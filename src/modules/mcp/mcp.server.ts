@@ -1,4 +1,4 @@
-import { HttpException, Logger } from '@nestjs/common';
+import { HttpException, Logger, UnauthorizedException } from '@nestjs/common';
 import type { HttpAdapterHost } from '@nestjs/core';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -8,9 +8,21 @@ import express, { type Request, type RequestHandler, type Response } from 'expre
 import { invokeTool } from '../../core/agent-tools/tool-invoker';
 import type { ToolRegistryService } from '../../core/agent-tools/tool-registry.service';
 import type { AuthService } from '../auth/auth.service';
+import type { ApiKey } from '../auth/entities/api-key.entity';
+import { looksLikeJwt } from '../oauth/jwt.util';
 import { handleToolError, jsonToolResult, smartToolResult } from './tool-result';
 import type { KeyRateLimiter } from './mcp-rate-limit';
 import { resolveClientIp } from '../../common/utils/ip';
+
+/** Optional OAuth 2.1 bridge: verify a bearer JWT and (async) resolve it to an API-key principal. */
+export interface McpOAuthBridge {
+  /** Sync signature/claims check for the discovery guard (returns false → emit 401 + WWW-Authenticate). */
+  verify: (bearer: string) => boolean;
+  /** Resolve a verified bearer to the underlying API key, or null if invalid. */
+  resolve: (bearer: string) => Promise<ApiKey | null>;
+  /** URL of the protected-resource metadata, advertised in WWW-Authenticate. */
+  resourceMetadataUrl: string;
+}
 
 const logger = new Logger('McpServer');
 
@@ -43,6 +55,7 @@ function buildServer(
   rateLimiter: KeyRateLimiter,
   readOnly: boolean,
   serverInfo: { name: string; version: string },
+  oauth?: McpOAuthBridge,
 ): McpServer {
   const server = new McpServer(
     { name: serverInfo.name, version: serverInfo.version },
@@ -66,7 +79,21 @@ function buildServer(
       async (input: Record<string, unknown>, extra: ToolExtra) => {
         const rawKey = extractApiKey(extra);
         try {
-          const result = await invokeTool(tool, input, rawKey, authService, id => rateLimiter.check(id));
+          // OAuth path: a JWT bearer is verified + resolved to an API-key principal here; the raw
+          // static-key path is unchanged (rawKey passed straight through to invokeTool).
+          let resolved: ApiKey | undefined;
+          if (oauth && rawKey && looksLikeJwt(rawKey)) {
+            resolved = (await oauth.resolve(rawKey)) ?? undefined;
+            if (!resolved) throw new UnauthorizedException('Invalid or expired OAuth token');
+          }
+          const result = await invokeTool(
+            tool,
+            input,
+            resolved ? undefined : rawKey,
+            authService,
+            id => rateLimiter.check(id),
+            resolved,
+          );
           return tool.resultDisposition === 'json'
             ? jsonToolResult(result as object)
             : smartToolResult(result as object);
@@ -85,6 +112,43 @@ export interface MountMcpServerOptions {
   basePath?: string;
   serverInfo?: { name: string; version: string };
   readOnly?: boolean;
+  oauth?: McpOAuthBridge;
+}
+
+/** Pull a bearer/x-api-key from a raw Express request (pre-transport, for the discovery guard). */
+function extractBearerFromReq(req: Request): string | undefined {
+  const xApiKey = req.headers['x-api-key'];
+  if (xApiKey) return Array.isArray(xApiKey) ? xApiKey[0] : xApiKey;
+  const auth = req.headers['authorization'];
+  const authStr = Array.isArray(auth) ? auth[0] : auth;
+  if (authStr?.toLowerCase().startsWith('bearer ')) return authStr.slice(7).trim();
+  return undefined;
+}
+
+function sendMcpUnauthorized(res: Response, resourceMetadataUrl: string, invalidToken: boolean): void {
+  const errPart = invalidToken ? ', error="invalid_token"' : '';
+  res
+    .status(401)
+    .set('WWW-Authenticate', `Bearer resource_metadata="${resourceMetadataUrl}"${errPart}`)
+    .json({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null });
+}
+
+/**
+ * When OAuth is enabled, emit an HTTP 401 + WWW-Authenticate (pointing at the protected-resource
+ * metadata) for requests with no token or an invalid JWT — this is what triggers a cloud MCP client
+ * (e.g. Claude) to start the OAuth flow. A non-JWT bearer (static API key) passes through and is
+ * validated per-tool-call as before, so static-key auth keeps working alongside OAuth.
+ */
+export function createOAuthGuard(oauth?: McpOAuthBridge): RequestHandler {
+  return (req, res, next) => {
+    if (!oauth) return next();
+    const bearer = extractBearerFromReq(req);
+    if (!bearer) return sendMcpUnauthorized(res, oauth.resourceMetadataUrl, false);
+    if (looksLikeJwt(bearer) && !oauth.verify(bearer)) {
+      return sendMcpUnauthorized(res, oauth.resourceMetadataUrl, true);
+    }
+    next();
+  };
 }
 
 /**
@@ -145,6 +209,7 @@ export function mountMcpServer(
   const basePath = (options.basePath ?? '/mcp').replace(/\/$/, '') || '/mcp';
   const serverInfo = options.serverInfo ?? { name: 'openwa', version: '0.0.0' };
   const readOnly = resolveMcpReadOnly(options.readOnly);
+  const oauth = options.oauth;
 
   // Eagerly compute the tool list at mount time to validate the registry is populated
   // and to emit the log line once. The actual McpServer is re-created per request to
@@ -153,7 +218,7 @@ export function mountMcpServer(
   logger.log(`MCP server mounted at POST ${basePath} (${tools.length} tools)`);
 
   const handler: RequestHandler = async (req: Request, res: Response) => {
-    const server = buildServer(registry, authService, rateLimiter, readOnly, serverInfo);
+    const server = buildServer(registry, authService, rateLimiter, readOnly, serverInfo, oauth);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     try {
       res.on('close', () => {
@@ -173,5 +238,5 @@ export function mountMcpServer(
   const adapter = httpAdapter as unknown as { post: (path: string, ...handlers: RequestHandler[]) => unknown };
   // ipThrottle runs BEFORE express.json()/handler so an unauthenticated flood is rejected before any body
   // parsing or DB lookup.
-  adapter.post(basePath, createIpThrottle(ipRateLimiter), express.json(), handler);
+  adapter.post(basePath, createIpThrottle(ipRateLimiter), createOAuthGuard(oauth), express.json(), handler);
 }

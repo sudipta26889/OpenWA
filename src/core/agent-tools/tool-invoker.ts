@@ -1,6 +1,7 @@
 import { BadRequestException, ForbiddenException, UnauthorizedException } from '@nestjs/common';
 import { ZodError } from 'zod';
 import type { AuthService } from '../../modules/auth/auth.service';
+import type { ApiKey } from '../../modules/auth/entities/api-key.entity';
 import type { ToolDescriptor } from './tool-descriptor';
 
 /**
@@ -21,10 +22,8 @@ export async function invokeTool(
   rawKey: string | undefined,
   authService: AuthService,
   onAuthenticated?: (apiKeyId: string) => void,
+  resolvedPrincipal?: ApiKey,
 ): Promise<unknown> {
-  if (!rawKey) {
-    throw new UnauthorizedException('Missing API key');
-  }
   // Pre-extract sessionId for the scope check BEFORE full validation (REST reads
   // req.params.sessionId in the guard, before the pipe).
   const probe = (rawInput ?? {}) as Record<string, unknown>;
@@ -38,7 +37,22 @@ export async function invokeTool(
     throw new BadRequestException('sessionId is required for this tool');
   }
 
-  const apiKey = await authService.validateApiKey(rawKey, undefined, sessionId);
+  // `resolvedPrincipal` is set on the OAuth path (bearer JWT already verified + resolved to a key).
+  // Otherwise validate the raw static key exactly as before.
+  let apiKey: ApiKey;
+  if (resolvedPrincipal) {
+    apiKey = resolvedPrincipal;
+    if (apiKey.allowedSessions && apiKey.allowedSessions.length > 0 && sessionId) {
+      if (!apiKey.allowedSessions.includes(sessionId)) {
+        throw new ForbiddenException('API key not authorized for this session');
+      }
+    }
+  } else {
+    if (!rawKey) {
+      throw new UnauthorizedException('Missing API key');
+    }
+    apiKey = await authService.validateApiKey(rawKey, undefined, sessionId);
+  }
   onAuthenticated?.(apiKey.id);
 
   if (tool.requiredRole && !authService.hasPermission(apiKey, tool.requiredRole)) {

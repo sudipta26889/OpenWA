@@ -177,6 +177,23 @@ export interface WhatsAppWebJsConfig {
   lidMappingStore?: LidMappingStore;
 }
 
+/**
+ * Optional remote-browser (CDP) connection. When WWEBJS_BROWSER_WS_ENDPOINT (a Chrome DevTools
+ * websocket, e.g. ws://host:9222/devtools/browser/<id>) or WWEBJS_BROWSER_URL (http://host:9222 —
+ * puppeteer auto-resolves the ws via /json/version) is set, whatsapp-web.js connects to that
+ * already-running Chrome (puppeteer.connect) instead of launching a local Chromium. Lets OpenWA run
+ * where a local Chromium cannot (locked-down/broken container). NOTE: WhatsApp login state lives in
+ * the REMOTE browser's profile, so that browser must use a persistent --user-data-dir to survive
+ * reconnects; executablePath/args are ignored by puppeteer.connect.
+ */
+export function resolveRemoteBrowserOpts(): Record<string, string> {
+  const ws = process.env.WWEBJS_BROWSER_WS_ENDPOINT?.trim();
+  if (ws) return { browserWSEndpoint: ws };
+  const url = process.env.WWEBJS_BROWSER_URL?.trim();
+  if (url) return { browserURL: url };
+  return {};
+}
+
 const READY_RECONCILE_INTERVAL_MS = 2000;
 const READY_RECONCILE_TIMEOUT_MS = 90_000;
 
@@ -406,6 +423,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
           // Only override the executable when explicitly configured; otherwise let
           // whatsapp-web.js fall back to Puppeteer's bundled Chromium.
           ...(this.config.puppeteer?.executablePath ? { executablePath: this.config.puppeteer.executablePath } : {}),
+          // Remote-browser (CDP) opt-in: when WWEBJS_BROWSER_WS_ENDPOINT/WWEBJS_BROWSER_URL is set,
+          // wwjs connects to an already-running Chrome instead of launching a local one.
+          ...resolveRemoteBrowserOpts(),
         },
         ...(authTimeoutMs !== undefined ? { authTimeoutMs } : {}),
         ...(proxyAuthentication ? { proxyAuthentication } : {}),
