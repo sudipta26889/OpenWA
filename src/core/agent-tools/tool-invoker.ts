@@ -1,6 +1,7 @@
 import { BadRequestException, ForbiddenException, UnauthorizedException } from '@nestjs/common';
 import { ZodError } from 'zod';
 import type { AuthService } from '../../modules/auth/auth.service';
+import type { ApiKey } from '../../modules/auth/entities/api-key.entity';
 import type { ToolDescriptor } from './tool-descriptor';
 
 /**
@@ -27,14 +28,12 @@ export async function invokeTool(
   authService: AuthService,
   onAuthenticated?: (apiKeyId: string) => void,
   onAuthFailure?: (error: unknown) => void,
+  resolvedPrincipal?: ApiKey,
 ): Promise<unknown> {
   // AUTH PHASE — every rejection here is an authentication/authorization failure (the MCP analog of the
   // REST ApiKeyGuard's authorize()). Wrapped so onAuthFailure can record the audit trail at the boundary.
-  let apiKey: Awaited<ReturnType<typeof authService.validateApiKey>>;
+  let apiKey: ApiKey;
   try {
-    if (!rawKey) {
-      throw new UnauthorizedException('Missing API key');
-    }
     // Pre-extract sessionId for the scope check BEFORE full validation (REST reads
     // req.params.sessionId in the guard, before the pipe).
     const probe = (rawInput ?? {}) as Record<string, unknown>;
@@ -48,7 +47,23 @@ export async function invokeTool(
       throw new BadRequestException('sessionId is required for this tool');
     }
 
-    apiKey = await authService.validateApiKey(rawKey, undefined, sessionId);
+    // `resolvedPrincipal` is set on the OAuth path (bearer JWT already verified + resolved to a key).
+    // Otherwise validate the raw static key exactly as before.
+    if (resolvedPrincipal) {
+      apiKey = resolvedPrincipal;
+      // The static path enforces allowedSessions inside validateApiKey; the OAuth path resolved the key
+      // out-of-band, so replicate the per-session fence here.
+      if (apiKey.allowedSessions && apiKey.allowedSessions.length > 0 && sessionId) {
+        if (!apiKey.allowedSessions.includes(sessionId)) {
+          throw new ForbiddenException('API key not authorized for this session');
+        }
+      }
+    } else {
+      if (!rawKey) {
+        throw new UnauthorizedException('Missing API key');
+      }
+      apiKey = await authService.validateApiKey(rawKey, undefined, sessionId);
+    }
     onAuthenticated?.(apiKey.id);
 
     if (tool.requiredRole && !authService.hasPermission(apiKey, tool.requiredRole)) {

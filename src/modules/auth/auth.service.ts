@@ -484,6 +484,24 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
     return apiKey;
   }
 
+  /**
+   * Resolve an API key by id WITHOUT the raw secret — used by the OAuth resource-server path,
+   * where the bearer is a signed access token whose `sub` is the key id. Mirrors validateApiKey's
+   * active/expiry/session checks (IP checks are N/A over MCP, as with the raw-key path).
+   */
+  async getApiKeyByIdForAuth(id: string, sessionId?: string): Promise<ApiKey> {
+    const apiKey = await this.apiKeyRepository.findOne({ where: { id } });
+    if (!apiKey) throw new UnauthorizedException('Invalid API key');
+    if (!apiKey.isActive) throw new UnauthorizedException('API key is revoked');
+    if (apiKey.expiresAt && apiKey.expiresAt < new Date()) throw new UnauthorizedException('API key has expired');
+    if (apiKey.allowedSessions && apiKey.allowedSessions.length > 0 && sessionId) {
+      if (!apiKey.allowedSessions.includes(sessionId)) {
+        throw new UnauthorizedException('API key not authorized for this session');
+      }
+    }
+    return apiKey;
+  }
+
   private hashKey(rawKey: string): string {
     return hashApiKey(rawKey, process.env.API_KEY_PEPPER);
   }
