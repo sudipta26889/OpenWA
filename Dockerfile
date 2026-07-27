@@ -97,6 +97,22 @@ COPY --from=builder /app/dashboard/dist ./dashboard/dist
 RUN mkdir -p ./data/sessions ./data/media && \
     chown -R openwa:openwa /app
 
+# ── Chrome for Testing 141 ──────────────────────────────────────────────────────────────────────
+# Debian's `chromium` (now v150, installed above) HARD-CRASHES at launch in this container: a
+# GPU-process SIGTRAP (vaapi probe on a GPU-less host → InitializeSandbox-with-multiple-threads CHECK),
+# reproducible even with cap_drop/seccomp fully relaxed — so it's the Chromium *version*, not the
+# hardening. Ship a known-good Chrome for Testing (141.0.7390.37, the exact build browserless runs fine
+# on this same host) and point Puppeteer at it. The apt `chromium` above is kept ONLY for its
+# shared-lib/font dependency closure (Chrome for Testing links the same libs). Placed after npm ci /
+# dist copy so those layers stay cached. Bump the pin if 141 ever ages out of Chrome for Testing.
+RUN apt-get update && apt-get install -y --no-install-recommends unzip \
+    && npx --yes @puppeteer/browsers install chrome@141.0.7390.37 --path /opt/cft \
+    && ln -s "$(find /opt/cft -type f -name chrome | head -1)" /opt/chrome \
+    && chmod -R a+rX /opt/cft \
+    && apt-get purge -y unzip && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+# Overrides the /usr/bin/chromium set earlier (later ENV wins; line 75 left untouched to preserve cache).
+ENV PUPPETEER_EXECUTABLE_PATH=/opt/chrome
+
 # The non-root openwa user has no home of its own (`useradd -r`, no -m). Chromium resolves the home
 # dir from the passwd entry via glib's getpwuid() — it IGNORES $HOME — so it tries to read/write
 # /home/openwa, which does not exist. On hardened/read-only hosts that makes the browser HARD-CRASH

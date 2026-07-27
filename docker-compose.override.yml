@@ -1,0 +1,26 @@
+# Homelab override — passes vars the base compose does not forward, and exposes
+# the API on the LAN. Secrets are interpolated from .env (not hardcoded here).
+services:
+  openwa-api:
+    ports: !override
+      - "0.0.0.0:${API_PORT:-2785}:2785"
+    volumes:
+      # wwebjs getChats resilience patch (#5733): overlay the read_only rootfs copy of the injected
+      # Utils.js with a patched one that skips un-serializable chats instead of 500-ing the whole /chats
+      # call. Version-fragile — re-extract & re-patch if whatsapp-web.js is upgraded in the image.
+      - ./patches/whatsapp-web.js/Utils.js:/app/node_modules/whatsapp-web.js/src/util/Injected/Utils.js:ro
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - AUTO_START_SESSIONS=${AUTO_START_SESSIONS:-true}
+      - MAX_CONCURRENT_SESSIONS=${MAX_CONCURRENT_SESSIONS:-10}
+      - ENGINE_TYPE=${ENGINE_TYPE:-whatsapp-web.js}
+      - WEBHOOK_SSRF_PROTECT=${WEBHOOK_SSRF_PROTECT:-false}
+      - ENABLE_SWAGGER=${ENABLE_SWAGGER:-true}
+      - CSP_UPGRADE_INSECURE_REQUESTS=false
+      # Remote CDP browser (Chrome on 192.168.11.150:9222). URL form: puppeteer auto-resolves the ws.
+      - WWEBJS_BROWSER_URL=${WWEBJS_BROWSER_URL:-}
+      - WWEBJS_BROWSER_WS_ENDPOINT=${WWEBJS_BROWSER_WS_ENDPOINT:-}
+      - MCP_ENABLED=${MCP_ENABLED:-false}
+      - OAUTH_ENABLED=${OAUTH_ENABLED:-false}
+      - OAUTH_ISSUER=${OAUTH_ISSUER:-}
+      - MCP_READONLY=${MCP_READONLY:-true}
