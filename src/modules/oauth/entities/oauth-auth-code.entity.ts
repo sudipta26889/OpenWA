@@ -5,36 +5,36 @@ import { Entity, Column, PrimaryColumn, CreateDateColumn } from 'typeorm';
 export class OAuthAuthCode {
   /** sha256(code) — the raw code is only ever returned to the client, never stored. */
   @PrimaryColumn({ type: 'varchar', length: 64 })
-  codeHash: string;
+  codeHash!: string;
 
   @Column({ type: 'varchar', length: 64 })
-  clientId: string;
+  clientId!: string;
 
   @Column({ type: 'varchar', length: 500 })
-  redirectUri: string;
+  redirectUri!: string;
 
   @Column({ type: 'varchar', length: 200 })
-  codeChallenge: string;
+  codeChallenge!: string;
 
   @Column({ type: 'varchar', length: 20, default: 'S256' })
-  codeChallengeMethod: string;
+  codeChallengeMethod!: string;
 
   /** The OpenWA API key id this authorization is bound to (token principal). */
   @Column({ type: 'varchar', length: 64 })
-  apiKeyId: string;
+  apiKeyId!: string;
 
   @Column({ type: 'varchar', length: 300, nullable: true })
-  resource: string | null;
+  resource!: string | null;
 
   @Column({ type: 'varchar', length: 300, nullable: true })
-  scope: string | null;
+  scope!: string | null;
 
   @Column({ type: 'datetime' })
-  expiresAt: Date;
+  expiresAt!: Date;
 
   @Column({ type: 'boolean', default: false })
-  used: boolean;
+  used!: boolean;
 
   @CreateDateColumn()
-  createdAt: Date;
+  createdAt!: Date;
 }
