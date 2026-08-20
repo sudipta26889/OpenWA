@@ -42,7 +42,12 @@ do_restart(){
   docker exec "$CONT" node -e '
     const k=process.env.API_MASTER_KEY, sid=process.argv[1], B="http://localhost:2785/api/sessions/";
     const post=p=>fetch(B+sid+p,{method:"POST",headers:{"x-api-key":k}}).then(r=>r.status).catch(()=>0);
-    (async()=>{ await post("/stop"); await new Promise(x=>setTimeout(x,4000)); console.log(await post("/start")); })();
+    // 12s, not 4s: Chromium does not fully release the LocalAuth profile within 4s of /stop. Restarting
+    // into a profile the previous browser still holds makes whatsapp-web.js loop on
+    // "Page navigated; re-injecting" and the v0.22.0 eventsAttached guard then (correctly) refuses to
+    // promote the session, marks it FAILED, and the watchdog restarts it again -- an endless loop.
+    // Observed on personal-wa 2026-08-20; the same session recovered first try with a 12s gap.
+    (async()=>{ await post("/stop"); await new Promise(x=>setTimeout(x,12000)); console.log(await post("/start")); })();
   ' "$sid" 2>/dev/null
   date +%s > "$STATE/last_$sid"
 }
