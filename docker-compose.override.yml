@@ -17,7 +17,8 @@ services:
       - WEBHOOK_SSRF_PROTECT=${WEBHOOK_SSRF_PROTECT:-false}
       - ENABLE_SWAGGER=${ENABLE_SWAGGER:-true}
       - CSP_UPGRADE_INSECURE_REQUESTS=false
-      # Remote CDP browser (Chrome on 192.168.11.150:9222). URL form: puppeteer auto-resolves the ws.
+      # Remote CDP browser opt-in (unset by default -> local Chrome). Point these at a DNS name, never a
+      # hardcoded IP (e.g. WWEBJS_BROWSER_WS_ENDPOINT=ws://nuc.lan:3001); URL form auto-resolves the ws.
       - WWEBJS_BROWSER_URL=${WWEBJS_BROWSER_URL:-}
       - WWEBJS_BROWSER_WS_ENDPOINT=${WWEBJS_BROWSER_WS_ENDPOINT:-}
       - MCP_ENABLED=${MCP_ENABLED:-false}

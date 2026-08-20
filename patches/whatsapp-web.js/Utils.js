@@ -580,9 +580,18 @@ exports.LoadUtils = () => {
 
         if (options.waitUntilMsgSent) await sendMsgResultPromise;
 
-        return window
-            .require('WAWebCollections')
-            .Msg.get(newMsgKey._serialized);
+        // WWEBJS-PATCH (sibling of the getChats #5733 fix): the message is ALREADY sent above
+        // (addAndSendMsgToChat + await msgPromise). But on current WhatsApp Web builds, Msg.get() can
+        // return undefined for a few hundred ms afterwards (the local Msg collection populates async),
+        // which made sendMessage() return undefined and openwa 500 the /messages/send-text call EVEN
+        // THOUGH the message went out. Retry the lookup briefly so the real Message model is returned.
+        const _key = newMsgKey._serialized;
+        let _sent = window.require('WAWebCollections').Msg.get(_key);
+        for (let _i = 0; _i < 20 && !_sent; _i++) {
+            await new Promise((r) => setTimeout(r, 100));
+            _sent = window.require('WAWebCollections').Msg.get(_key);
+        }
+        return _sent;
     };
 
     window.WWebJS.editMessage = async (msg, content, options = {}) => {
