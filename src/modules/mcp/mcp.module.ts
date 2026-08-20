@@ -1,10 +1,11 @@
-import { type DynamicModule, Module, type MiddlewareConsumer, type NestModule } from '@nestjs/common';
+import { type DynamicModule, Module, type MiddlewareConsumer, type NestModule, Optional } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
 import { ToolRegistryService } from '../../core/agent-tools/tool-registry.service';
 import { AuthService } from '../auth/auth.service';
 import { AuditService } from '../audit/audit.service';
+import { OAuthService } from '../oauth/oauth.service';
 import { KeyRateLimiter, readRateLimitConfig, readIpRateLimitConfig } from './mcp-rate-limit';
-import { mountMcpServer } from './mcp.server';
+import { mountMcpServer, type McpOAuthBridge } from './mcp.server';
 
 export interface McpModuleOptions {
   basePath?: string;
@@ -23,6 +24,8 @@ export class McpModule implements NestModule {
     private readonly httpAdapterHost: HttpAdapterHost,
     // AuditModule is @Global(), so AuditService is injectable here without an explicit import.
     private readonly auditService: AuditService,
+    // Present only when OAUTH_ENABLED loads the (global) OAuthModule; undefined otherwise.
+    @Optional() private readonly oauthService?: OAuthService,
   ) {}
 
   static forRoot(options: McpModuleOptions = {}): DynamicModule {
@@ -46,13 +49,23 @@ export class McpModule implements NestModule {
     const rateLimiter = new KeyRateLimiter(max, windowMs);
     const ipCfg = readIpRateLimitConfig();
     const ipRateLimiter = new KeyRateLimiter(ipCfg.max, ipCfg.windowMs);
+    // Build the OAuth bridge only when the AS is enabled; otherwise MCP stays static-key-only.
+    let oauth: McpOAuthBridge | undefined;
+    if (this.oauthService && process.env.OAUTH_ENABLED === 'true') {
+      const svc = this.oauthService;
+      oauth = {
+        verify: (bearer: string) => svc.verifyAccessToken(bearer) !== null,
+        resolve: (bearer: string) => svc.resolveApiKey(bearer),
+        resourceMetadataUrl: svc.protectedResourceMetadataUrl(),
+      };
+    }
     mountMcpServer(
       httpAdapter,
       this.registry,
       this.authService,
       rateLimiter,
       ipRateLimiter,
-      { basePath, serverInfo },
+      { basePath, serverInfo, oauth },
       this.auditService,
     );
   }

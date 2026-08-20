@@ -1,0 +1,22 @@
+# Homelab override — passes vars the base compose does not forward, and exposes
+# the API on the LAN. Secrets are interpolated from .env (not hardcoded here).
+services:
+  openwa-api:
+    ports: !override
+      - "0.0.0.0:${API_PORT:-2785}:2785"
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - AUTO_START_SESSIONS=${AUTO_START_SESSIONS:-true}
+      - MAX_CONCURRENT_SESSIONS=${MAX_CONCURRENT_SESSIONS:-10}
+      - ENGINE_TYPE=${ENGINE_TYPE:-whatsapp-web.js}
+      - WEBHOOK_SSRF_PROTECT=${WEBHOOK_SSRF_PROTECT:-false}
+      - ENABLE_SWAGGER=${ENABLE_SWAGGER:-true}
+      - CSP_UPGRADE_INSECURE_REQUESTS=false
+      # Remote CDP browser opt-in (unset by default -> local Chrome). Point these at a DNS name, never a
+      # hardcoded IP (e.g. WWEBJS_BROWSER_WS_ENDPOINT=ws://nuc.lan:3001); URL form auto-resolves the ws.
+      - WWEBJS_BROWSER_URL=${WWEBJS_BROWSER_URL:-}
+      - WWEBJS_BROWSER_WS_ENDPOINT=${WWEBJS_BROWSER_WS_ENDPOINT:-}
+      - MCP_ENABLED=${MCP_ENABLED:-false}
+      - OAUTH_ENABLED=${OAUTH_ENABLED:-false}
+      - OAUTH_ISSUER=${OAUTH_ISSUER:-}
+      - MCP_READONLY=${MCP_READONLY:-true}

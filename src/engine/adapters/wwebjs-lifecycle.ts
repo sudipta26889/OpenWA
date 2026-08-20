@@ -24,6 +24,25 @@ import { AUTH_FAILURE_REASON, STALE_PROFILE_ADVICE } from '../terminal-engine-fa
 import { wwjsAuthDir } from '../auth-dir-paths';
 
 /**
+ * LOCAL CUSTOMIZATION — optional remote-browser (CDP) connection.
+ * When WWEBJS_BROWSER_WS_ENDPOINT (a Chrome DevTools websocket, e.g.
+ * ws://host:9222/devtools/browser/<id>) or WWEBJS_BROWSER_URL (http://host:9222 — puppeteer
+ * auto-resolves the ws via /json/version) is set, whatsapp-web.js connects to that already-running
+ * Chrome (puppeteer.connect) instead of launching a local Chromium. Lets OpenWA run where a local
+ * Chromium cannot (locked-down/broken container). NOTE: WhatsApp login state lives in the REMOTE
+ * browser's profile, so that browser must use a persistent --user-data-dir to survive reconnects;
+ * executablePath/args are ignored by puppeteer.connect.
+ */
+export function resolveRemoteBrowserOpts(): Record<string, string> {
+  const ws = process.env.WWEBJS_BROWSER_WS_ENDPOINT?.trim();
+  if (ws) return { browserWSEndpoint: ws };
+  const url = process.env.WWEBJS_BROWSER_URL?.trim();
+  if (url) return { browserURL: url };
+  return {};
+}
+
+
+/**
  * Detect Puppeteer's "Execution context was destroyed" error. During `Client.inject()` this is most
  * often a persistent browser profile left stale by an OpenWA upgrade that changed the Chromium/Chrome
  * binary (e.g. the v0.8.12 amd64 Debian Chromium → Chrome for Testing switch, #663 / #708) — but it is
@@ -421,6 +440,9 @@ export class WwebjsLifecycle {
         // Per-CDP-command budget, spread only when the host configured a usable one (see above).
         // Absent, puppeteer-core nullish-coalesces to its own 180 000 ms (`cdp/Connection.js`).
         ...(protocolTimeout !== undefined ? { protocolTimeout } : {}),
+        // LOCAL: remote-browser (CDP) opt-in — when WWEBJS_BROWSER_WS_ENDPOINT/WWEBJS_BROWSER_URL is
+        // set, wwjs connects to an already-running Chrome instead of launching a local one.
+        ...resolveRemoteBrowserOpts(),
       },
       ...(authTimeoutMs !== undefined ? { authTimeoutMs } : {}),
       ...(proxyAuthentication ? { proxyAuthentication } : {}),
