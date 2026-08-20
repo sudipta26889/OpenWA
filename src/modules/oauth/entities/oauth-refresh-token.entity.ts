@@ -5,26 +5,26 @@ import { Entity, Column, PrimaryColumn, CreateDateColumn } from 'typeorm';
 export class OAuthRefreshToken {
   /** sha256(refresh_token). */
   @PrimaryColumn({ type: 'varchar', length: 64 })
-  tokenHash: string;
+  tokenHash!: string;
 
   @Column({ type: 'varchar', length: 64 })
-  clientId: string;
+  clientId!: string;
 
   @Column({ type: 'varchar', length: 64 })
-  apiKeyId: string;
+  apiKeyId!: string;
 
   @Column({ type: 'varchar', length: 300, nullable: true })
-  resource: string | null;
+  resource!: string | null;
 
   @Column({ type: 'varchar', length: 300, nullable: true })
-  scope: string | null;
+  scope!: string | null;
 
   @Column({ type: 'datetime' })
-  expiresAt: Date;
+  expiresAt!: Date;
 
   @Column({ type: 'boolean', default: false })
-  revoked: boolean;
+  revoked!: boolean;
 
   @CreateDateColumn()
-  createdAt: Date;
+  createdAt!: Date;
 }
