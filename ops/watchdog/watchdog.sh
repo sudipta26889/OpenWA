@@ -84,7 +84,13 @@ while true; do
         [ -n "${sid:-}" ] && maybe_restart "$sid" "engine-death"
       done
   # (2) Backstop: proactively refresh any session older than BACKSTOP.
+  # BACKSTOP=0 DISABLES this branch entirely (a 0 threshold would otherwise make every session
+  # "overdue" on every poll and restart-loop it at the debounce interval). Since OpenWA v0.22.0 the
+  # engine's own eventsAttached guard refuses to promote a session whose inbound bridge never
+  # attached and reloads the page to reinject, so the blind proactive refresh is redundant — and the
+  # restart it performs is itself a source of message gaps. The engine-death branch (1) above stays on.
   now=$(date +%s)
+  if [ "$BACKSTOP" -le 0 ]; then sleep "$POLL"; continue; fi
   list_sessions | while read sid status; do
     [ -z "${sid:-}" ] && continue
     case "$status" in stopped|failed) continue;; esac
