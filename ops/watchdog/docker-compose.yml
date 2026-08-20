@@ -1,0 +1,21 @@
+# openwa-watchdog — self-heals WhatsApp sessions (see watchdog.sh). Decoupled from the openwa stack so
+# it survives openwa redeploys; restart:unless-stopped means Docker keeps it alive across host reboots.
+# Needs the docker socket to `docker exec`/`docker logs` openwa-api; the master key never leaves openwa-api.
+services:
+  openwa-watchdog:
+    image: docker:cli
+    container_name: openwa-watchdog
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./watchdog.sh:/watchdog.sh:ro
+      - openwa-watchdog-state:/state
+    environment:
+      - OPENWA_CONTAINER=openwa-api
+      - WATCHDOG_POLL_SECONDS=60
+      - WATCHDOG_BACKSTOP_SECONDS=0        # disabled: v0.22.0 eventsAttached guard replaces the blind 6h refresh
+      - WATCHDOG_DEBOUNCE_SECONDS=180
+    entrypoint: ["sh", "/watchdog.sh"]
+
+volumes:
+  openwa-watchdog-state:
