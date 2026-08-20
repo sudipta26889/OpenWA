@@ -271,6 +271,16 @@ async function bootstrap() {
         req.path === '/socket.io' ||
         req.path.startsWith('/mcp/') ||
         req.path === '/mcp' ||
+        // LOCAL: the self-hosted OAuth 2.1 AS+RS. These are Nest-owned JSON/redirect routes, but they
+        // are extensionless and the discovery docs are fetched with an Accept that can include
+        // text/html — so without this they match documentRequest and get answered with the dashboard
+        // shell. That silently breaks the whole MCP OAuth handshake: /.well-known/* returns HTML
+        // instead of the AS/RS metadata, and a browser landing on /oauth/authorize sees the dashboard,
+        // so the flow starts and never finishes. The ServeStaticModule `exclude` list in app.module.ts
+        // guards the OTHER (now-disabled) fallback and does not cover this handler.
+        req.path.startsWith('/oauth/') ||
+        req.path === '/oauth' ||
+        req.path.startsWith('/.well-known/') ||
         req.path.startsWith('/assets/');
       const documentRequest =
         req.method === 'GET' &&
