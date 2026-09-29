@@ -4,6 +4,10 @@ services:
   openwa-api:
     ports: !override
       - "0.0.0.0:${API_PORT:-2785}:2785"
+    # nuc.lan (Postgres + Redis) pinned: a DNS failure on 2026-09-21 left the API unable to reach
+    # Redis, then the stack was stopped and stayed down (502) for a week.
+    extra_hosts:
+      - "nuc.lan:192.168.10.118"
     environment:
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - AUTO_START_SESSIONS=${AUTO_START_SESSIONS:-true}
