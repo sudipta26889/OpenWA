@@ -182,7 +182,7 @@ jobs:
           REDIS_PORT: '6379'
 
       - name: Upload coverage
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
         if: always()
         with:
           files: ./coverage/lcov.info
@@ -198,6 +198,9 @@ jobs:
           POSTGRES_USER: openwa
           POSTGRES_PASSWORD: openwa
           POSTGRES_DB: openwa
+          # initdb takes the server's default TimeZone from this, so the session pin has something to
+          # override. A UTC server would make the UTC-pin spec pass without the pin doing anything.
+          TZ: Asia/Jakarta
         ports:
           - 5432:5432
         options: >-
@@ -233,15 +236,27 @@ jobs:
           DATABASE_NAME: openwa
 
       # Runtime-proves BuiltInFtsProvider on Postgres (websearch_to_tsquery + ts_headline against the
-      # STORED body_ts tsvector) and the boot-migration advisory lock (two concurrent migrators on
-      # one database). Both specs self-skip unless DATABASE_TYPE=postgres, so they are a no-op
-      # in the default test job and only execute here against the postgres:16 service.
-      - name: Postgres specs (FTS provider + boot-migration lock)
-        # --runInBand: both specs issue DDL against the one shared service database, and jest's
+      # STORED body_ts tsvector), the boot-migration advisory lock (two concurrent migrators on one
+      # database), that a paged message list has a total order (Postgres sorts a tie group
+      # differently between two statements, so an unstable order drops rows from a page walk), and
+      # that the data entities can build their own schema (raw SQL the ORM passes through verbatim,
+      # such as a partial index predicate, only case-folds on a real server), and that the UTC pin
+      # holds across a backup round trip, a retention window and a local-midnight count. All five
+      # self-skip unless DATABASE_TYPE=postgres, so they are a no-op in the default test job and only
+      # execute here against the postgres:16 service.
+      #
+      # TZ is deliberately NOT UTC: the pin's whole job is to make a `timestamp` column mean the same
+      # instant on a host that runs in another zone, and on a UTC runner every assertion about it
+      # would pass for the wrong reason (the UTC-pin spec fails outright rather than pass vacuously).
+      - name: Postgres specs (FTS provider + boot-migration lock + list ordering + entity synchronize + UTC pin)
+        # --runInBand: the specs issue DDL against the one shared service database, and jest's
         # default file-parallelism races their catalog writes (pg_type duplicate-key). The lock
-        # spec's own two-migrator race is in-file (Promise.all) and unaffected by runInBand.
-        run: npx jest --runInBand src/database/migrations/__tests__/1782400000000-AddMessagesFts.pg.spec.ts src/database/migrations/__tests__/pg-boot-migrations.pg.spec.ts
+        # spec's own two-migrator race is in-file (Promise.all) and unaffected by runInBand. The
+        # synchronize spec additionally CREATEs and DROPs a scratch database of its own, which is
+        # only safe serialized.
+        run: npx jest --runInBand src/database/migrations/__tests__/1782400000000-AddMessagesFts.pg.spec.ts src/database/migrations/__tests__/pg-boot-migrations.pg.spec.ts src/modules/message/message-list-ordering.pg.spec.ts src/database/migrations/__tests__/pg-entity-synchronize.pg.spec.ts src/database/postgres-utc.pg.spec.ts
         env:
+          TZ: Asia/Jakarta
           DATABASE_TYPE: postgres
           DATABASE_HOST: localhost
           DATABASE_PORT: '5432'
@@ -409,10 +424,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Login to GitHub Container Registry
         if: github.event_name == 'push'
@@ -436,7 +451,7 @@ jobs:
             type=sha,prefix=
 
       - name: Build and optionally push
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           # Fork pull requests receive a read-only token, so they validate both image architectures
@@ -452,6 +467,13 @@ jobs:
           sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Never serve the production stage's apt layer from cache on branch builds either: a
+          # cached hit installs whatever the apt index held when the layer was first built, so a
+          # `:main` image can ship OS packages Debian has since patched. The filter names a whole
+          # stage, so every branch and pull request build rebuilds all of `production` on both
+          # platforms, not only the apt layer; the builder stage keeps its cache. release.yml's
+          # docker build carries the same line plus the incident record that motivated it.
+          no-cache-filters: production
 
       # The image carries no USER directive by design: docker-entrypoint.sh starts as root to fix
       # named-volume ownership, then drops with `exec gosu openwa`. Nothing verified that drop —
@@ -459,7 +481,7 @@ jobs:
       # every gate above and reached `latest`. Loaded single-arch from the same gha cache the
       # multi-arch build just populated, so this reuses those layers rather than building twice.
       - name: Load a single-arch image for the runtime smoke test
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           load: true

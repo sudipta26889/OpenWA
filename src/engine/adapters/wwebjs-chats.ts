@@ -5,6 +5,7 @@ import { EngineTransportError } from '../../common/errors/engine-transport.error
 import { chatKind, isChannelJid } from '../identity/wa-id';
 import { WwebjsMessaging } from './wwebjs-messaging';
 import { type WwebjsEngineHost } from './wwebjs-host';
+import { isProtocolTimeout } from './wwebjs-lifecycle';
 
 /**
  * Chat-list operations extracted from WhatsAppWebJsAdapter. The adapter keeps the public methods as
@@ -60,6 +61,16 @@ export class WwebjsChats {
         timestamp: chat.timestamp || 0,
         // A location message's body is the base64 map thumbnail; don't surface it as the chat preview.
         lastMessage: chat.lastMessage?.type === MessageTypes.LOCATION ? '📍' : chat.lastMessage?.body || undefined,
+        archived: Boolean(chat.archived),
+        pinned: Boolean(chat.pinned),
+        // Chat.isMuted is the current verdict; muteExpiration is wwjs epoch SECONDS with -1 = forever.
+        muted: Boolean(chat.isMuted),
+        // Expose the expiry as ms (0 = indefinite), present only when muted, per ChatSummary.
+        muteExpiration: chat.isMuted
+          ? (chat.muteExpiration ?? 0) > 0
+            ? (chat.muteExpiration ?? 0) * 1000
+            : 0
+          : undefined,
       });
     }
 
@@ -83,6 +94,9 @@ export class WwebjsChats {
         this.host.reportIfPageTransportError(error, 'sendSeen');
         throw new EngineTransportError('Transport died while marking a chat as read');
       }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while marking a chat as read');
+      }
       this.host.logger.error(`Error marking chat ${chatId} as read`, String(error));
       return false;
     }
@@ -103,6 +117,9 @@ export class WwebjsChats {
       if (this.host.isPageTransportError(error)) {
         this.host.reportIfPageTransportError(error, 'clearChatMessages');
         throw new EngineTransportError('Transport died while clearing a chat');
+      }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while clearing a chat');
       }
       this.host.logger.error(`Error clearing messages in chat ${chatId}`, String(error));
       return false;
@@ -136,6 +153,9 @@ export class WwebjsChats {
         this.host.reportIfPageTransportError(error, 'archiveChat');
         throw new EngineTransportError('Transport died while archiving a chat');
       }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while archiving a chat');
+      }
       this.host.logger.error(`Error ${archive ? 'archiving' : 'unarchiving'} chat ${chatId}`, String(error));
       return false;
     }
@@ -165,6 +185,9 @@ export class WwebjsChats {
       if (this.host.isPageTransportError(error)) {
         this.host.reportIfPageTransportError(error, 'requireResolvableChat');
         throw new EngineTransportError('Transport died while resolving a chat');
+      }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while resolving a chat');
       }
       chat = undefined; // an unknown chat rejects too — that is the 400 below
     }
@@ -223,6 +246,9 @@ export class WwebjsChats {
         this.host.reportIfPageTransportError(error, 'markUnread');
         throw new EngineTransportError('Transport died while marking a chat as unread');
       }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while marking a chat as unread');
+      }
       this.host.logger.error(`Error marking chat ${chatId} as unread`, String(error));
       return false;
     }
@@ -245,6 +271,9 @@ export class WwebjsChats {
       if (this.host.isPageTransportError(error)) {
         this.host.reportIfPageTransportError(error, 'deleteChat');
         throw new EngineTransportError('Transport died while deleting a chat');
+      }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while deleting a chat');
       }
       this.host.logger.error(`Error deleting chat ${chatId}`, String(error));
       return false;

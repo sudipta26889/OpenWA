@@ -14,6 +14,11 @@ import { BulkMessageService } from '../message/bulk-message.service';
  * QR_READY is deliberately absent — an unpaired session on a dead node has nothing to resume, and
  * restarting it elsewhere just renders a QR nobody asked for. FAILED is deliberately absent too:
  * it marks a session an operator must look at, and silently relocating it would hide that.
+ *
+ * DISCONNECTED is present, so the status correction must never write it over a row this sweep would
+ * otherwise leave alone: markLapsedDisconnected corrects READY, INITIALIZING, AUTHENTICATING and
+ * ACTION_REQUIRED, which are adopted either way, and QR_READY only on a row with no phone, which
+ * isEligible refuses either way.
  */
 const TAKEOVER_STATUSES = new Set<SessionStatus>([
   SessionStatus.READY,
@@ -25,6 +30,22 @@ const TAKEOVER_STATUSES = new Set<SessionStatus>([
 
 /** Pause between successive engine launches, matching the boot auto-start's Chromium stagger. */
 const TAKEOVER_START_STAGGER_MS = 2000;
+
+/**
+ * How many lease TTLs past its expiry a lease must be before the status correction treats its holder
+ * as "really gone".
+ *
+ * Two, not one. A lease lapses while its holder is perfectly healthy whenever a query runs long, and
+ * the next heartbeat re-extends it; correcting a status on a single lapse would report a live peer's
+ * sessions as disconnected, and nothing would put that right, because the peer's own renewal still
+ * finds its nodeId and detects no loss. A lease expires one TTL after the holder's last renewal, so a
+ * row is corrected more than three TTLs after that renewal, plus up to one sweep interval.
+ *
+ * Adoption does not wait for this and acts on the first lapse. It goes through claim(), which takes a
+ * lapsed lease outright: a holder that was only slow loses the session and tears its engine down at
+ * its next heartbeat.
+ */
+const STRANDED_LEASE_TTL_MULTIPLE = 2;
 
 /**
  * Adopts sessions whose holder's lease has lapsed.
@@ -74,9 +95,12 @@ export class SessionTakeoverService implements OnApplicationBootstrap, OnModuleD
   }
 
   onApplicationBootstrap(): void {
-    // The same flag that governs boot auto-start: a deployment that opted out of automatic engine
-    // starts must not get spontaneous ones from the sweep either.
-    if (!resolveFeatureFlags(this.configService).autoStartSessions) return;
+    // Deliberately NOT gated on auto-start any more. The sweep now has a second job that starts
+    // nothing: correcting a status whose owner is gone. Nothing else revisits one, because the boot
+    // reset skips a foreign claim that is still live and after a container recreate the previous
+    // hostname IS foreign, so with auto-start off the row went on reporting a running engine no
+    // process holds. The adopt loop below is still behind the flag: an operator who disabled
+    // auto-start asked for no spontaneous engine starts, not for a dashboard that lies.
     const sweepMs = this.configService?.get<number>('session.takeoverSweepMs', 30_000) ?? 30_000;
     this.sweepTimer = setInterval(() => {
       // At most one sweep at a time: a slow start (Chromium launch) must not stack a second sweep
@@ -104,10 +128,30 @@ export class SessionTakeoverService implements OnApplicationBootstrap, OnModuleD
     }
   }
 
-  /** One pass: adopt every eligible lapsed session. Exposed for the spec; the timer drives it. */
+  /**
+   * One pass: correct every stale status a vanished node left behind, then, when AUTO_START_SESSIONS
+   * is on, adopt every eligible lapsed session. Runs on every node whatever that flag says, and a
+   * failed correction is logged without costing the pass its adoptions. Exposed for the spec; the
+   * timer drives it.
+   */
   async sweep(): Promise<void> {
     if (this.stopping) return;
     const lapsed = await this.ownership.lapsedHeldByOthers();
+
+    // Correct the stale statuses BEFORE adopting: a row this pass goes on to start gets its
+    // INITIALIZING written by start() afterwards, so the correction can never land on a live engine.
+    // Idempotent, because DISCONNECTED is not one of the statuses it acts on. A failure leaves no
+    // write pending, so the adopt loop still runs; the next pass retries the correction.
+    const goneBefore = new Date(Date.now() - this.ownership.leaseTtlMs * STRANDED_LEASE_TTL_MULTIPLE);
+    try {
+      await this.sessionService.markLapsedDisconnected(lapsed, goneBefore);
+    } catch (error) {
+      this.logger.warn('Lapsed session status correction failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    if (!resolveFeatureFlags(this.configService).autoStartSessions) return;
     const eligible = lapsed.filter(session => this.isEligible(session));
     if (eligible.length === 0) return;
 

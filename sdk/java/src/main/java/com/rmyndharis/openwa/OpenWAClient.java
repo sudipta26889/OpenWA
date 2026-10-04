@@ -12,6 +12,7 @@ import com.rmyndharis.openwa.http.HttpMethod;
 import com.rmyndharis.openwa.model.MuteChatRequest;
 import com.rmyndharis.openwa.model.UpdateSessionConfigRequest;
 import com.rmyndharis.openwa.model.UpdateSessionConfigRequestSerializer;
+import com.rmyndharis.openwa.model.UpdateSessionProxyRequest;
 import com.rmyndharis.openwa.http.HttpRequestData;
 import com.rmyndharis.openwa.http.HttpResponseData;
 import com.rmyndharis.openwa.http.HttpTransport;
@@ -44,8 +45,10 @@ import java.util.Map;
  *
  * <pre>{@code
  * OpenWAClient client = new OpenWAClient("http://localhost:2785", "owa_k1_…");
- * client.sessions.start("my-session");
- * client.messages.sendText("my-session",
+ * // Sessions are addressed by the UUID that create() returns, not by name.
+ * SessionResponse session = client.sessions.create(CreateSessionRequest.builder().name("my-session").build());
+ * client.sessions.start(session.id());
+ * client.messages.sendText(session.id(),
  *     SendTextRequest.builder().chatId("628123456789@c.us").text("Hello!").build());
  * }</pre>
  */
@@ -192,7 +195,11 @@ public final class OpenWAClient {
      * turn into an unintended "reset to default".
      */
     private Gson bodySerializer(Object body) {
-        return body instanceof UpdateSessionConfigRequest || body instanceof MuteChatRequest ? nullEmittingGson : gson;
+        return body instanceof UpdateSessionConfigRequest
+                        || body instanceof MuteChatRequest
+                        || body instanceof UpdateSessionProxyRequest
+                ? nullEmittingGson
+                : gson;
     }
 
     private HttpResponseData execute(HttpMethod method, String path, Object query, Object body) {

@@ -1,6 +1,6 @@
 /**
  * Baileys Engine Plugin
- * Built-in engine plugin that wraps the @whiskeysockets/baileys library (minimal slice).
+ * Built-in engine plugin that wraps the @whiskeysockets/baileys library.
  */
 
 import { PluginContext, PluginType, IEnginePlugin } from '../../../core/plugins';
@@ -8,6 +8,7 @@ import { IWhatsAppEngine } from '../../interfaces/whatsapp-engine.interface';
 import { BaileysAdapter } from '../../adapters/baileys.adapter';
 import { BaileysMessageStore } from '../../types/baileys.types';
 import { LidMappingStore } from '../../identity/lid-mapping-store.service';
+import { ChatStateStore } from '../../adapters/baileys-chat-state-store.service';
 
 export class BaileysPlugin implements IEnginePlugin {
   type = PluginType.ENGINE as const;
@@ -20,6 +21,7 @@ export class BaileysPlugin implements IEnginePlugin {
     private readonly messageStore?: BaileysMessageStore,
     private readonly registeredConfig?: Record<string, unknown>,
     private readonly lidMappingStore?: LidMappingStore,
+    private readonly chatStateStore?: ChatStateStore,
   ) {}
 
   onLoad(context: PluginContext): Promise<void> {
@@ -58,6 +60,7 @@ export class BaileysPlugin implements IEnginePlugin {
       proxyType,
       messageStore: this.messageStore,
       lidMappingStore: this.lidMappingStore,
+      chatStateStore: this.chatStateStore,
     });
   }
 
@@ -74,6 +77,11 @@ export class BaileysPlugin implements IEnginePlugin {
       'message-deletion',
       'group-management',
       'read-receipts',
+      'channels',
+      'status-updates',
+      'catalog',
+      // No 'labels': Baileys can create, delete and attach labels but has no query for them, so the
+      // label and chat-label reads 501 and a client could not read back what it wrote.
     ];
   }
 

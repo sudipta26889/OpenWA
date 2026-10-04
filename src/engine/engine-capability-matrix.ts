@@ -218,7 +218,7 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     wwjs: { status: 'supported' },
     baileys: { status: 'not-available', rootCause: 'library-limitation' },
     evidence:
-      'baileys no getLabel/getLabelById in lib/**/*.d.ts (Types/Label.d.ts has only Label interface + LabelColor enum + LabelActionBody); derivable only from an app-state-sync label cache; wwjs Client.getLabelById (Client.js:2838)',
+      'baileys no getLabel/getLabelById in lib/**/*.d.ts (Types/Label.d.ts has only Label interface + LabelColor enum + LabelActionBody); derivable only from an app-state-sync label cache; wwjs picks from Client.getLabels (Client.js:2760), since Client.getLabelById (Client.js:2838) throws page-side for an unknown id',
   },
   getLabels: {
     wwjs: { status: 'supported' },
@@ -299,10 +299,28 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
       'baileys createCallLink(type, {startTime}, timeoutMs) (Socket/chats.d.ts:17) resolves the bare link_create token (Socket/chats.js:586-603), assembled behind CALL_VIDEO_PREFIX / CALL_AUDIO_PREFIX (Defaults/index.d.ts:5-6); wwjs Client.createCallLink(startTime, callType) (index.d.ts:342) resolves the finished link or an empty string (Client.js:3212-3235)',
   },
   rejectCall: {
+    wwjs: { status: 'not-available', rootCause: 'library-limitation' },
+    baileys: { status: 'supported' },
+    evidence:
+      "baileys rejectCall(callId, callFrom) (Socket/messages-recv.d.ts:10) with the raw `from` JID cached from the 'offer' call event (Types/Call.d.ts); measured live on 2026-09-17 with 7.0.0-rc14, a real call fired call.received then call.rejected and auto-reject stopped the caller's phone at once. wwjs Call.reject() exists and is typed Promise<void> (index.d.ts:2417) on the Call from the client 'call' event (index.d.ts:643), but measured live on 2026-09-17 on OpenWA 0.23.4 with WhatsApp Web 2.3000.1047471845-alpha the reject resolved and OpenWA logged the call as auto-rejected while the caller's phone kept ringing until it timed out. The cause is not established. The page function Call.reject() runs, WWebJS.rejectCall, is modified by OpenWA patch 1 (scripts/wwebjs-201832.patch), which reads getMaybeMePnUser()._serialized || $1",
+  },
+  requestPairingCode: {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      "wwjs Call.reject() (index.d.ts:2417) on the live Call cached from the client 'call' event (index.d.ts:643); baileys rejectCall(callId, callFrom) (Socket/messages-recv.d.ts:10) with the raw `from` JID cached from the 'offer' call event (Types/Call.d.ts)",
+      'Curated for a hazard, not a gap: both engines return a code. wwjs Client.requestPairingCode ' +
+      '(Client.js:516-571) runs in the shared WhatsApp Web page and calls ' +
+      'PairingCodeLinkUtils.setPairingType + initializeAltDeviceLinking before startAltLinkingFlow, ' +
+      'checking no precondition; measured twice (2026-09-17, 2026-09-18) a request for a number that ' +
+      'already had a linked session was followed within about a minute by WhatsApp revoking that ' +
+      'device, whatsapp-web.js deleting its credentials and the session returning to qr_ready. It ' +
+      'also arms an in-page 3-minute re-request interval that mints a fresh code and notifies the ' +
+      'phone on every tick. The interval lives in the page, so it dies with the next WhatsApp Web ' +
+      'reload (roughly every 20s while UNPAIRED) and with the session; the library does expose ' +
+      'cancelPairingCode, but it returns the page to QR mode, which is not what a retry wants. ' +
+      'baileys requestPairingCode ' +
+      '(Socket/socket.js:596-650) writes only its own creds and sends one link_code_companion_reg IQ, ' +
+      'with no shared page; no side effect was observed there.',
   },
   sendCatalog: {
     wwjs: { status: 'not-available', rootCause: 'library-limitation' },
@@ -332,7 +350,7 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      'wwjs GroupChat.setDescription(description) → boolean (index.d.ts:1984; false → adapter throws EngineRefusedError); baileys groupUpdateDescription(jid, description?) (Socket/groups.d.ts:21)',
+      "wwjs GroupChat.setDescription(description) → boolean (index.d.ts:1984; false → adapter throws EngineRefusedError) — depends on 🔧⁹ (scripts/patch-wwebjs-group-description.js): stock 1.34.7 calls the page's WAWebGroupModifyInfoJob.setGroupDescription positionally, but that job now takes a single options object {desc, groupWid, newDescId, prevDescId}, so widToGroupJid reads an undefined Wid and throws inside the page, reaching the caller as a bare 500. setGroupSubject in the same module is still positional and is unaffected. Patched call measured live on wwjs 1.34.7: set reads back, empty string clears. baileys groupUpdateDescription(jid, description?) (Socket/groups.d.ts:21)",
   },
   setGroupEphemeral: {
     wwjs: { status: 'not-available', rootCause: 'library-limitation' },
@@ -417,6 +435,12 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     baileys: { status: 'not-available', rootCause: 'library-limitation' },
     evidence:
       "wwjs Message.vote(selectedOptions: string[]) (index.d.ts:1376) matches poll options BY NAME against msg.pollOptions and throws a bare STRING on a non-poll target (Message.js:1009-1040); baileys has no vote-send helper at all — only decryptPollVote for RECEIVING (Utils/process-message.d.ts), so sending needs a hand-built proto.Message.PollUpdateMessage with HMAC-SHA256 vote encryption keyed by the poll creation's messageSecret",
+  },
+  clickButton: {
+    wwjs: { status: 'not-available', rootCause: 'library-limitation' },
+    baileys: { status: 'supported' },
+    evidence:
+      'wwjs has no interactive button-reply send path; baileys sendMessage({buttonReply,type}) / sendMessage({listReply}) for buttonsMessage, templateMessage and listMessage (Types/Message.d.ts ButtonReplyInfo / listReply; Utils/messages.js). Native-flow interactiveMessage has no helper and is unverified: the adapter sends a template buttonReply, not InteractiveResponseMessage, and must not be advertised as fully supported until a live business native-flow prompt confirms the server accepts it',
   },
   unpinMessage: {
     wwjs: { status: 'supported' },

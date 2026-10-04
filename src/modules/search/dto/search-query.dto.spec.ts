@@ -27,6 +27,13 @@ describe('SearchQueryDto', () => {
     expect(validateSync(dto).some(e => e.property === 'offset')).toBe(true);
   });
 
+  // Both are bound straight into LIMIT ? OFFSET ?, where SQLite and PostgreSQL reject a fraction with a
+  // 500; the DTO must stop it as a 400.
+  it('rejects a fractional limit or offset', () => {
+    expect(validateSync(fromQuery({ q: 'hello', limit: '1.5' })).some(e => e.property === 'limit')).toBe(true);
+    expect(validateSync(fromQuery({ q: 'hello', offset: '0.5' })).some(e => e.property === 'offset')).toBe(true);
+  });
+
   it('rejects limit < 1 (@Min(1))', () => {
     const dto = fromQuery({ q: 'hello', limit: '0' });
     expect(validateSync(dto).some(e => e.property === 'limit')).toBe(true);
@@ -35,6 +42,11 @@ describe('SearchQueryDto', () => {
   it('rejects offset < 0 (@Min(0))', () => {
     const dto = fromQuery({ q: 'hello', offset: '-1' });
     expect(validateSync(dto).some(e => e.property === 'offset')).toBe(true);
+  });
+
+  it('rejects offset above SEARCH_OFFSET_MAX instead of letting the service clamp it to a repeated page', () => {
+    expect(validateSync(fromQuery({ q: 'hello', offset: '100001' })).some(e => e.property === 'offset')).toBe(true);
+    expect(validateSync(fromQuery({ q: 'hello', offset: '100000' }))).toHaveLength(0);
   });
 
   it('rejects an invalid direction (@IsEnum(MessageDirection))', () => {

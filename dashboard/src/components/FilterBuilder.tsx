@@ -3,11 +3,13 @@ import { useTranslation } from 'react-i18next';
 import { Plus, X } from 'lucide-react';
 import {
   MESSAGE_TYPES,
+  CHAT_KINDS,
   type Chat,
   type WebhookFilters,
   type WebhookFilterCondition,
   type WebhookFilterOperator,
 } from '../services/api';
+import { filterValueLabel } from '../utils/enumLabels';
 import './FilterBuilder.css';
 
 type FieldKind = 'id' | 'idArray' | 'text' | 'enum' | 'boolean';
@@ -23,9 +25,11 @@ interface FieldDescriptor {
 const MESSAGE_FIELDS: FieldDescriptor[] = [
   { field: 'sender', kind: 'id', operators: ['is', 'isNot'] },
   { field: 'recipient', kind: 'id', operators: ['is', 'isNot'] },
+  { field: 'chatId', kind: 'id', operators: ['is', 'isNot'] },
   { field: 'body', kind: 'text', operators: ['contains', 'equals'] },
   { field: 'type', kind: 'enum', operators: ['is', 'isNot'], enumValues: MESSAGE_TYPES },
   { field: 'isGroup', kind: 'boolean', operators: ['is'] },
+  { field: 'kind', kind: 'enum', operators: ['is', 'isNot'], enumValues: CHAT_KINDS },
   { field: 'fromMe', kind: 'boolean', operators: ['is'] },
   { field: 'hasMedia', kind: 'boolean', operators: ['is'] },
   { field: 'mentions', kind: 'idArray', operators: ['is', 'isNot'] },
@@ -63,10 +67,14 @@ function ContactChipsInput({ value, onChange, chats }: ContactChipsInputProps) {
   const suggestions = useMemo(() => {
     const query = text.trim().toLowerCase();
     const chosen = new Set(value);
-    return chats
-      .filter(c => !chosen.has(c.id))
-      .filter(c => !query || c.name.toLowerCase().includes(query) || c.id.toLowerCase().includes(query))
-      .slice(0, 8);
+    return (
+      chats
+        .filter(c => !chosen.has(c.id))
+        .filter(c => !query || c.name.toLowerCase().includes(query) || c.id.toLowerCase().includes(query))
+        // The dropdown scrolls, so this only bounds how much of an account with up to 1000 chats is
+        // rendered on every keystroke. Typing narrows the list further.
+        .slice(0, 50)
+    );
   }, [text, chats, value]);
 
   const labelFor = (jid: string) => chats.find(c => c.id === jid)?.name ?? jid;
@@ -224,7 +232,7 @@ export function FilterBuilder({ filters, onChange, chats }: FilterBuilderProps) 
                           });
                         }}
                       >
-                        {option}
+                        {filterValueLabel(t, def.field, option)}
                       </button>
                     );
                   })}

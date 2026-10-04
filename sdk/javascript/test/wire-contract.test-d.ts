@@ -50,7 +50,7 @@ interface WireStatus {
   expiresAt: string;
 }
 
-/** `Channel` — `picture`/`createdAt` come from the Baileys `toChannel()` path; wwjs omits both. */
+/** `Channel` — `createdAt` comes from the Baileys `toChannel()` path; wwjs omits it. No engine fills `picture`. */
 interface WireChannel {
   id: string;
   name: string;
@@ -103,6 +103,8 @@ interface WireChatHistoryMessage {
     | 'poll'
     | 'call'
     | 'revoked'
+    | 'order'
+    | 'product'
     | 'masked'
     | 'unknown';
   timestamp: number;
@@ -137,6 +139,8 @@ interface WireChatHistoryMessage {
   media?: { mimetype: string; filename?: string; data?: string; omitted?: boolean; sizeBytes?: number };
   quotedMessage?: { id: string; body: string };
   location?: { latitude: number; longitude: number; description?: string; address?: string; url?: string };
+  order?: { orderId: string; token?: string };
+  product?: { productId: string; title?: string; description?: string; businessOwnerJid?: string };
 }
 
 /** `Catalog` — the control: this pair already agreed before #754 and must stay agreeing. */

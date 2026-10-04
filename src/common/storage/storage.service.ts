@@ -14,8 +14,15 @@ import {
 } from '@aws-sdk/client-s3';
 import { createLogger } from '../services/logger.service';
 import { isSafeStorageKey } from '../utils/path-safety';
-import { createExportStream, importFromStream } from './storage-transfer';
-import { listLocalFiles, iterateLocalFiles, getLocalFile, putLocalFile, deleteLocalFile } from './storage-local-files';
+import { createExportStream, ExportFileSource, importFromStream } from './storage-transfer';
+import {
+  listLocalFiles,
+  iterateLocalFiles,
+  getLocalFile,
+  openLocalFile,
+  putLocalFile,
+  deleteLocalFile,
+} from './storage-local-files';
 
 interface S3Config {
   endpoint?: string;
@@ -92,6 +99,24 @@ export class StorageService implements OnModuleDestroy {
         this.s3Bucket = process.env.S3_BUCKET || s3Config.bucket || 'openwa';
         void this.initializeS3Bucket();
         this.startS3Reprobe();
+      } else {
+        // Every other degradation in this service announces itself, but this one could not: the
+        // logging all lives past the client construction above, so an s3 deployment missing its
+        // credentials built no client, wrote every file to local disk, and said nothing at all.
+        // The operator's first symptom was an empty bucket with no failure to point at.
+        //
+        // Name the variables actually missing rather than declaring all of them absent: reaching
+        // here with one of the pair set is a plain typo in the other, and "no credentials found"
+        // would send that operator looking at the one they got right.
+        const missing = [
+          accessKeyId ? null : 'S3_ACCESS_KEY_ID',
+          secretAccessKey ? null : 'S3_SECRET_ACCESS_KEY',
+        ].filter((name): name is string => name !== null);
+        this.logger.warn(
+          `STORAGE_TYPE=s3 but ${missing.join(' and ')} is not set; media is being written to the ` +
+            `local dir '${this.localPath}' instead of the bucket. The built-in MinIO uses ` +
+            `minioadmin/minioadmin.`,
+        );
       }
     }
 
@@ -267,6 +292,20 @@ export class StorageService implements OnModuleDestroy {
     return this.getLocalFile(filePath);
   }
 
+  /**
+   * Open a file as a stream instead of reading it into memory, with the same key guard and S3
+   * read-through as getFile. A missing or unreadable file rejects here rather than on the stream.
+   */
+  async openFile(filePath: string): Promise<ExportFileSource> {
+    if (!isSafeStorageKey(filePath)) {
+      throw new Error(`Refusing to read an unsafe storage key: ${filePath}`);
+    }
+    if (this.storageType === 's3' && this.s3Client && this.s3Available) {
+      return this.openS3File(filePath);
+    }
+    return openLocalFile(this.localPath, filePath);
+  }
+
   async putFile(filePath: string, data: Buffer): Promise<void> {
     // Centralized containment so BOTH backends inherit it: putLocalFile has its own isPathWithin
     // guard, but putS3File builds `media/${filePath}` with none — reject a traversing key here.
@@ -383,7 +422,7 @@ export class StorageService implements OnModuleDestroy {
     // could not reveal the gap. An export exists to be complete; that is what the uncapped walk is for.
     return createExportStream(
       () => this.listAllFiles(),
-      filePath => this.getFile(filePath),
+      filePath => this.openFile(filePath),
       this.logger,
     );
   }
@@ -471,6 +510,15 @@ export class StorageService implements OnModuleDestroy {
   }
 
   private async getS3File(filePath: string): Promise<Buffer> {
+    const { stream } = await this.openS3File(filePath);
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) {
+      chunks.push(Buffer.from(chunk as ArrayBuffer));
+    }
+    return Buffer.concat(chunks);
+  }
+
+  private async openS3File(filePath: string): Promise<ExportFileSource> {
     if (!this.s3Client) throw new Error('S3 client not initialized');
 
     let response;
@@ -487,26 +535,19 @@ export class StorageService implements OnModuleDestroy {
       // fine during the outage). Fall through to the local copy; if there is none, surface the
       // original S3 error so "not found" semantics are unchanged.
       if ((error as { name?: string }).name !== 'NoSuchKey') throw error;
+      let local: ExportFileSource;
       try {
-        const local = await this.getLocalFile(filePath);
-        this.logger.debug(`Served '${filePath}' from the local fallback dir (not yet in S3)`);
-        return local;
+        local = await openLocalFile(this.localPath, filePath);
       } catch {
         throw error;
       }
+      this.logger.debug(`Served '${filePath}' from the local fallback dir (not yet in S3)`);
+      return local;
     }
 
     if (!response.Body) throw new Error('Empty response body');
 
-    // Convert stream to buffer
-    const chunks: Buffer[] = [];
-    const stream = response.Body as Readable;
-
-    for await (const chunk of stream) {
-      chunks.push(Buffer.from(chunk as ArrayBuffer));
-    }
-
-    return Buffer.concat(chunks);
+    return { stream: response.Body as Readable, size: response.ContentLength };
   }
 
   private async putS3File(filePath: string, data: Buffer): Promise<void> {

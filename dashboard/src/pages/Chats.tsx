@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo, useLayoutEffect } fr
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Trans, useTranslation } from 'react-i18next';
 import { nextReconnectState } from '../utils/reconnectState';
-import { applyIncomingToChatList } from '../utils/chatList';
+import { applyIncomingToChatList, promoteChatWithSnippet } from '../utils/chatList';
 import { filterChats, filterChannels, groupStatusesByContact } from '../utils/chatFilters';
 import { ArrowLeft, Loader2, Megaphone, CircleDashed, AlertCircle, MessageSquare } from 'lucide-react';
 import { useProfilePicture } from '../hooks/useProfilePicture';
@@ -25,20 +25,30 @@ import {
   mergeDeliveryStatus,
   mergeReactionSnapshot,
   findRevokedIndex,
+  patchMatchingMessage,
+  byMessageId,
   getMediaSrc,
+  liveMessageMetadata,
+  stripMentionDelimiters,
   type ChatMessageView,
   type MessageMedia,
 } from '../utils/chatMessages';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import { useToast } from '../hooks/useToast';
+import { useRole } from '../hooks/useRole';
 import { PageHeader } from '../components/PageHeader';
 import { GlobalSearch } from '../components/GlobalSearch';
-import { useChatMessages, useChatMessagesActions, messagesQueryKey } from '../hooks/useChatMessages';
+import {
+  useChatMessages,
+  useChatMessagesActions,
+  messagesQueryKey,
+  updateCachedMessages,
+  cachedSessionThreads,
+} from '../hooks/useChatMessages';
 import { useChannelMessages } from '../hooks/useChannelMessages';
 import { useContactStatuses } from '../hooks/useContactStatuses';
 import { useChatScrollPosition } from '../hooks/useChatScrollPosition';
-import { useCurrentEngineQuery } from '../hooks/queries';
 import { createTrailingCoalescer } from '../utils/trailingCoalescer';
 import MessageBody from '../components/chats/MessageBody';
 import MediaLightbox, { type LightboxItem } from '../components/chats/MediaLightbox';
@@ -70,6 +80,8 @@ interface IncomingWsMessage {
   // The backend emits `call` as a top-level field on the live `message.received` event (it's only
   // folded into `metadata` on the persisted/history path), so declare it here to carry it through.
   call?: { video: boolean; missed: boolean };
+  /** Business prompt choices (Baileys); top-level on the live event, folded into metadata for the UI. */
+  buttons?: Array<{ id: string; text: string }>;
   metadata?: ChatMessageView['metadata'];
   kind?: ChatKind;
   /** Group poster: `from` is the group JID, so `contact`/`author` identify who actually sent it. */
@@ -109,6 +121,7 @@ export function Chats() {
   const { t } = useTranslation();
   useDocumentTitle(t('nav.chats'));
   const { error: showErrorToast, warning: showWarningToast } = useToast();
+  const { canWrite, engineType } = useRole();
 
   // Sessions list & active session
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -141,8 +154,8 @@ export function Chats() {
 
   // Channels tab: only whatsapp-web.js implements channel listing/reading — Baileys throws 501 for
   // both, so the query is gated off entirely (never fired) rather than left to fail per-request.
-  const currentEngine = useCurrentEngineQuery();
-  const channelsSupported = currentEngine.data?.engineType === 'whatsapp-web.js';
+  // The engine comes from the sign-in validate response, which every role can read.
+  const channelsSupported = engineType === 'whatsapp-web.js';
   const channelsQuery = useQuery({
     queryKey: ['channels', selectedSessionId],
     queryFn: () => sessionApi.getSubscribedChannels(selectedSessionId!),
@@ -173,6 +186,9 @@ export function Chats() {
     data: messages = [],
     isLoading: loadingMessages,
     isError: messagesError,
+    hasNextPage: hasMoreMessages,
+    isFetchingNextPage: loadingOlderMessages,
+    fetchNextPage,
   } = useChatMessages(selectedSessionId, activeChat?.id ?? null);
   const { appendMessage, updateMessage } = useChatMessagesActions();
   const queryClient = useQueryClient();
@@ -200,10 +216,11 @@ export function Chats() {
     return () => URL.revokeObjectURL(previewUrl);
   }, [previewUrl]);
 
-  // Drop a staged attachment when the user moves to a DIFFERENT chat. Closing the room
-  // (`activeChat` → null) deliberately keeps it, so close/reopen is a lossless round trip; only an
-  // actual change of conversation clears. The composer invalidates its in-flight FileReader on the
-  // same transition, so a late read cannot re-stage the file against the new chat.
+  // Drop a staged attachment and a staged reply when the user moves to a DIFFERENT chat. Closing the
+  // room (`activeChat` → null) deliberately keeps them, so close/reopen is a lossless round trip; only
+  // an actual change of conversation clears. A reply carried across would quote the previous chat's
+  // message, text and sender included, into the new one. The composer invalidates its in-flight
+  // FileReader on the same transition, so a late read cannot re-stage the file against the new chat.
   const lastRoomIdRef = useRef<string | null>(null);
   useEffect(() => {
     const current = activeChat?.id ?? null;
@@ -213,6 +230,7 @@ export function Chats() {
     if (previous === null || previous === current) return;
     setAttachment(null);
     setPreviewUrl(null);
+    setReplyingTo(null);
   }, [activeChat]);
 
   // Per-chat scroll-position memory + auto-scroll heuristic.
@@ -224,7 +242,14 @@ export function Chats() {
     containerRef: messagesContainerRef,
     onMessageAppended,
     onMediaLoad,
-  } = useChatScrollPosition(activeChat?.id ?? null, messages.length > 0);
+    measureMedia,
+    onOlderMessagesRequested,
+  } = useChatScrollPosition(activeChat?.id ?? null, messages.length > 0, loadingOlderMessages);
+
+  const handleLoadOlderMessages = useCallback(() => {
+    onOlderMessagesRequested();
+    void fetchNextPage();
+  }, [fetchNextPage, onOlderMessagesRequested]);
 
   // Batch profile-picture fetch for the visible chat list — ONE request for the whole sidebar
   // (per-row queries burst the per-IP throttle into 429s). Sorted-key cached 1h; rows fall back
@@ -248,6 +273,19 @@ export function Chats() {
   const activePhoneText =
     activePhoneDisplay ?? (resolvedPhoneQ.data ? formatPhoneForDisplay(resolvedPhoneQ.data) : null);
 
+  // The list loaders below reach the translator and the error toast through a ref, not as
+  // dependencies: both change identity on a language switch, which re-ran the session load (it
+  // reselected the first session) and, through loadChats, the session-reset effect (it closed the
+  // open chat and dropped a staged file or reply).
+  const loadErrorRef = useRef({ t, showErrorToast });
+  useEffect(() => {
+    loadErrorRef.current = { t, showErrorToast };
+  });
+  const showLoadError = useCallback((key: string, err: unknown) => {
+    const current = loadErrorRef.current;
+    current.showErrorToast(current.t(key), err instanceof Error ? err.message : undefined);
+  }, []);
+
   // 1. Fetch available connected sessions on mount
   useEffect(() => {
     const loadSessions = async () => {
@@ -260,32 +298,57 @@ export function Chats() {
           setSelectedSessionId(readySessions[0].id);
         }
       } catch (err) {
-        showErrorToast(t('chats.errors.loadSessions'), err instanceof Error ? err.message : undefined);
+        showLoadError('chats.errors.loadSessions', err);
       } finally {
         setLoadingSessions(false);
       }
     };
     void loadSessions();
-  }, [t, showErrorToast]);
+  }, [showLoadError]);
 
-  // 2. Fetch chats when active session changes
+  // 2. Fetch chats when active session changes. A session switch does not cancel the list still
+  // loading for the session left behind, so an answer for any session but the latest call's is
+  // dropped, or it would put that account's chats under the selected session. Within one session an
+  // answer is dropped only once a newer one has landed: dropping every answer a newer call overtook
+  // left a burst of realtime refetches with no list at all, each miss firing the next refetch.
+  // A realtime refetch runs in the background, keeping the current list on screen.
+  const chatsRequestRef = useRef(0);
+  const chatsAppliedRef = useRef(0);
+  const chatsSessionRef = useRef('');
   const loadChats = useCallback(
-    async (sessionId: string) => {
+    async (sessionId: string, { background = false } = {}) => {
       if (!sessionId) return;
+      const request = ++chatsRequestRef.current;
+      chatsSessionRef.current = sessionId;
+      const stale = () => sessionId !== chatsSessionRef.current || request < chatsAppliedRef.current;
       try {
-        setLoadingChats(true);
+        if (!background) setLoadingChats(true);
         const data = await sessionApi.getChats(sessionId);
+        if (stale()) return;
+        chatsAppliedRef.current = request;
         const sorted = [...data].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
         setChats(sorted);
       } catch (err) {
-        showErrorToast(t('chats.errors.loadChats'), err instanceof Error ? err.message : undefined);
+        // A background refetch only refreshes summaries: keep the list it would have replaced.
+        if (stale() || background) return;
+        showLoadError('chats.errors.loadChats', err);
         setChats([]);
       } finally {
-        setLoadingChats(false);
+        // Only the call that raised the spinner clears it: a background refetch settling first would
+        // otherwise uncover the previous session's list while the switch's own load is still out.
+        if (!background && sessionId === chatsSessionRef.current) setLoadingChats(false);
       }
     },
-    [t, showErrorToast],
+    [showLoadError],
   );
+
+  // A send resolves after the await, possibly once another session's list is on screen. That list can
+  // hold a chat with the same id (a group or contact both accounts share), so the promote only applies
+  // to the session the send started in.
+  const promoteSentChat = useCallback((sessionId: string, chatId: string, snippet: string, sentAt: number) => {
+    if (sessionId !== chatsSessionRef.current) return;
+    setChats(prev => promoteChatWithSnippet(prev, chatId, snippet, sentAt));
+  }, []);
 
   useEffect(() => {
     if (selectedSessionId) {
@@ -293,12 +356,13 @@ export function Chats() {
       setActiveChat(null);
       setActiveChannel(null);
       setActiveStatusContactId(null);
-      // A staged attachment belongs to a chat in the session being left, so it is dropped here
+      // A staged attachment or reply belongs to a chat in the session being left, so it is dropped here
       // rather than carried across — the close/reopen round trip that preserves it is scoped to a
       // single session. Clearing previewUrl runs the revoke effect's cleanup; the composer
       // unmounts with the closed room and invalidates its own in-flight FileReader.
       setAttachment(null);
       setPreviewUrl(null);
+      setReplyingTo(null);
       lastRoomIdRef.current = null;
     }
   }, [selectedSessionId, loadChats]);
@@ -323,14 +387,19 @@ export function Chats() {
   // where those queued reads belong.
   useEffect(() => () => markReadCoalescer.flush(), [markReadCoalescer]);
 
+  // Marking a chat read is an operator write; a read-only key would only collect 403 toasts.
   const markChatRead = useCallback(
     (chatId: string) => {
-      markReadCoalescer.call(chatId);
+      if (canWrite) markReadCoalescer.call(chatId);
     },
-    [markReadCoalescer],
+    [markReadCoalescer, canWrite],
   );
 
   // 3. WebSocket integration for real-time messages
+  const chatsRef = useRef(chats);
+  useEffect(() => {
+    chatsRef.current = chats;
+  });
   const handleIncomingMessage = useCallback(
     (event: { sessionId: string; message: Record<string, unknown> }) => {
       if (event.sessionId !== selectedSessionId) return;
@@ -353,11 +422,7 @@ export function Chats() {
         status: 'sent',
         timestamp: newMsg.timestamp,
         createdAt: new Date(newMsg.timestamp * 1000).toISOString(),
-        metadata: newMsg.metadata || {
-          media: newMsg.media,
-          quotedMessage: newMsg.quotedMessage,
-          call: newMsg.call,
-        },
+        metadata: liveMessageMetadata(newMsg),
         kind: newMsg.kind,
       };
 
@@ -371,46 +436,40 @@ export function Chats() {
         if (!newMsg.fromMe) onMessageAppended('incoming');
       }
 
-      // Update sidebar chat list. The refetch is REPORTED by the reducer and fired below, never from
-      // inside the updater: React double-invokes updaters under StrictMode, so a side effect in there
-      // ran twice for every message arriving in a chat the sidebar does not have.
-      let needsSidebarRefetch = false;
-      setChats(prevChats => {
-        const result = applyIncomingToChatList(prevChats, newMsg, {
-          activeChatId: activeChat?.id,
-          // A location message's body is the (multi-KB) base64 map thumbnail; show a label instead.
-          locationLabel: `📍 ${t('chats.media.location')}`,
-        });
-        needsSidebarRefetch = result.needsSidebarRefetch;
-        return result.chats;
-      });
+      // Update sidebar chat list. Whether the chat is missing is decided against the list on screen,
+      // never inside the updater: React double-invokes updaters under StrictMode, and it may defer
+      // one to the next render, so a flag set in there was still false when read here and a chat the
+      // sidebar does not list never appeared.
+      const listOptions = {
+        // Only a chat this key marks read is exempt from the unread count (see markChatRead).
+        activeChatId: canWrite ? activeChat?.id : undefined,
+        // A location message's body is the (multi-KB) base64 map thumbnail; show a label instead.
+        locationLabel: `📍 ${t('chats.media.location')}`,
+      };
+      const { needsSidebarRefetch } = applyIncomingToChatList(chatsRef.current, newMsg, listOptions);
+      setChats(prevChats => applyIncomingToChatList(prevChats, newMsg, listOptions).chats);
       if (needsSidebarRefetch) {
-        void loadChats(selectedSessionId);
+        void loadChats(selectedSessionId, { background: true });
       }
     },
-    [selectedSessionId, activeChat, loadChats, markChatRead, appendMessage, onMessageAppended, t],
+    [selectedSessionId, activeChat, canWrite, loadChats, markChatRead, appendMessage, onMessageAppended, t],
   );
 
   const handleIncomingMessageAck = useCallback(
     (event: { sessionId: string; messageId: string; status: ChatMessageView['status'] }) => {
       if (event.sessionId !== selectedSessionId) return;
 
-      // Acks can arrive for any cached chat under this session. Walk every cache entry under
-      // ['messages', event.sessionId, *] and apply the forward-only delivery merge in place.
-      const caches = queryClient.getQueriesData<ChatMessageView[]>({
-        queryKey: ['messages', event.sessionId],
-      });
-      for (const [key, list] of caches) {
-        if (!list) continue;
-        const idx = list.findIndex(m => m.id === event.messageId || m.waMessageId === event.messageId);
-        if (idx === -1) continue;
-        const target = list[idx];
+      // Acks can arrive for any cached chat under this session, so every thread is checked.
+      for (const [key, thread] of cachedSessionThreads(queryClient, event.sessionId, byMessageId(event.messageId))) {
+        const target = thread.find(byMessageId(event.messageId));
+        if (!target) continue;
         // Backend now sends the neutral delivery status directly (no engine-specific ack codes).
         // Merge forward-only so an out-of-order/replayed lower ack can't downgrade the tick.
         const nextStatus = mergeDeliveryStatus(target.status, event.status) ?? target.status;
-        const next = list.slice();
-        next[idx] = { ...target, status: nextStatus };
-        queryClient.setQueryData(key, next);
+        if (nextStatus === target.status) continue;
+        updateCachedMessages(queryClient, key, list =>
+          patchMatchingMessage(list, event.messageId, m => ({ ...m, status: nextStatus })),
+        );
       }
     },
     [selectedSessionId, queryClient],
@@ -426,23 +485,16 @@ export function Chats() {
       //
       // The absent-vs-empty distinction on `reactions` is mergeReactionSnapshot's job; it is a named
       // function so the behaviour is covered by a test, because nothing here is.
-      const caches = queryClient.getQueriesData<ChatMessageView[]>({
-        queryKey: ['messages', event.sessionId],
-      });
-      for (const [key, list] of caches) {
-        if (!list) continue;
-        const idx = list.findIndex(m => m.id === event.messageId || m.waMessageId === event.messageId);
-        if (idx === -1) continue;
-        const target = list[idx];
-        const next = list.slice();
-        next[idx] = {
-          ...target,
-          metadata: {
-            ...(target.metadata || {}),
-            reactions: mergeReactionSnapshot(target.metadata?.reactions, event.reactions),
-          },
-        };
-        queryClient.setQueryData(key, next);
+      for (const [key] of cachedSessionThreads(queryClient, event.sessionId, byMessageId(event.messageId))) {
+        updateCachedMessages(queryClient, key, list =>
+          patchMatchingMessage(list, event.messageId, m => ({
+            ...m,
+            metadata: {
+              ...(m.metadata || {}),
+              reactions: mergeReactionSnapshot(m.metadata?.reactions, event.reactions),
+            },
+          })),
+        );
       }
     },
     [selectedSessionId, queryClient],
@@ -455,17 +507,15 @@ export function Chats() {
       // Walk every cached chat under this session, find the deleted message and zero it — the
       // backend emits an empty body; the localized "deleted" label is rendered below. Matching is
       // in findRevokedIndex: the event carries two candidate ids and wwebjs's `id` alone can miss.
-      const caches = queryClient.getQueriesData<ChatMessageView[]>({
-        queryKey: ['messages', event.sessionId],
-      });
-      for (const [key, list] of caches) {
-        if (!list) continue;
-        const idx = findRevokedIndex(list, event);
-        if (idx === -1) continue;
-        const target = list[idx];
-        const next = list.slice();
-        next[idx] = { ...target, body: '', type: asMessageType(event.type) };
-        queryClient.setQueryData(key, next);
+      const revoked = (m: ChatMessageView): boolean => findRevokedIndex([m], event) !== -1;
+      for (const [key] of cachedSessionThreads(queryClient, event.sessionId, revoked)) {
+        updateCachedMessages(queryClient, key, list => {
+          const idx = findRevokedIndex(list, event);
+          if (idx === -1) return list;
+          const next = list.slice();
+          next[idx] = { ...next[idx], body: '', type: asMessageType(event.type) };
+          return next;
+        });
       }
     },
     [selectedSessionId, queryClient],
@@ -475,23 +525,19 @@ export function Chats() {
     (event: { sessionId: string; messageId: string; chatId: string; body: string }) => {
       if (event.sessionId !== selectedSessionId) return;
 
-      const caches = queryClient.getQueriesData<ChatMessageView[]>({
-        queryKey: ['messages', event.sessionId],
-      });
       let matchedCachedMessage = false;
       let editedLastMessage = false;
-      for (const [key, list] of caches) {
-        if (!list) continue;
-        const next = applyMessageEdit(list, event);
-        if (next === list) continue;
+      for (const [key, thread] of cachedSessionThreads(queryClient, event.sessionId, byMessageId(event.messageId))) {
+        // Position is asked of the merged thread, never of a page: pages carry only a fraction of
+        // the chat each, so "is this the last message" is only ever answerable from the whole thing.
+        const editedIndex = thread.findIndex(byMessageId(event.messageId));
+        if (editedIndex === -1) continue;
         matchedCachedMessage = true;
-        queryClient.setQueryData(key, next);
+        updateCachedMessages(queryClient, key, list => applyMessageEdit(list, event));
 
-        // Message caches are chronological; only editing the final row changes the sidebar preview.
-        // Confirm the cache belongs to the event chat before touching that summary.
-        const cachedChatId = Array.isArray(key) && typeof key[2] === 'string' ? key[2] : undefined;
-        const editedIndex = list.findIndex(m => m.id === event.messageId || m.waMessageId === event.messageId);
-        if (cachedChatId === event.chatId && editedIndex === list.length - 1) editedLastMessage = true;
+        // Only editing the newest row changes the sidebar preview. Confirm the thread belongs to
+        // the event chat before touching that summary.
+        if (key[2] === event.chatId && editedIndex === thread.length - 1) editedLastMessage = true;
       }
       if (editedLastMessage) {
         setChats(previous =>
@@ -501,7 +547,7 @@ export function Chats() {
         // The chat may never have been opened, so there is no message cache from which to prove
         // whether this was its latest row. Refresh summaries instead of guessing and overwriting the
         // sidebar with the body of an older edited message.
-        void loadChats(selectedSessionId);
+        void loadChats(selectedSessionId, { background: true });
       }
     },
     [selectedSessionId, queryClient, loadChats],
@@ -542,7 +588,8 @@ export function Chats() {
   // A transient WebSocket gap means message.received/ack/revoke events were missed, and the chat
   // cache uses staleTime: Infinity so it won't refetch on its own. On a reconnect (isConnected
   // false→true after a prior connect), invalidate the active session's messages so the thread the
-  // gap left stale refreshes. The transition logic is unit-tested in utils/reconnectState.
+  // gap left stale refreshes. A failed feed counts as a gap even if it never connected, so the
+  // banner's retry refreshes too. The transition logic is unit-tested in utils/reconnectState.
   const reconnectHadConnected = useRef(false);
   const reconnectWasDisconnected = useRef(false);
   useEffect(() => {
@@ -550,6 +597,7 @@ export function Chats() {
       isConnected,
       hadConnected: reconnectHadConnected.current,
       wasDisconnected: reconnectWasDisconnected.current,
+      connectionFailed,
     });
     reconnectHadConnected.current = decision.hadConnected;
     reconnectWasDisconnected.current = decision.wasDisconnected;
@@ -559,7 +607,7 @@ export function Chats() {
       // otherwise stay invisible until a focus refetch.
       queryClient.invalidateQueries({ queryKey: ['contact-statuses', selectedSessionId] });
     }
-  }, [isConnected, selectedSessionId, queryClient]);
+  }, [isConnected, connectionFailed, selectedSessionId, queryClient]);
 
   useEffect(() => {
     if (selectedSessionId && isConnected) {
@@ -607,7 +655,7 @@ export function Chats() {
 
       // Deep-merge metadata.reactions so existing media / quotedMessage on metadata survive.
       const key = messagesQueryKey(selectedSessionId, activeChat.id);
-      queryClient.setQueryData<ChatMessageView[]>(key, (old = []) =>
+      updateCachedMessages(queryClient, key, old =>
         old.map(m => {
           if (m.id === msg.id || m.waMessageId === msg.id) {
             const metadata = m.metadata || {};
@@ -646,6 +694,22 @@ export function Chats() {
     }
   };
 
+  const handleClickButton = async (msg: ChatMessageView, button: { id: string; text: string }) => {
+    if (!selectedSessionId || !activeChat) return;
+    const msgId = msg.waMessageId || msg.id;
+    try {
+      await messageApi.clickButton(selectedSessionId, {
+        chatId: activeChat.id,
+        messageId: msgId,
+        buttonId: button.id,
+        text: button.text,
+      });
+    } catch (err) {
+      showErrorToast(t('chats.errors.clickButton'), err instanceof Error ? err.message : undefined);
+      throw err;
+    }
+  };
+
   // Side effects when the active chat changes: mark-as-read on the gateway + clear sidebar unread badge.
   // The message-history fetch is driven by useChatMessages; scroll restoration is driven by
   // useChatScrollPosition (both keyed off activeChat?.id). Deliberately keying off `activeChat?.id`
@@ -654,9 +718,11 @@ export function Chats() {
   useEffect(() => {
     if (!activeChat) return;
     markChatRead(activeChat.id);
-    setChats(prev => prev.map(c => (c.id === activeChat.id ? { ...c, unreadCount: 0 } : c)));
+    // A read-only key sends no mark-as-read, so the chat stays unread on the gateway; clearing the
+    // badge here would only have the next chat-list load bring it back.
+    if (canWrite) setChats(prev => prev.map(c => (c.id === activeChat.id ? { ...c, unreadCount: 0 } : c)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeChat?.id, markChatRead]);
+  }, [activeChat?.id, markChatRead, canWrite]);
 
   // --- Global search: jump to a hit's chat (and best-effort scroll to the message) ---
   // A cross-session hit switches session, which asynchronously reloads the chats list — so the
@@ -666,7 +732,25 @@ export function Chats() {
   const pendingHitRef = useRef<{ chatId: string; waMessageId: string } | null>(null);
 
   const handleSearchHit = useCallback(
-    (hit: SearchHit) => {
+    async (hit: SearchHit) => {
+      // Search covers stored messages of every session, but the page can only open a ready one, and
+      // its list is read on mount. A session missing from it is looked up again, since it may have
+      // connected since; one that still is not ready is refused rather than selected with no chats.
+      if (hit.sessionId !== selectedSessionId && !sessions.some(s => s.id === hit.sessionId)) {
+        let ready: Session[];
+        try {
+          ready = (await sessionApi.list()).filter(s => s.status === 'ready');
+        } catch (err) {
+          showLoadError('chats.errors.loadSessions', err);
+          return;
+        }
+        if (!ready.some(s => s.id === hit.sessionId)) {
+          pendingHitRef.current = null;
+          showWarningToast(t('chats.errors.searchHitSessionNotReady'));
+          return;
+        }
+        setSessions(ready);
+      }
       pendingHitRef.current = { chatId: hit.chatId, waMessageId: hit.waMessageId };
       if (hit.sessionId !== selectedSessionId) {
         // Switching session triggers loadChats; the effect below selects the chat once the list lands.
@@ -695,13 +779,15 @@ export function Chats() {
         }
       }
     },
-    [selectedSessionId, chats, switchTab],
+    [selectedSessionId, sessions, chats, switchTab, showLoadError, showWarningToast, t],
   );
 
   // After a session switch the chats list reloads — pick up the pending chat once it appears.
+  // While the switch's list is loading, `chats` still holds the previous session's list, which can
+  // list the same id (a shared group or contact) as a Chat object from the other account.
   useEffect(() => {
     const pending = pendingHitRef.current;
-    if (!pending || activeChat?.id === pending.chatId) return;
+    if (!pending || loadingChats || activeChat?.id === pending.chatId) return;
     const chat = chats.find(c => c.id === pending.chatId);
     if (chat) {
       if (chat.kind === 'channel') {
@@ -719,7 +805,7 @@ export function Chats() {
         setActiveStatusContactId(null);
       }
     }
-  }, [chats, activeChat, switchTab]);
+  }, [chats, loadingChats, activeChat, switchTab]);
 
   // Best-effort scroll to the hit message. Runs as a layout effect (after useChatScrollPosition's
   // own restore on the same commit) so it overrides the bottom/saved jump with no visible flash.
@@ -788,6 +874,25 @@ export function Chats() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [activeStatusGroup?.contact.id, activeStatusGroup?.items]);
 
+  // Escape closes the open view and returns to the list. Anything that owns the key already keeps
+  // it: a modal (Modal renders role="dialog" only while open) and the language menu (role="menu")
+  // are skipped here, and so is the media viewer, whose library renders its own role="dialog"
+  // portal and closes itself on Escape. A handler that called preventDefault, or a composition
+  // still being committed by an IME, is left alone for the same reason.
+  useEffect(() => {
+    const closeOpenViewOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing) return;
+      if (document.querySelector('[role="dialog"], [role="menu"]')) return;
+      if (activeStatusContactId !== null) setActiveStatusContactId(null);
+      else if (activeChannel) setActiveChannel(null);
+      else if (activeChat) setActiveChat(null);
+      else return;
+      event.preventDefault();
+    };
+    document.addEventListener('keydown', closeOpenViewOnEscape);
+    return () => document.removeEventListener('keydown', closeOpenViewOnEscape);
+  }, [activeStatusContactId, activeChannel, activeChat]);
+
   // Image media items for the lightbox, in render order. `getMediaSrc` reconstructs a usable src
   // from either a base64 payload or a URL — the ChatMessageView shape stores both in `data`.
   const imageMedia = useMemo<LightboxItem[]>(
@@ -798,6 +903,7 @@ export function Chats() {
           id: m.id,
           url: getMediaSrc(m.metadata?.media),
           alt: m.body || m.metadata?.media?.filename || '',
+          filename: m.metadata?.media?.filename,
           senderName: undefined,
           timestamp: formatChatTime(m.timestamp || Math.floor(new Date(m.createdAt).getTime() / 1000)),
         })),
@@ -860,7 +966,7 @@ export function Chats() {
               onSelectChat: setActiveChat,
             }}
             channelsTab={{
-              engineLoading: currentEngine.isLoading,
+              engineLoading: engineType === null,
               supported: channelsSupported,
               query: channelsQuery,
               channels: filteredChannels,
@@ -924,7 +1030,11 @@ export function Chats() {
                   loadingMessages={loadingMessages}
                   messagesError={messagesError}
                   messagesContainerRef={messagesContainerRef}
+                  hasMoreMessages={Boolean(hasMoreMessages)}
+                  loadingOlderMessages={loadingOlderMessages}
+                  onLoadOlderMessages={handleLoadOlderMessages}
                   onMediaLoad={onMediaLoad}
+                  measureMedia={measureMedia}
                   onOpenImage={messageId => {
                     const idx = imageMedia.findIndex(x => x.id === messageId);
                     if (idx >= 0) setLightboxIndex(idx);
@@ -932,6 +1042,7 @@ export function Chats() {
                   onReply={setReplyingTo}
                   onReact={handleReactMessage}
                   onDelete={handleDeleteMessage}
+                  onClickButton={handleClickButton}
                 />
 
                 {/* Composer: attachment preview, emoji panel, reply banner, input bar —
@@ -942,7 +1053,7 @@ export function Chats() {
                   replyingTo={replyingTo}
                   setReplyingTo={setReplyingTo}
                   onMessageAppended={onMessageAppended}
-                  setChats={setChats}
+                  onSent={promoteSentChat}
                   messageInput={messageInput}
                   setMessageInput={setMessageInput}
                   attachment={attachment}
@@ -982,7 +1093,7 @@ export function Chats() {
                     (channelMessages.data ?? []).map(m => (
                       <div key={m.id} className="message-bubble incoming">
                         {m.hasMedia && m.mediaUrl && <img className="channel-media" src={m.mediaUrl} alt="" />}
-                        {m.body && <MessageBody text={m.body} className="message-text" />}
+                        {m.body && <MessageBody text={stripMentionDelimiters(m.body)} className="message-text" />}
                         <span className="message-time">{formatChatTime(m.timestamp)}</span>
                       </div>
                     ))
@@ -1028,7 +1139,9 @@ export function Chats() {
                           type={item.type === 'video' ? 'video' : item.type === 'voice' ? 'audio' : 'image'}
                         />
                       )}
-                      {item.caption && <MessageBody text={item.caption} className="message-text" />}
+                      {item.caption && (
+                        <MessageBody text={stripMentionDelimiters(item.caption)} className="message-text" />
+                      )}
                       <span className="message-time">
                         {formatChatTime(Math.floor(new Date(item.timestamp).getTime() / 1000))}
                       </span>

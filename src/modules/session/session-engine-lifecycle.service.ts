@@ -14,6 +14,7 @@ import { PresenceStore } from './presence-store.service';
 import { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { resolveEngineInitTimeoutMs } from '../../engine/engine-init-timeout';
+import { isKnownTerminalEngineFailure } from '../../engine/terminal-engine-failure';
 import { StatusStoreService } from '../status-store/status-store.service';
 import { IWhatsAppEngine, AccountRestriction } from '../../engine/interfaces/whatsapp-engine.interface';
 import { createLogger } from '../../common/services/logger.service';
@@ -28,7 +29,11 @@ import { HookManager } from '../../core/hooks';
 import { SessionLifecycleFences } from './session-lifecycle-fences';
 import { SessionStatusBroadcaster } from './session-status-broadcaster';
 import { SessionEngineLeafEvents } from './session-engine-leaf-events';
-import { SessionEngineEventWiring, SessionEngineWiringHost } from './session-engine-event-wiring';
+import {
+  RECONNECT_LOOP_REASON,
+  SessionEngineEventWiring,
+  SessionEngineWiringHost,
+} from './session-engine-event-wiring';
 import { SessionEngineControls } from './session-engine-controls';
 import { SessionOwnershipService, nodeOwnsSession } from './session-ownership.service';
 
@@ -41,13 +46,16 @@ const isStatusSeedOnReadyEnabled = (): boolean => process.env.STATUS_SEED_ON_REA
 
 // Message types that carry downloadable media. Any persisted row of these types must have a media
 // marker in metadata — never NULL — or the dashboard renders an empty bubble (no placeholder) and the
-// by-type stats filter skips the row. Sources that arrive without a media field (media-free history
-// sync, a wwjs own-send echo whose download failed) get the omitted marker synthesized at the
-// persistence chokepoints.
+// by-type stats filter skips the row. Sources that arrive without a media field (the media-free
+// history sync) get the omitted marker synthesized at the persistence chokepoints.
 
 export interface ReconnectState extends ReconnectAttemptState {
   /** The pending attempt's timer. Lives here, not in the policy, which stays free of side effects. */
   timer: NodeJS.Timeout | null;
+  /** True while executeReconnect awaits its re-init: an engine failure reported then is parked, not applied. */
+  initInFlight?: boolean;
+  /** The failure parked during that window, applied or dropped by executeReconnect once init settles. */
+  parkedFailure?: { run: () => void; terminal: boolean };
 }
 
 // Reconnect-backoff bounds. An OPERATOR-supplied session.config feeds this math, so the values
@@ -59,18 +67,21 @@ const RECONNECT_MAX_ATTEMPTS_CAP = 20;
 
 /** Coerce + clamp the untyped session.config reconnect knobs to finite, bounded values. Defaults are
  *  a 5000ms base delay and UNLIMITED attempts (`Infinity`): a long-lived session must keep retrying
- *  (the backoff parks at the 1h cap) instead of dying permanently after ~2.5 minutes. An EXPLICIT
- *  `maxReconnectAttempts: 0` (disable) is preserved, and 1..20 clamps as before. */
+ *  (the backoff parks at the 5-minute cap) instead of dying permanently after ~2.5 minutes. An EXPLICIT
+ *  `maxReconnectAttempts: 0` (disable) is preserved, and 1..20 clamps as before; null means unset. */
 export function resolveReconnectConfig(
   config: { maxReconnectAttempts?: unknown; reconnectBaseDelay?: unknown } | null,
 ): { maxAttempts: number; baseDelay: number } {
-  const baseRaw = Number(config?.reconnectBaseDelay);
+  // null, undefined and a blank string mean "unset" (GET /config reports the unlimited default as null), not
+  // the 0 that Number() makes of them; a numeric string a create body stored still coerces.
+  const toNumber = (v: unknown): number => (v == null || (typeof v === 'string' && v.trim() === '') ? NaN : Number(v));
+  const baseRaw = toNumber(config?.reconnectBaseDelay);
   const baseDelay = clampNumber(
     Number.isFinite(baseRaw) ? baseRaw : 5000,
     RECONNECT_BASE_DELAY_MIN_MS,
     RECONNECT_BASE_DELAY_MAX_MS,
   );
-  const attemptsRaw = Number(config?.maxReconnectAttempts);
+  const attemptsRaw = toNumber(config?.maxReconnectAttempts);
   const maxAttempts = Number.isFinite(attemptsRaw)
     ? Math.floor(clampNumber(attemptsRaw, 0, RECONNECT_MAX_ATTEMPTS_CAP))
     : Number.POSITIVE_INFINITY;
@@ -145,6 +156,25 @@ const TERMINAL_UNLINK_REASONS = new Set(['LOGOUT', 'UNPAIRED', 'UNPAIRED_IDLE', 
  * executeReconnect calls initializeEngine), so they stay in ONE service — splitting them would need
  * forwardRef(), which this codebase deliberately avoids.
  */
+/**
+ * The session-row fields a READY writes.
+ *
+ * An empty `phone` must NOT overwrite the bound number. whatsapp-web.js can momentarily report an
+ * empty phone at ready (client.info unreadable), and the account-binding guard in
+ * SessionEngineEventWiring skips an empty incoming phone rather than rebind-rejecting it, so writing
+ * it here would silently clear the stored number and drop the binding guard until the next non-empty
+ * ready. In that case keep the existing binding and update only the liveness fields.
+ */
+export function readyRowUpdate(phone: string, pushName: string, at: Date) {
+  return {
+    status: SessionStatus.READY,
+    ...(phone ? { phone } : {}),
+    pushName,
+    connectedAt: at,
+    lastActiveAt: at,
+  };
+}
+
 @Injectable()
 export class SessionEngineLifecycle {
   private readonly logger = createLogger('SessionEngineLifecycle');
@@ -191,15 +221,16 @@ export class SessionEngineLifecycle {
   }
 
   // Destructive credential-teardown promises (logout rms of the session's on-disk WhatsApp auth
-  // dir), keyed by session NAME — the on-disk auth-dir key (EngineFactory.wwjsAuthDir/baileysAuthDir
-  // and adapter clearLocalAuth all build the path from Session.name), NOT the UUID. A losing
-  // logout() promise keeps running past its deadline race and ends in an fs.rm of that dir — the
-  // same path a later start() under the SAME name re-creates — so start()/delete()/executeReconnect
-  // consult this map and wait (bounded, fail-closed) for settlement before touching that path. After
-  // an old UUID's session is deleted and the name is recreated, a late logout from the old UUID
-  // still targets the new session's dir (same name → same path), so keying by name keeps the fence
-  // attached to the credential path that is actually at risk. Entries self-remove on settlement
-  // (identity-checked); nothing else evicts them (delete()'s finally no longer drops them).
+  // dir), keyed by session NAME. A losing logout() promise keeps running past its deadline race and
+  // ends in an fs.rm of that dir — the same path a later start() re-creates — so
+  // start()/delete()/executeReconnect consult this map and wait (bounded, fail-closed) for
+  // settlement before touching that path. The dirs themselves are keyed by Session.id (#1597), and
+  // the name is unique, so for a live row the two keys are 1:1 and the name fence covers exactly the
+  // id's path; across a delete and a recreate under the same name it merely holds the new session
+  // back a little longer than strictly needed, which is the safe direction. The name is also what
+  // the public refusal code (SESSION_NAME_TEARDOWN_PENDING) is documented against. Entries
+  // self-remove on settlement (identity-checked); nothing else evicts them (delete()'s finally no
+  // longer drops them).
   private readonly pendingTeardowns = new Map<string, Promise<void>>();
 
   // The in-flight `updateStatus(INITIALIZING)` write keyed by id, carrying the EXACT engine it
@@ -212,6 +243,17 @@ export class SessionEngineLifecycle {
   // a delayed INITIALIZING for engine A can never be awaited as / delete the entry of a replacement
   // engine B the control action did not capture.
   private readonly pendingInitialStatuses = new Map<string, { engine: IWhatsAppEngine; promise: Promise<void> }>();
+
+  // The engine an operator-initiated teardown (stop/logout/forceKill) is currently retiring, keyed
+  // by id and holding the EXACT instance. An adapter reports DISCONNECTED synchronously on entry to
+  // its teardown, before the engine is evicted (whatsapp-web.js then awaits browser.close(), which
+  // takes seconds), so that report is announced while GET /sessions still answers
+  // `engineLoaded: true`, and the verb's own DISCONNECTED write afterwards is dropped by the
+  // broadcaster's de-dup, leaving the corrected view unannounced. The wiring consults this to skip
+  // the engine-driven DISCONNECTED for the instance being torn down; the verb announces it after the
+  // eviction. Identity-keyed, never on the id alone: a replacement engine from a concurrent start()
+  // must still announce, and a mark outliving a refused verb must not mute a later real disconnect.
+  private readonly operatorTeardowns = new Map<string, IWhatsAppEngine>();
 
   // The ONE-SHOT budget for an automatic stuck-auth credential reset, hoisted out of the adapter
   // instance and keyed by session id. recoverFromStuckAuth() (a generation that authenticated but
@@ -291,11 +333,15 @@ export class SessionEngineLifecycle {
     // promise and add settlement hops the retirement-race specs assert against).
     this.wiringHost = {
       isLiveEngine: (id, engine) => this.isLiveEngine(id, engine),
+      isOperatorTeardown: (id, engine) => this.operatorTeardowns.get(id) === engine,
       ownsSession: id => this.ownsSession(id),
       handleEngineReady: (id, engine, phone, pushName) => this.handleEngineReady(id, engine, phone, pushName),
+      rejectRebind: (id, engine, sessionName, previousPhone, incomingPhone) =>
+        this.rejectRebind(id, engine, sessionName, previousPhone, incomingPhone),
       handleEngineDisconnected: (id, engine, reason) => this.handleEngineDisconnected(id, engine, reason),
       updateStatus: (id, status) => this.updateStatus(id, status),
       cancelReconnect: id => this.cancelReconnect(id),
+      parkReconnectInitFailure: (id, run, reason) => this.parkReconnectInitFailure(id, run, reason),
       evictAndForceDestroy: (id, engine) => this.evictAndForceDestroy(id, engine),
       trackPendingCredentialTeardown: (sessionName, raw) => this.trackPendingCredentialTeardown(sessionName, raw),
       reportRestrictionLifted: (id, lifted) => this.reportRestrictionLifted(id, lifted),
@@ -346,9 +392,10 @@ export class SessionEngineLifecycle {
       cancelReconnect: id => this.cancelReconnect(id),
       initializeEngine: (id, session) => this.initializeEngine(id, session),
       isSessionRetired: id => this.isSessionRetired(id),
-      purgeAuthDirsIfDeleted: (id, name) => this.purgeAuthDirsIfDeleted(id, name),
+      purgeAuthDirsIfDeleted: id => this.purgeAuthDirsIfDeleted(id),
       updateStatus: (id, status) => this.updateStatus(id, status),
       stoppingSessions: this.stoppingSessions,
+      operatorTeardowns: this.operatorTeardowns,
       reconnectStates: this.reconnectStates,
       stuckAuthRecoveryUsed: this.stuckAuthRecoveryUsed,
       initializingSessions: this.initializingSessions,
@@ -470,8 +517,8 @@ export class SessionEngineLifecycle {
   isEngineActive(id: string): boolean {
     if (this.engines.has(id) || this.initializingSessions.has(id)) return true;
     // Reconnect state counts only while an attempt is actually pending: a timer armed by
-    // scheduleReconnect, or one that has fired and is running executeReconnect (which leaves the
-    // spent handle in place and has already counted its attempt). The entry start() creates up
+    // scheduleReconnect, or one that has fired and is running executeReconnect (which has already
+    // counted its attempt). The entry start() creates up
     // front — {attempts: 0, timer: null} — is dormant: a start that then failed leaves nothing
     // that will ever re-register an engine, and treating it as liveness would pin the claim to
     // this node forever.
@@ -537,13 +584,18 @@ export class SessionEngineLifecycle {
       proxyEnabled: !!session.proxyUrl,
     });
 
+    // The engine is keyed by the session UUID, not its name: names are unique case-sensitively, so
+    // two rows differing only in case shared one auth directory on a case-insensitive filesystem
+    // (#1597). SessionAuthDirMigration renames the legacy name-keyed directories at boot.
     const engine = this.engineFactory.create({
-      sessionId: session.name,
+      sessionId: id,
       dbSessionId: id,
       proxyUrl: session.proxyUrl || undefined,
       proxyType: session.proxyType || undefined,
     });
-    this.engines.set(id, engine);
+    // The proxy is registered with the engine, not re-read from the row later: it is the egress this
+    // engine will use until it is replaced, and a fetch made on the session's behalf must match it.
+    this.engines.set(id, engine, session.proxyUrl || undefined);
     // Presence subscriptions live on the socket, so a fresh engine has none — whatever the previous
     // connection last reported is now unverifiable and would be served as if it were current.
     this.presence.clear(id);
@@ -600,14 +652,15 @@ export class SessionEngineLifecycle {
     // lifecycle's live methods/state through the wiringHost built in the constructor.
     // `session.name` is handed over as the immutable snapshot onCredentialTeardownStarted keys on.
     const initPromise = engine.initialize(
-      this.eventWiring.buildCallbacks(id, engine, session.name, this.wiringHost, Boolean(session.phone)),
+      this.eventWiring.buildCallbacks(id, engine, session.name, this.wiringHost, session.phone ?? null),
     );
 
     // engine.initialize() launches Chromium and navigates to WhatsApp Web with no internal timeout:
     // whatsapp-web.js calls page.goto(..., { timeout: 0 }) and its web-version-cache fetch has none
     // either. If the browser stalls under container memory pressure (observed in prod: a session
-    // wedged in INITIALIZING with no error logged and GET /sessions/:id/qr 400ing forever), this
-    // await never settles. Race it against a deadline so a wedged init fails fast instead.
+    // wedged in INITIALIZING with no error logged and GET /sessions/:id/qr 400ing forever), or if
+    // WhatsApp Web is simply unreachable so the navigation never completes, this await never settles.
+    // Race it against a deadline so a wedged init fails fast instead.
     //
     // ONLY the timeout case mutates state here. A REAL rejection (e.g. Chromium can't launch) must
     // propagate untouched so start()'s catch keeps owning FAILED+reason (the diagnosability #600/#631
@@ -651,26 +704,94 @@ export class SessionEngineLifecycle {
         await this.teardownEngineSafely(id, engine, e => e.forceDestroy(), 'force-destroy');
         await this.updateStatus(id, SessionStatus.DISCONNECTED);
         // Map to a diagnostic 504 like the auth-timeout branch below, so a wedged init doesn't escape as a
-        // bare 500 (#733 follow-up). The browser stalled mid-startup — usually a container memory/resource
-        // limit or a wedged Chromium, not a network/proxy issue (that's the auth-timeout's signature).
+        // bare 500 (#733 follow-up). This deadline covers EVERY cause and cannot tell them apart: the
+        // auth-timeout below only fires once the page has LOADED (whatsapp-web.js navigates with
+        // page.goto(..., { waitUntil: 'load', timeout: 0 }) and starts its authTimeoutMs poll in inject()
+        // afterwards), so a navigation that hangs (an unreachable WhatsApp Web, or a proxy that accepts
+        // the connection and never answers) hits this deadline too, not the auth timeout. The message must
+        // name every cause and rule out none. It also says ENGINE, not browser: the deadline is
+        // engine-agnostic (Baileys launches no browser), and in the hang case the browser did start.
         throw new HttpException(
-          `Engine initialization timed out after ${err.timeoutMs}ms — the browser process did not complete ` +
-            'startup in time (often a container memory/resource limit or a stalled Chromium, not a network ' +
-            'issue). Retry the session; for chronically slow first boots, raise WWEBJS_AUTH_TIMEOUT_MS.',
+          `Engine initialization timed out after ${err.timeoutMs}ms: the engine did not finish starting. ` +
+            'WhatsApp Web, the network or the session proxy may be unreachable, or the browser may have ' +
+            'stalled during startup (for example a container memory/resource limit). Retry the session; for ' +
+            'chronically slow first boots, raise WWEBJS_AUTH_TIMEOUT_MS.',
           HttpStatus.GATEWAY_TIMEOUT,
         );
       } else if (isAuthTimeoutRejection(err)) {
         // The engine's INTERNAL auth-timeout: whatsapp-web.js throws the primitive string 'auth timeout'
         // (see ENGINE_AUTH_TIMEOUT) when its inject poll exhausts authTimeoutMs (default 30s) — the common
         // pre-QR failure when the browser launched but couldn't reach WhatsApp, e.g. a dead/unreachable
-        // session proxy (#733). onError already evicted the engine + wrote FAILED before this catch ran, so
-        // only the HTTP mapping remains: surface a diagnostic 504 instead of letting the bare string escape
-        // to NestJS's default handler as a meaningless 500.
+        // session proxy (#733). On a start() onError already evicted the engine + wrote FAILED before this
+        // catch ran (a reconnect parked that report, and its catch evicts and retries instead), so only
+        // the HTTP mapping remains: surface a diagnostic 504 instead of letting the bare string escape to
+        // NestJS's default handler as a meaningless 500.
         throw new HttpException(ENGINE_AUTH_TIMEOUT_MESSAGE, HttpStatus.GATEWAY_TIMEOUT);
       }
       throw err;
     } finally {
       if (initTimer) clearTimeout(initTimer);
+    }
+  }
+
+  /**
+   * Refuse a ready link whose account differs from the one this session is bound to. Reached only via
+   * the account-binding guard in SessionEngineEventWiring, i.e. the session already carries a phone and
+   * a DIFFERENT number scanned its QR. The incoming account is never persisted: log the reason, tear
+   * the wrong account's engine down (logout wipes its on-disk credentials and unlinks the device), land
+   * the session in FAILED, and audit it. The original `phone` binding is deliberately left in place so
+   * a subsequent stranger scan is rejected the same way, and the operator can see which number it is
+   * bound to. A caller-initiated logout latches its own teardown flags on both engines, so the
+   * disconnected handler (which would null the stored phone) never fires here.
+   */
+  private async rejectRebind(
+    id: string,
+    engine: IWhatsAppEngine,
+    sessionName: string,
+    previousPhone: string,
+    incomingPhone: string,
+  ): Promise<void> {
+    if (!this.isLiveEngine(id, engine)) return;
+    const reason =
+      `Link rejected: this session is bound to ${previousPhone}, but a different WhatsApp number ` +
+      `(${incomingPhone}) scanned its QR. Re-pair the original number, or delete the session to bind a new one.`;
+    this.logger.warn('Rejected a QR link from a different WhatsApp account', {
+      sessionId: id,
+      previousPhone,
+      incomingPhone,
+      action: 'rebind_rejected',
+    });
+    // Terminal, not a flap: suppress the reconnect/re-init auto-recovery and stop the watchdog. FAILED
+    // (persisted) already excludes the session from boot auto-start and the takeover sweep; a manual
+    // start() clears stoppingSessions. cancelReconnect is defensive: a caller-initiated logout does not
+    // schedule a reconnect, but a stray timer from before the ready must not fire against a dead engine.
+    this.stoppingSessions.add(id);
+    this.cancelReconnect(id);
+    this.watchdog.clear(id);
+    this.sessionErrors.set(id, reason);
+    // Record the rejection before the teardown, so it lands even if a concurrent start() replaces the
+    // engine while logout runs and the re-fence below returns early.
+    void this.auditService?.logWarn(AuditAction.SESSION_REBIND_REJECTED, {
+      sessionId: id,
+      metadata: { previousPhone, incomingPhone },
+      errorMessage: reason,
+    });
+    // logout() wipes the wrong account's credentials and removes this device from that account.
+    await this.teardownEngineSafely(id, engine, e => e.logout(), 'logout', sessionName);
+    // Re-fence after the await, as handleEngineDisconnected does: a concurrent start() may have
+    // replaced the engine while logout ran. If this handler is now stale it must not delete the new
+    // engine or write FAILED over a fresh start.
+    if (!this.isLiveEngine(id, engine)) return;
+    this.engines.deleteIfLive(id, engine);
+    // Fenced on ownership like every engine-driven terminal write: a lapsed lease must not park a
+    // peer's session unrecoverably in FAILED. Defensively caught like handleEngineReady's row write.
+    if (this.ownsSession(id)) {
+      await this.updateStatus(id, SessionStatus.FAILED).catch(err =>
+        this.logger.warn('Failed to persist the rebind-rejected FAILED state', {
+          sessionId: id,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
     }
   }
 
@@ -697,10 +818,17 @@ export class SessionEngineLifecycle {
       },
     );
 
-    // Reset reconnect attempts and clear any stale failure reason on success
+    // Reset reconnect attempts and clear any stale failure reason on success. READY also ends the
+    // episode: a reconnect still pending (the watchdog reported this engine, then it recovered on
+    // its own) would tear the recovered engine down. Only the timer goes; the state keeps the
+    // session's reconnect settings for its next drop.
     const reconnectState = this.reconnectStates.get(id);
     if (reconnectState) {
       reconnectState.attempts = 0;
+      if (reconnectState.timer) {
+        clearTimeout(reconnectState.timer);
+        reconnectState.timer = null;
+      }
     }
     // A fresh READY stretch starts the watchdog's failure budget clean too.
     this.watchdog.clear(id);
@@ -715,20 +843,12 @@ export class SessionEngineLifecycle {
     // one-shot recovery budget is re-armed for a future episode.
     this.stuckAuthRecoveryUsed.delete(id);
 
-    void this.sessionRepository
-      .update(id, {
-        status: SessionStatus.READY,
-        phone,
-        pushName,
-        connectedAt: new Date(),
-        lastActiveAt: new Date(),
-      })
-      .catch(err =>
-        this.logger.warn('Failed to persist session ready state', {
-          sessionId: id,
-          error: err instanceof Error ? err.message : String(err),
-        }),
-      );
+    void this.sessionRepository.update(id, readyRowUpdate(phone, pushName, new Date())).catch(err =>
+      this.logger.warn('Failed to persist session ready state', {
+        sessionId: id,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
 
     // Best-effort snapshot of the account's own contacts' currently-active statuses. Live status
     // posts arrive through onMessage below; this just backfills what was already up before we
@@ -896,8 +1016,13 @@ export class SessionEngineLifecycle {
 
     const state = this.reconnectStates.get(id);
     if (!state) return;
+    // A reconnect is already armed for this episode. Another disconnect report (the liveness watchdog
+    // re-probes a wedged engine that still says READY) must neither consume an attempt nor push the
+    // pending one back: re-arming each time kept a long base delay from ever firing. Also keeps two
+    // back-to-back disconnects from stacking two timers and double-initializing the engine.
+    if (state.timer) return;
 
-    // All the backoff rules (stability reset, budget, exponential delay, loop cadence) live in the
+    // All the backoff rules (budget, exponential delay, loop cadence) live in the
     // pure policy; this method only applies the effects the decision calls for.
     const decision = decideReconnect(state);
 
@@ -908,12 +1033,22 @@ export class SessionEngineLifecycle {
         action: 'reconnect_failed',
       });
       // Don't leave the session silently stuck DISCONNECTED — mark it terminally FAILED with a reason
-      // so findOne/findAll surface it via `lastError` and the dashboard shows it needs a restart.
-      this.sessionErrors.set(id, decision.reason);
+      // so findOne/findAll surface it via `lastError` and the dashboard shows it needs a restart. The
+      // last attempt's own failure is kept alongside: it is the diagnosis, and this write would
+      // otherwise erase it. The engine-internal loop banner is not a cause, so it is not repeated.
+      const lastError = this.sessionErrors.get(id);
+      const reason =
+        lastError && !lastError.startsWith(RECONNECT_LOOP_REASON)
+          ? `${decision.reason} Last error: ${lastError}`
+          : decision.reason;
+      this.sessionErrors.set(id, reason);
       // Same ownership fence as the engine callbacks: a reconnect chain that exhausts itself after
       // this node's lease lapsed must not park a peer's session in FAILED, which nothing resets
       // automatically. The in-memory error above is per-process and harmless either way.
       if (this.ownsSession(id)) void this.updateStatus(id, SessionStatus.FAILED);
+      // The hook signal a terminal failure carries: a failed re-init no longer fires session:error per
+      // attempt, so the episode's one terminal end reports it here.
+      void this.hookManager.execute('session:error', { reason }, { sessionId: id, source: 'SessionService' });
       // Terminal path — evict the dead engine so it neither holds a concurrency slot nor makes a
       // subsequent start() reject the session as "already started". This mirrors onError's terminal
       // path (the same rationale: leaving the engine in the map wedges the session). The engine may
@@ -960,10 +1095,9 @@ export class SessionEngineLifecycle {
       });
     }
 
-    // Clear any timer a prior scheduleReconnect left pending so two back-to-back disconnects
-    // don't stack two timers (which would run executeReconnect twice and double-init the engine).
-    if (state.timer) clearTimeout(state.timer);
     state.timer = setTimeout(() => {
+      // Spent: the attempt's own failure path schedules the next one through the guard above.
+      state.timer = null;
       void this.executeReconnect(id, session, state);
     }, delay);
   }
@@ -988,17 +1122,16 @@ export class SessionEngineLifecycle {
    * engine eviction and its row removal initializes a fresh engine that RE-CREATES the auth dir
    * purgeSessionData just emptied (both engines mkdir at init); the post-init guard tears the engine
    * down, but engine teardown never touches the on-disk dirs, so without this second purge the race
-   * leaves live WhatsApp credentials behind — and a later same-name recreate would silently re-link
-   * them. Gated two ways so ONLY the delete race purges: a stop() retirement still has its row (its
-   * credentials must survive), and a row re-created under the SAME name now owns those dirs, so
-   * purging would wipe the fresh session's link. Best-effort: a failure is logged, never thrown —
-   * the retirement path must still surface the deleted session as NotFound.
+   * leaves live WhatsApp credentials behind on the volume. Gated on the row so ONLY the delete race
+   * purges: a stop() retirement still has its row and its credentials must survive. The dirs are
+   * keyed by the session id, which no recreate can reuse, so a surviving row under the same NAME is
+   * no longer consulted: it owns a different directory. Best-effort: a failure is logged, never
+   * thrown — the retirement path must still surface the deleted session as NotFound.
    */
-  private async purgeAuthDirsIfDeleted(id: string, name: string): Promise<void> {
+  private async purgeAuthDirsIfDeleted(id: string): Promise<void> {
     try {
       if ((await this.sessionRepository.findOne({ where: { id } })) != null) return;
-      if ((await this.sessionRepository.findOne({ where: { name } })) != null) return;
-      await this.engineFactory.purgeSessionData(name);
+      await this.engineFactory.purgeSessionData(id);
     } catch (error) {
       this.logger.warn('Failed to re-purge session auth dirs after a start/delete race', {
         sessionId: id,
@@ -1011,6 +1144,8 @@ export class SessionEngineLifecycle {
   private async executeReconnect(id: string, session: Session, state: ReconnectState): Promise<void> {
     // The session may have been stopped/deleted before this fired — don't resurrect it.
     if (this.stoppingSessions.has(id)) {
+      // Drop the spent state too: its attempt count would otherwise keep isEngineActive() pinning the lease.
+      if (this.reconnectStates.get(id) === state) this.cancelReconnect(id);
       return;
     }
     try {
@@ -1034,13 +1169,24 @@ export class SessionEngineLifecycle {
       // Credential-teardown fence — BEFORE engineFactory.create (inside initializeEngine). A logout
       // teardown that lost its deadline race is still running and ends in an fs.rm of this session's
       // on-disk profile — the same path initializeEngine is about to populate. Keyed by session NAME
-      // (the auth-dir key) and FAIL CLOSED: a timeout becomes a failed reconnect attempt that is
+      // (see awaitPendingTeardown) and FAIL CLOSED: a timeout becomes a failed reconnect attempt that is
       // rescheduled WITHOUT touching the auth dir (the catch below schedules the next attempt; no
       // engine was created, so there is nothing to evict and no dir to purge).
       await this.awaitPendingTeardown(session.name);
 
-      // Re-initialize
-      await this.initializeEngine(id, session);
+      // Re-initialize. An engine failure reported inside this window is parked (see
+      // parkReconnectInitFailure): a failed launch must retry, not land FAILED and strand the session.
+      state.initInFlight = true;
+      try {
+        await this.initializeEngine(id, session);
+      } finally {
+        state.initInFlight = false;
+      }
+      // Init resolved, so a failure the engine reported meanwhile (a stuck-auth or readiness timer, an
+      // auth failure) is real: apply it, unless a stop/delete/start already replaced this state.
+      const parked = state.parkedFailure;
+      state.parkedFailure = undefined;
+      if (parked && this.reconnectStates.get(id) === state) parked.run();
 
       // A stop()/delete() may have run while we awaited init — if so, tear down the engine we just
       // registered so it isn't orphaned (the session is meant to be down). delete() clears its
@@ -1063,15 +1209,26 @@ export class SessionEngineLifecycle {
         }
         // Same start/delete window as start()'s post-init guard: this re-init re-created auth dirs
         // delete() had already purged — purge again so no credentials outlive the row.
-        await this.purgeAuthDirsIfDeleted(id, session.name);
+        await this.purgeAuthDirsIfDeleted(id);
         return;
       }
     } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      const errorMessage = error instanceof Error ? error.message : String(error);
       this.logger.error(`Reconnect attempt ${state.attempts} failed`, errorMessage, {
         sessionId: id,
         action: 'reconnect_error',
       });
+      const parked = state.parkedFailure;
+      state.parkedFailure = undefined;
+      // A delete (or delete + start) replaced this state while init ran: nothing here is ours any more,
+      // and the engine in the map may be the replacement's. No await may sit between this check and
+      // the eviction/scheduling below.
+      if (this.reconnectStates.get(id) !== state) return;
+      // A failure only the operator can fix (re-scan, stale profile) stays terminal on a reconnect too.
+      if (parked && (parked.terminal || isKnownTerminalEngineFailure(errorMessage))) {
+        parked.run();
+        return;
+      }
       // initializeEngine registers the engine in the map BEFORE engine.initialize() runs, so a rejected
       // re-init leaves a half-built engine behind. Evict + reap it: otherwise a reconnect that later
       // exhausts its attempts strands an orphaned Chromium holding a concurrency slot, and the next
@@ -1080,9 +1237,31 @@ export class SessionEngineLifecycle {
       if (halfBuilt) {
         this.evictAndForceDestroy(id, halfBuilt);
       }
-      // Schedule another attempt
+      if (this.stoppingSessions.has(id)) {
+        this.cancelReconnect(id);
+        return;
+      }
+      // Schedule another attempt. The row stays INITIALIZING through the backoff (an active status, with
+      // lastError still showing the reason), so a retryable failure writes nothing per attempt.
       this.scheduleReconnect(id, session);
     }
+  }
+
+  /**
+   * Park an engine failure while the current reconnect state's re-init is in flight, so
+   * executeReconnect decides once init settles. onError's report supersedes the bare FAILED
+   * onStateChanged parks just before it, and a known-terminal report is never displaced by a
+   * retryable one. Keyed ONLY on the marker, never on stoppingSessions: stop marks outlive refused
+   * requests, and swallowing a failure on them would strand an engine start() then refuses.
+   */
+  private parkReconnectInitFailure(id: string, run: () => void, reason?: string): boolean {
+    const state = this.reconnectStates.get(id);
+    if (!state?.initInFlight) return false;
+    const terminal = reason !== undefined && isKnownTerminalEngineFailure(reason);
+    if (!state.parkedFailure || (reason !== undefined && !state.parkedFailure.terminal)) {
+      state.parkedFailure = { run, terminal };
+    }
+    return true;
   }
 
   private cancelReconnect(id: string): void {
@@ -1100,5 +1279,18 @@ export class SessionEngineLifecycle {
   // inline method had — an async wrapper would add adoption hops the retirement-race specs catch.
   updateStatus(id: string, status: SessionStatus): Promise<void> {
     return this.broadcaster.updateStatus(id, status);
+  }
+
+  /**
+   * Public delegate: the fan-out half only, for a caller that wrote the row under its own predicate.
+   *
+   * Always fans out. The caller's write affecting a row already proves a real transition, and the
+   * de-dup map cannot judge one: it only records what THIS process announced, so on a node that never
+   * hosted the engine it still holds the status of an earlier correction, not the READY a peer
+   * announced since.
+   */
+  announceStatus(id: string, status: SessionStatus): void {
+    this.broadcaster.clear(id);
+    this.broadcaster.announce(id, status);
   }
 }

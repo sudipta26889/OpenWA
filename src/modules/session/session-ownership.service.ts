@@ -75,7 +75,8 @@ export class SessionOwnershipService {
     return this.configService?.get<string>('session.nodeUrl') || process.env.NODE_URL || '';
   }
 
-  private get leaseTtlMs(): number {
+  /** Public because the takeover sweep sizes its "this holder is really gone" cutoff against it. */
+  get leaseTtlMs(): number {
     return this.configService?.get<number>('session.leaseTtlMs') ?? 60_000;
   }
 
@@ -340,6 +341,16 @@ export class SessionOwnershipService {
       .andWhere('"leaseExpiresAt" > :now', { now: leaseParam(now) })
       .getCount();
     return count > 0;
+  }
+
+  /** {@link isHeldByOtherNode} for a row already loaded, so a list can answer it without a query per row. */
+  heldByOtherLiveNode(session: Pick<Session, 'nodeId' | 'leaseExpiresAt'>, now = new Date()): boolean {
+    return (
+      session.nodeId != null &&
+      session.nodeId !== this.nodeId &&
+      session.leaseExpiresAt != null &&
+      session.leaseExpiresAt > now
+    );
   }
 
   async heldByOtherNodes(now = new Date()): Promise<string[]> {

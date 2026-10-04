@@ -11,7 +11,9 @@ from .._http import quote_segment
 from ..types import (
     CreateSessionRequest,
     SessionConfig,
+    SessionProxy,
     UpdateSessionConfigRequest,
+    UpdateSessionProxyRequest,
     PairingCodeResponse,
     QrCodeResponse,
     RequestPairingCodeRequest,
@@ -26,10 +28,14 @@ if TYPE_CHECKING:
 
 
 class ListSessionsQuery(TypedDict, total=False):
-    """Pagination for :meth:`SessionsResource.list`. The server applies its own default when omitted."""
+    """Pagination for :meth:`SessionsResource.list`. The server applies its own default when omitted.
+
+    ``name`` returns only the session with exactly that name (case-sensitive).
+    """
 
     limit: int
     offset: int
+    name: str
 
 
 class SessionsResource:
@@ -51,6 +57,16 @@ class SessionsResource:
         """
         return self._http.request(
             "PATCH", f"/api/sessions/{quote_segment(session_id)}/config", body=body
+        )
+
+    def get_proxy(self, session_id: str) -> SessionProxy:
+        """Read a session's masked proxy configuration (credentials never returned)."""
+        return self._http.request("GET", f"/api/sessions/{quote_segment(session_id)}/proxy")
+
+    def update_proxy(self, session_id: str, body: UpdateSessionProxyRequest) -> SessionProxy:
+        """Update per-session proxy settings. No restart — changes apply on the next start."""
+        return self._http.request(
+            "PATCH", f"/api/sessions/{quote_segment(session_id)}/proxy", body=body
         )
 
     def get(self, session_id: str) -> SessionResponse:

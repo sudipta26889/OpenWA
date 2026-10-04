@@ -6,8 +6,13 @@ import { ConfigService } from '@nestjs/config';
 import { PluginLoaderService, PluginType } from '../core/plugins';
 import { BaileysMessageStoreService } from './adapters/baileys-message-store.service';
 import { LidMappingStoreService } from './identity/lid-mapping-store.service';
+import { ChatStateStoreService } from './adapters/baileys-chat-state-store.service';
+import { baileysAuthDir, wwjsAuthDir } from './auth-dir-paths';
 
 describe('EngineFactory', () => {
+  // The auth-dir key is Session.id (#1597), so the on-disk assertions below use a UUID and build the
+  // expected paths with the same helpers the adapters use.
+  const SESSION_ID = '8f5b1d9e-0c4a-4e21-9d6b-2a7c3f0e1b44';
   const engineBlob = {
     type: 'whatsapp-web.js',
     sessionDataPath: '/var/data/sessions',
@@ -36,15 +41,28 @@ describe('EngineFactory', () => {
       remember: jest.fn().mockResolvedValue(undefined),
     }) as unknown as LidMappingStoreService;
 
-  it('refuses to create an engine for an unsafe session name (path-traversal into the auth dir)', () => {
+  const buildChatStateStore = (): ChatStateStoreService =>
+    ({
+      get: jest.fn(),
+      remember: jest.fn().mockResolvedValue(undefined),
+      reload: jest.fn().mockResolvedValue(undefined),
+    }) as unknown as ChatStateStoreService;
+
+  it('refuses to create an engine for an unsafe session key (path-traversal into the auth dir)', () => {
     const createEngine = jest.fn().mockReturnValue({});
     const pluginLoader = {
       getPlugin: jest.fn().mockReturnValue({ instance: { type: PluginType.ENGINE, createEngine } }),
     } as unknown as PluginLoaderService;
-    const factory = new EngineFactory(buildConfigService(), pluginLoader, buildMessageStore(), buildLidStore());
+    const factory = new EngineFactory(
+      buildConfigService(),
+      pluginLoader,
+      buildMessageStore(),
+      buildLidStore(),
+      buildChatStateStore(),
+    );
 
-    expect(() => factory.create({ sessionId: '../../etc', dbSessionId: 'db-1' })).toThrow(/unsafe session name/i);
-    expect(() => factory.create({ sessionId: 'a/b', dbSessionId: 'db-1' })).toThrow(/unsafe session name/i);
+    expect(() => factory.create({ sessionId: '../../etc', dbSessionId: 'db-1' })).toThrow(/unsafe session key/i);
+    expect(() => factory.create({ sessionId: 'a/b', dbSessionId: 'db-1' })).toThrow(/unsafe session key/i);
     expect(createEngine).not.toHaveBeenCalled();
   });
 
@@ -55,7 +73,13 @@ describe('EngineFactory', () => {
       getPlugin: jest.fn().mockReturnValue({ instance: pluginInstance }),
     } as unknown as PluginLoaderService;
 
-    const factory = new EngineFactory(buildConfigService(), pluginLoader, buildMessageStore(), buildLidStore());
+    const factory = new EngineFactory(
+      buildConfigService(),
+      pluginLoader,
+      buildMessageStore(),
+      buildLidStore(),
+      buildChatStateStore(),
+    );
     factory.create({ sessionId: 'sess-1', dbSessionId: 'db-1', proxyUrl: 'http://p', proxyType: 'http' });
 
     // Plain-object (not objectContaining) assertion: any browser key (headless/puppeteerArgs/
@@ -76,7 +100,13 @@ describe('EngineFactory', () => {
       getPlugin: jest.fn(),
     } as unknown as PluginLoaderService;
 
-    const factory = new EngineFactory(buildConfigService(), pluginLoader, buildMessageStore(), buildLidStore());
+    const factory = new EngineFactory(
+      buildConfigService(),
+      pluginLoader,
+      buildMessageStore(),
+      buildLidStore(),
+      buildChatStateStore(),
+    );
     await factory.onModuleInit();
 
     expect(registerBuiltInPlugin).toHaveBeenCalledWith(
@@ -94,7 +124,13 @@ describe('EngineFactory', () => {
       getPlugin: jest.fn(),
     } as unknown as PluginLoaderService;
 
-    const factory = new EngineFactory(buildConfigService(), pluginLoader, buildMessageStore(), buildLidStore());
+    const factory = new EngineFactory(
+      buildConfigService(),
+      pluginLoader,
+      buildMessageStore(),
+      buildLidStore(),
+      buildChatStateStore(),
+    );
     await factory.onModuleInit();
 
     const registeredIds = registerBuiltInPlugin.mock.calls.map(call => (call as [{ id: string }])[0].id);
@@ -107,7 +143,13 @@ describe('EngineFactory', () => {
       getPlugin: jest.fn().mockReturnValue(undefined),
     } as unknown as PluginLoaderService;
 
-    const factory = new EngineFactory(buildConfigService(), pluginLoader, buildMessageStore(), buildLidStore());
+    const factory = new EngineFactory(
+      buildConfigService(),
+      pluginLoader,
+      buildMessageStore(),
+      buildLidStore(),
+      buildChatStateStore(),
+    );
     expect(() => factory.create({ sessionId: 'sess-2', dbSessionId: 'db-2' })).not.toThrow();
   });
 
@@ -123,6 +165,7 @@ describe('EngineFactory', () => {
       pluginLoader,
       buildMessageStore(),
       buildLidStore(),
+      buildChatStateStore(),
     );
     expect(() => factory.create({ sessionId: 'sess-b', dbSessionId: 'db-b' })).toThrow(/baileys/i);
   });
@@ -143,8 +186,8 @@ describe('EngineFactory', () => {
       // An upgrade reuses the dirs a previous install left world-readable (default umask); fresh
       // installs have no dirs at all. Both must end at 0o700 after create().
       if (preLoosen) {
-        fs.mkdirSync(path.join(sessionDataPath, 'session-alice'), { recursive: true, mode: 0o755 });
-        fs.mkdirSync(path.join(authDir, 'alice'), { recursive: true, mode: 0o755 });
+        fs.mkdirSync(wwjsAuthDir(sessionDataPath, SESSION_ID), { recursive: true, mode: 0o755 });
+        fs.mkdirSync(baileysAuthDir(authDir, SESSION_ID), { recursive: true, mode: 0o755 });
       }
       const createEngine = jest.fn().mockReturnValue({});
       const pluginLoader = {
@@ -158,25 +201,26 @@ describe('EngineFactory', () => {
         pluginLoader,
         buildMessageStore(),
         buildLidStore(),
+        buildChatStateStore(),
       );
       return {
         factory,
-        wwjsDir: path.join(sessionDataPath, 'session-alice'),
-        baileysDir: path.join(authDir, 'alice'),
+        wwjsDir: wwjsAuthDir(sessionDataPath, SESSION_ID),
+        baileysDir: baileysAuthDir(authDir, SESSION_ID),
       };
     };
 
     it.each([false, true])('hardens both engine shapes on a %s install', preLoosen => {
       const { factory, wwjsDir, baileysDir } = buildTmpFactory(preLoosen);
 
-      factory.create({ sessionId: 'alice', dbSessionId: 'db-1' });
+      factory.create({ sessionId: SESSION_ID, dbSessionId: SESSION_ID });
 
       expect(fs.statSync(wwjsDir).mode & 0o777).toBe(0o700);
       expect(fs.statSync(baileysDir).mode & 0o777).toBe(0o700);
     });
   });
 
-  describe('purgeSessionData (delete fully removes on-disk auth, keyed by session name)', () => {
+  describe('purgeSessionData (delete fully removes on-disk auth, keyed by session id)', () => {
     const noPluginLoader = () => ({ getPlugin: jest.fn() }) as unknown as PluginLoaderService;
     let tmpRoot: string;
 
@@ -200,8 +244,13 @@ describe('EngineFactory', () => {
         noPluginLoader(),
         buildMessageStore(),
         buildLidStore(),
+        buildChatStateStore(),
       );
-      return { factory, wwjsDir: path.join(sessionDataPath, 'session-alice'), baileysDir: path.join(authDir, 'alice') };
+      return {
+        factory,
+        wwjsDir: wwjsAuthDir(sessionDataPath, SESSION_ID),
+        baileysDir: baileysAuthDir(authDir, SESSION_ID),
+      };
     };
 
     it.each(['whatsapp-web.js', 'baileys'])(
@@ -213,7 +262,7 @@ describe('EngineFactory', () => {
         fs.writeFileSync(path.join(wwjsDir, 'creds.json'), '{}');
         fs.writeFileSync(path.join(baileysDir, 'creds.json'), '{}');
 
-        await factory.purgeSessionData('alice');
+        await factory.purgeSessionData(SESSION_ID);
 
         expect(fs.existsSync(wwjsDir)).toBe(false);
         expect(fs.existsSync(baileysDir)).toBe(false);
@@ -233,7 +282,7 @@ describe('EngineFactory', () => {
           return realRm(...args);
         });
       try {
-        await expect(factory.purgeSessionData('alice')).resolves.toBeUndefined();
+        await expect(factory.purgeSessionData(SESSION_ID)).resolves.toBeUndefined();
       } finally {
         spy.mockRestore();
       }
@@ -248,13 +297,63 @@ describe('EngineFactory', () => {
       await expect(factory.purgeSessionData('never-linked')).resolves.toBeUndefined();
     });
 
-    it('refuses to purge an unsafe session name (no rm on a traversal path)', async () => {
+    // The boot migration keeps a legacy name-keyed directory it could not rename (an open profile, or
+    // a conflict with an id-keyed one). Delete has to take it too, or a complete WhatsApp login stays
+    // on the volume, and in every backup, after the session is gone.
+    it('removes the legacy name-keyed directories of the deleted session as well', async () => {
+      const { factory, wwjsDir, baileysDir } = buildBothDirFactory('baileys');
+      fs.mkdirSync(wwjsDir, { recursive: true });
+      fs.mkdirSync(baileysDir, { recursive: true });
+      const legacyWwjs = wwjsAuthDir(path.join(tmpRoot, 'sessions'), 'alice');
+      const legacyBaileys = baileysAuthDir(path.join(tmpRoot, 'baileys'), 'alice');
+      fs.mkdirSync(legacyWwjs, { recursive: true });
+      fs.mkdirSync(legacyBaileys, { recursive: true });
+
+      await factory.purgeSessionData(SESSION_ID, 'alice');
+
+      expect(fs.existsSync(legacyWwjs)).toBe(false);
+      expect(fs.existsSync(legacyBaileys)).toBe(false);
+    });
+
+    // Why the legacy purge matches a directory listing instead of asking existsSync: there, deleting
+    // `Alice` would remove the directory holding `alice`'s login, which is #1597 through the delete
+    // path. The two only diverge on a case-insensitive filesystem, which is where the bug lives.
+    it('leaves a legacy directory whose stored name differs only in case alone', async () => {
+      const { factory } = buildBothDirFactory('baileys');
+      const otherSession = wwjsAuthDir(path.join(tmpRoot, 'sessions'), 'alice');
+      fs.mkdirSync(otherSession, { recursive: true });
+
+      await factory.purgeSessionData(SESSION_ID, 'Alice');
+
+      expect(fs.existsSync(otherSession)).toBe(true);
+    });
+
+    // The shape of a name says nothing about whose login its directory holds: a session named after a
+    // tenant UUID owns it. Whether the name is another session's live id is the caller's to decide
+    // (SessionEngineControls.delete asks the table and withholds such a name).
+    it('removes the legacy directories of a UUID-shaped name as well', async () => {
+      const { factory } = buildBothDirFactory('baileys');
+      const uuidName = '0b5c3a52-6d1e-4c1a-9f0e-2a7b8c9d0e1f';
+      const legacyWwjs = wwjsAuthDir(path.join(tmpRoot, 'sessions'), uuidName);
+      const legacyBaileys = baileysAuthDir(path.join(tmpRoot, 'baileys'), uuidName);
+      fs.mkdirSync(legacyWwjs, { recursive: true });
+      fs.mkdirSync(legacyBaileys, { recursive: true });
+
+      await factory.purgeSessionData(SESSION_ID, uuidName);
+
+      expect(fs.existsSync(legacyWwjs)).toBe(false);
+      expect(fs.existsSync(legacyBaileys)).toBe(false);
+    });
+
+    it('refuses to purge an unsafe session key (no rm on a traversal path)', async () => {
       // A sibling that a '../' name would resolve to — it must survive the refused purge.
       const sibling = path.join(tmpRoot, 'baileys-evil');
       fs.mkdirSync(sibling, { recursive: true });
 
       const { factory } = buildBothDirFactory('baileys');
       await factory.purgeSessionData('../baileys-evil');
+      // Same guard on the legacy name, which an imported row can carry raw.
+      await factory.purgeSessionData(SESSION_ID, '../baileys-evil');
 
       expect(fs.existsSync(sibling)).toBe(true);
     });

@@ -442,7 +442,7 @@ import { resolveReconnectConfig } from './session-engine-lifecycle.service';
 describe('resolveReconnectConfig', () => {
   it('keeps reconnect settings finite and bounded', () => {
     // Invalid maxReconnectAttempts falls back to the default: unlimited retries (the backoff
-    // parks at the 1h cap); an invalid baseDelay is clamped up to the 1s minimum.
+    // parks at the 5-minute cap); an invalid baseDelay is clamped up to the 1s minimum.
     expect(resolveReconnectConfig({ maxReconnectAttempts: 'bad', reconnectBaseDelay: -1 })).toEqual({
       maxAttempts: Number.POSITIVE_INFINITY,
       baseDelay: 1000,
@@ -654,6 +654,10 @@ docker compose up -d
 docker compose --profile postgres up -d
 docker compose --profile full up -d
 ```
+
+A profile only starts the extra containers. Point OpenWA at them first, from Dashboard >
+Infrastructure or with the `.env` variables listed under Production Deployment in the README;
+otherwise it stays on SQLite and local storage.
 
 ### VS Code Extensions
 

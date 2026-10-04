@@ -99,6 +99,10 @@ services:
     environment:
       # Core
       - NODE_ENV=${NODE_ENV:-production}
+      # The image already runs on UTC; stated here so it is a decision rather than an accident. Stored
+      # timestamps are UTC on either database whatever this says (the Postgres data connection pins its
+      # own session), so overriding it only moves log stamps and the local day the "today" stats count.
+      - TZ=${TZ:-UTC}
       # Writable HOME on tmpfs so Chromium's HOME-relative writes don't hit the read_only rootfs
       - HOME=/tmp
       # Chromium resolves its home from the passwd entry (no /home/openwa), ignoring $HOME, so without
@@ -127,6 +131,9 @@ services:
       # PostgreSQL schema (blank-forwarded like the other DATABASE_* keys so a dashboard-saved
       # POSTGRES_SCHEMA in data/.env.generated applies; a real host value pins). Ignored for sqlite.
       - POSTGRES_SCHEMA=${POSTGRES_SCHEMA:-}
+      # TLS to a managed PostgreSQL, blank-forwarded the same way.
+      - DATABASE_SSL=${DATABASE_SSL:-}
+      - DATABASE_SSL_REJECT_UNAUTHORIZED=${DATABASE_SSL_REJECT_UNAUTHORIZED:-}
       - DATABASE_SYNCHRONIZE=${DATABASE_SYNCHRONIZE:-false}
       # Engine. Forwarded empty by default so the dashboard (Infrastructure > Engine) selects the
       # active engine via data/.env.generated (defaults to whatsapp-web.js); main.ts treats a blank
@@ -141,6 +148,7 @@ services:
       - SESSION_DATA_PATH=${SESSION_DATA_PATH:-}
       - PUPPETEER_HEADLESS=${PUPPETEER_HEADLESS:-}
       - PUPPETEER_ARGS=${PUPPETEER_ARGS:-}
+      - PUPPETEER_PROTOCOL_TIMEOUT_MS=${PUPPETEER_PROTOCOL_TIMEOUT_MS:-}
       # Optional WhatsApp Web version override. DEFAULT (empty, "latest", or "auto"): OpenWA auto-resolves a
       # settled build from the third-party wppconnect-team/wa-version registry and pins its remote HTML
       # (fetched into the web.whatsapp.com origin without an integrity check). Set "off" to disable pinning
@@ -210,6 +218,7 @@ services:
       - MEDIA_DOWNLOAD_MAX_BYTES=${MEDIA_DOWNLOAD_MAX_BYTES:-}
       - MEDIA_DOWNLOAD_TIMEOUT_MS=${MEDIA_DOWNLOAD_TIMEOUT_MS:-}
       - INBOUND_MEDIA_CONCURRENCY=${INBOUND_MEDIA_CONCURRENCY:-}
+      - SESSION_PROXY_URL_FETCH=${SESSION_PROXY_URL_FETCH:-}
       # Server-side media conversion (opt-in). The image ships ffmpeg, but without these forwards
       # the feature could not be switched on from .env at all.
       - MEDIA_CONVERSION_ENABLED=${MEDIA_CONVERSION_ENABLED:-}
@@ -335,6 +344,7 @@ services:
       - BAILEYS_LOG_LEVEL=${BAILEYS_LOG_LEVEL:-}
       - BAILEYS_MESSAGE_STORE_LIMIT=${BAILEYS_MESSAGE_STORE_LIMIT:-}
       - BAILEYS_SESSION_STORE_MAX_ENTRIES=${BAILEYS_SESSION_STORE_MAX_ENTRIES:-}
+      - BAILEYS_CHAT_STATE_CACHE_MAX=${BAILEYS_CHAT_STATE_CACHE_MAX:-}
       - WWEBJS_ONBOARDING_CONTINUE_LABELS=${WWEBJS_ONBOARDING_CONTINUE_LABELS:-}
       # Default matches the image's ENV (Dockerfile); a blank forward would shadow it and make
       # puppeteer fall back to a bundled Chromium the image does not ship. compose-parity.spec.ts
@@ -364,6 +374,8 @@ services:
       - PLUGIN_CATALOG_URL=${PLUGIN_CATALOG_URL:-}
       - PLUGIN_CAP_TIMEOUT_MS=${PLUGIN_CAP_TIMEOUT_MS:-}
       - PLUGIN_STORAGE_MAX_BYTES=${PLUGIN_STORAGE_MAX_BYTES:-}
+      # The dashboard's update notice asks GitHub for the latest release; false turns that request off.
+      - UPDATE_CHECK_ENABLED=${UPDATE_CHECK_ENABLED:-}
       # Misc application tuning.
       - AUDIT_RETENTION_DAYS=${AUDIT_RETENTION_DAYS:-}
       - BULK_MAX_CONCURRENT_BATCHES=${BULK_MAX_CONCURRENT_BATCHES:-}

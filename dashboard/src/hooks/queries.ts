@@ -77,7 +77,8 @@ export function useStopSessionMutation() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => sessionApi.stop(id),
-    onSuccess: () => {
+    // A failed stop can still have changed the session, so the list is re-read either way.
+    onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
     },
   });
@@ -192,6 +193,28 @@ export function useCreateApiKeyMutation() {
       allowedSessions?: string[];
       expiresAt?: string;
     }) => apiKeyApi.create(data),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys });
+    },
+  });
+}
+
+export function useUpdateApiKeyMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      data,
+    }: {
+      id: string;
+      data: {
+        name?: string;
+        role?: string;
+        allowedIps?: string[];
+        allowedSessions?: string[];
+        expiresAt?: string;
+      };
+    }) => apiKeyApi.update(id, data),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys });
     },

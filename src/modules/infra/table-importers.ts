@@ -8,6 +8,7 @@ import type {
   TemplateRow,
   BaileysStoredMessageRow,
   LidMappingRow,
+  ChatStateRow,
   PluginInstanceRow,
   ConversationMappingRow,
   IngressEventRow,
@@ -64,10 +65,15 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
     sql: `INSERT INTO sessions (id, name, status, phone, "pushName", config, "proxyUrl", "proxyType", "connectedAt", "lastActiveAt", "createdAt", "updatedAt") 
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
     id: (session: SessionRow) => session.id,
-    // A session name becomes the engine auth-directory key, so an unvalidated imported name (this
-    // path bypasses CreateSessionDto) could traverse the filesystem. Skip + warn instead of
-    // throwing, so one bad row doesn't 500 the whole restore.
+    // Both columns reach an auth-directory path: the id keys the directory itself, and the name is
+    // still weighed against it (the boot migration and the legacy purge on delete). An unvalidated
+    // imported value (this path bypasses CreateSessionDto) could traverse the filesystem, and an
+    // unsafe id would only surface later as a refused start. Skip + warn instead of throwing, so one
+    // bad row doesn't 500 the whole restore.
     skip: (session: SessionRow) => {
+      if (!isSafeSessionName(session.id)) {
+        return `Skipped session ${JSON.stringify(session.id)}: unsafe id`;
+      }
       if (isSafeSessionName(session.name)) return null;
       return `Skipped session ${session.id}: unsafe name ${JSON.stringify(session.name)}`;
     },
@@ -219,6 +225,15 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
     sql: `INSERT INTO lid_mappings (lid, phone, "sessionId", "updatedAt") VALUES ($1, $2, $3, $4)`,
     id: (lm: LidMappingRow) => lm.lid,
     map: (lm: LidMappingRow) => [lm.lid, lm.phone ?? null, lm.sessionId ?? null, lm.updatedAt],
+  }),
+
+  // Import chat states (optional; not a FK, restored as a standalone per-session cache table)
+  defineTableImporter({
+    key: 'chatStates',
+    label: 'chat state',
+    sql: `INSERT INTO chat_states ("sessionId", "chatId", "muteEndTime", archived, pinned, "updatedAt") VALUES ($1, $2, $3, $4, $5, $6)`,
+    id: (cs: ChatStateRow) => `${cs.sessionId}/${cs.chatId}`,
+    map: (cs: ChatStateRow) => [cs.sessionId, cs.chatId, cs.muteEndTime ?? null, cs.archived, cs.pinned, cs.updatedAt],
   }),
 
   // Import plugin instances (Integration Fabric config + ingress HMAC secret)
@@ -419,6 +434,7 @@ const EXPECTED_TABLE_KEYS: ReadonlyArray<keyof MigrationTables> = [
   'templates',
   'baileysStoredMessages',
   'lidMappings',
+  'chatStates',
   'pluginInstances',
   'conversationMappings',
   'ingressEvents',

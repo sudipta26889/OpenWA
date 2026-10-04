@@ -18,7 +18,8 @@ import { EngineNotSupportedError } from '../../common/errors/engine-not-supporte
 import { GroupNotFoundError } from '../../common/errors/group-not-found.error';
 import { InvalidInviteCodeError } from '../../common/errors/invalid-invite-code.error';
 import { toMessageMedia } from './wwebjs-messaging';
-import { type WwebjsEngineHost } from './wwebjs-host';
+import { type WwebjsEngineHost, withPage } from './wwebjs-host';
+import { isProtocolTimeout } from './wwebjs-lifecycle';
 
 /**
  * Extracts the JID of the parent community a group is linked to, if any.
@@ -81,7 +82,7 @@ export class WwebjsGroups {
 
   async getGroups(): Promise<Group[]> {
     this.host.ensureReady();
-    try {
+    return withPage(this.host, 'getGroups', async () => {
       const client = this.client();
       const chats = await client.getChats();
 
@@ -105,10 +106,7 @@ export class WwebjsGroups {
           linkedParentJID: extractLinkedParentJID(groupChat.groupMetadata),
         };
       });
-    } catch (error) {
-      this.host.reportIfPageTransportError(error, 'getGroups');
-      throw error;
-    }
+    });
   }
 
   async getGroupInfo(groupId: string): Promise<GroupInfo | null> {
@@ -153,6 +151,10 @@ export class WwebjsGroups {
       if (this.host.isPageTransportError(error)) {
         this.host.reportIfPageTransportError(error, 'getGroupInfo');
         throw new EngineTransportError(`Transport died while reading group ${groupId}`);
+      }
+      // A command that outran the protocol budget got no answer either way: a 503, but no death.
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError(`WhatsApp Web did not answer the read of group ${groupId} in time`);
       }
       this.host.logger.warn(`Failed to get group: ${groupId}`, { error: String(error) });
       return null;
@@ -391,6 +393,9 @@ export class WwebjsGroups {
         this.host.reportIfPageTransportError(error, 'getGroupJoinInfo');
         throw new EngineTransportError(`Transport died while previewing invite ${inviteCode}`);
       }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError(`WhatsApp Web did not answer the preview of invite ${inviteCode} in time`);
+      }
       this.host.logger.debug('getInviteInfo rejected; treating the invite as not found', {
         error: error instanceof Error ? error.message : String(error),
       });
@@ -435,6 +440,11 @@ export class WwebjsGroups {
         this.host.reportIfPageTransportError(error, 'joinGroupViaInviteCode');
         throw new EngineTransportError('Transport died while accepting the group invite');
       }
+      // The join may still land WhatsApp-side, so this is the route's "may or may not have been
+      // applied" 503, never "invalid invite".
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer the group invite acceptance in time');
+      }
       this.host.logger.warn(`Failed to accept group invite: ${String(error)}`);
       groupId = undefined;
     }
@@ -473,7 +483,7 @@ export class WwebjsGroups {
   async setGroupPicture(groupId: string, media: MediaInput): Promise<void> {
     const groupChat = await this.requireGroupChat(groupId);
     // GroupChat.setPicture, NOT Client.setProfilePicture — the latter targets the own account.
-    const ok = await groupChat.setPicture(await toMessageMedia(media));
+    const ok = await groupChat.setPicture(await toMessageMedia(media, this.host.config.proxy?.url));
     if (!ok) {
       throw new EngineRefusedError(`Failed to set the picture for group ${groupId} — admin rights required`);
     }
@@ -524,7 +534,7 @@ export class WwebjsGroups {
     // non-group jid answered 200 with an empty list, which reads as "this group has no pending
     // requests" rather than "there is no such group"; Baileys answers the refusal.
     await this.requireGroupChat(groupId);
-    try {
+    return withPage(this.host, 'getGroupMembershipRequests', async () => {
       const raw = await this.client().getGroupMembershipRequests(groupId);
       // Raw page-context store objects: wids can arrive as {_serialized} OR {$1} (the #747
       // minifier rename), so every id goes through readWid; a requester whose wid is unreadable
@@ -551,10 +561,7 @@ export class WwebjsGroups {
           },
         ];
       });
-    } catch (error) {
-      this.host.reportIfPageTransportError(error, 'getGroupMembershipRequests');
-      throw error;
-    }
+    });
   }
 
   approveGroupMembershipRequests(groupId: string, participants?: string[]): Promise<ParticipantOperationResult[]> {

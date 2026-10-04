@@ -8,9 +8,11 @@ import { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { SessionService } from '../session/session.service';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
+import { ChatStateStoreService } from '../../engine/adapters/baileys-chat-state-store.service';
 import { SessionOwnershipService } from '../session/session-ownership.service';
 import { Session as SessionEntity, SessionStatus } from '../session/entities/session.entity';
 import { In } from 'typeorm';
+import { DateUtils } from 'typeorm/util/DateUtils';
 import type { MigrationTables, TableCounts } from './migration-tables.types';
 import { EXPORT_TABLES, EXPORT_TABLE_EXCLUSIONS } from './export-tables';
 import { TABLE_IMPORTERS } from './table-importers';
@@ -105,6 +107,37 @@ export async function restoreSessionOwnership(
       [row.nodeId, row.claimedAt, carryLease(row.leaseExpiresAt, readAt, now), row.nodeUrl, row.id],
     );
   }
+}
+
+/**
+ * The `datetime` columns of each imported table on a SQLite data connection, keyed by backup table key
+ * and read from the entity metadata: CreateDateColumn/UpdateDateColumn and any other column TypeORM
+ * binds through its SQLite datetime path. DateTransformer columns are `text` there and are not listed,
+ * because the app itself writes those in ISO form.
+ */
+export function sqliteDatetimeColumns(dataSource: DataSource): Map<keyof MigrationTables, string[]> {
+  const byTable = new Map(
+    dataSource.entityMetadatas.map(metadata => [
+      metadata.tableName,
+      metadata.columns
+        .filter(column => dataSource.driver.normalizeType(column) === 'datetime')
+        .map(column => column.databaseName),
+    ]),
+  );
+  return new Map(EXPORT_TABLES.map(entry => [entry.key, byTable.get(entry.table) ?? []]));
+}
+
+/**
+ * Rewrite one archived `datetime` value into the text TypeORM writes on SQLite (`YYYY-MM-DD HH:MM:SS.SSS`,
+ * UTC). A PostgreSQL export serializes these columns as ISO `...T...Z`, and SQLite compares them as
+ * text: `'T'` sorts after `' '`, so a restored row never matches `LessThan(date)` on its own calendar
+ * day. Only ISO text with an explicit zone is converted. A value already in SQLite form carries no
+ * zone, and parsing it would read it as host-local time and shift it, so it is left as it is.
+ */
+export function toSqliteDatetime(value: unknown): unknown {
+  if (typeof value !== 'string' || !/T.*(Z|[+-]\d{2}:?\d{2})$/i.test(value)) return value;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : DateUtils.mixedDateToUtcDatetimeString(date);
 }
 
 /**
@@ -259,6 +292,8 @@ export class InfraDataService {
     // direct-construction unit tests, and every use is `?.`-guarded.
     @Optional()
     private readonly ownership?: SessionOwnershipService,
+    @Optional()
+    private readonly chatStateStore?: ChatStateStoreService,
   ) {}
 
   /**
@@ -596,6 +631,10 @@ export class InfraDataService {
         // lid_mappings is not a FK to sessions, so the sessions DELETE below won't clear it; clear it
         // explicitly so a restore replaces the cache rather than colliding on existing lid PKs.
         await clearTable('lid_mappings');
+        // chat_states is the same case: PK (sessionId, chatId), no FK to sessions, so the sessions DELETE
+        // does not reach it. Without this, a restore onto an instance that already holds chat_states rows
+        // collides on those PKs and the all-or-nothing gate rolls the whole import back.
+        await clearTable('chat_states');
         // Integration Fabric + both DLQs: none carry an FK constraint to sessions (sessionId is provenance),
         // so clearing them here before the sessions DELETE keeps the replace-semantics complete.
         await clearTable('plugin_instances');
@@ -636,10 +675,23 @@ export class InfraDataService {
         // carry each table's INSERT text, param mapping, and per-row skip guard; a missing or empty
         // table keeps its 0 count and contributes no warnings.
         const counts = Object.fromEntries(TABLE_IMPORTERS.map(importer => [importer.key, 0] as const)) as TableCounts;
-        for (const importer of TABLE_IMPORTERS) {
+        // SQLite only: archived datetime values are normalized to the form TypeORM writes there, so a
+        // PostgreSQL-made backup compares and sorts like rows the app wrote itself.
+        const datetimeColumns = isPostgres ? undefined : sqliteDatetimeColumns(this.dataDataSource);
+        restore: for (const importer of TABLE_IMPORTERS) {
           const rows = data.tables[importer.key];
           if (!rows?.length) continue;
-          for (const untypedRow of rows) {
+          const dateColumns = datetimeColumns?.get(importer.key) ?? [];
+          for (const archivedRow of rows) {
+            const source = archivedRow as unknown as Record<string, unknown>;
+            const untypedRow = {
+              ...source,
+              ...Object.fromEntries(
+                dateColumns
+                  .filter(column => column in source)
+                  .map(column => [column, toSqliteDatetime(source[column])]),
+              ),
+            };
             // `rows` was read from `data.tables[importer.key]`, so it holds exactly the row type this
             // descriptor's id/map/skip declare. That correlation is what the erased importer type
             // cannot carry, and this loop is the one place it is known — so the cast lives here rather
@@ -657,6 +709,9 @@ export class InfraDataService {
               warnings.push(
                 `Failed to import ${importer.label} ${importer.id(row)}: ${err instanceof Error ? err.message : String(err)}`,
               );
+              // PostgreSQL aborts the transaction on a failed statement: every later one would fail with
+              // "current transaction is aborted" and bury this row's real error. Stop at the first.
+              if (isPostgres) break restore;
             }
           }
         }
@@ -667,12 +722,33 @@ export class InfraDataService {
         // bug it fixes — on PostgreSQL a failed statement aborts the transaction, so the COMMIT would
         // execute as a ROLLBACK and the endpoint would report a fully discarded import as a success,
         // with per-table counts, to an operator restoring after data loss.
-        try {
-          await restoreSessionOwnership(preservedOwnership, insert, ownershipReadAt);
-        } catch (error) {
-          warnings.push(
-            `Failed to restore session ownership: ${error instanceof Error ? error.message : String(error)}`,
-          );
+        // Skipped once a row has failed: the rollback below is already certain, and on PostgreSQL the
+        // aborted transaction would only add a misleading warning.
+        if (warnings.length === 0) {
+          try {
+            await restoreSessionOwnership(preservedOwnership, insert, ownershipReadAt);
+          } catch (error) {
+            warnings.push(
+              `Failed to restore session ownership: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+
+        // "Replace all data" must be all-or-nothing: the import already DELETEd every row, so if any
+        // INSERT failed we must roll back (restoring the pre-import data) rather than commit a
+        // half-wiped DB and report success. A partial restore reported as imported:true was how
+        // message history could silently vanish on a SQLite->Postgres migration. It must precede
+        // every further statement: on PostgreSQL a failure has aborted the transaction, so the
+        // normalization UPDATE below would throw and turn this answer into a 500.
+        if (warnings.length > 0) {
+          await queryRunner.rollbackTransaction();
+          return {
+            imported: false,
+            counts,
+            warnings,
+            notices,
+            ...engineStateAfterRollback,
+          };
         }
 
         // Normalize imported statuses the same way boot does: an ACTIVE status (ready,
@@ -707,21 +783,6 @@ export class InfraDataService {
           );
         }
 
-        // "Replace all data" must be all-or-nothing: the import already DELETEd every row, so if any
-        // INSERT failed we must roll back (restoring the pre-import data) rather than commit a
-        // half-wiped DB and report success. A partial restore reported as imported:true was how
-        // message history could silently vanish on a SQLite->Postgres migration.
-        if (warnings.length > 0) {
-          await queryRunner.rollbackTransaction();
-          return {
-            imported: false,
-            counts,
-            warnings,
-            notices,
-            ...engineStateAfterRollback,
-          };
-        }
-
         // A wrong/empty/garbage backup file restores zero rows but the DELETE already ran — committing
         // would silently WIPE the database and report success. Refuse it and roll back instead. (#488 review)
         const totalRestored = Object.values(counts).reduce((sum, n) => sum + n, 0);
@@ -743,7 +804,10 @@ export class InfraDataService {
         // reach it — resolution would keep serving stale entries (and miss restored ones) until the next
         // process start. Reload from the new DB contents. Best-effort: a miss falls back to engine
         // re-resolution, so a reload failure degrades instead of failing the (already committed) import.
+        // The chat-state mirror has the same shape: left stale, GET /chats would serve the old
+        // archived/pinned/muted flags and the next live update would write them back over the restore.
         await this.lidMappingStore?.reload();
+        await this.chatStateStore?.reload();
 
         // Audit the destructive replace-all restore, only on the committed-success path (the rollback /
         // refused-empty branches above return without emitting, since no data actually changed). Any

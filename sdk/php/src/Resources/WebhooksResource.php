@@ -39,7 +39,10 @@ class WebhooksResource
      *
      * @param array<string,mixed> $query Optional filter: `sessionId`, `limit`, `offset`.
      *
-     * @return mixed the response has no published schema, so it is returned unshaped
+     * @return array<int,array<string,mixed>> most recent first; each entry carries `id`, `webhookId`,
+     *                                        `sessionId`, `event`, `url`, `attempts`, `lastError` and
+     *                                        `createdAt`, plus nullable `idempotencyKey`, `deliveryId`
+     *                                        and `lastStatusCode`
      */
     public function deliveryFailures(array $query = [])
     {
@@ -59,6 +62,10 @@ class WebhooksResource
     }
 
     /**
+     * A `secret` in $body signs every delivery as `X-OpenWA-Signature: sha256=<hex>`. The gateway
+     * enforces a 16-character minimum on it and answers 400 below that; omit it for unsigned
+     * deliveries. Neither `secret` nor `headers` is returned by a read.
+     *
      * @param array<string,mixed> $body
      * @return array<string,mixed>
      */
@@ -73,6 +80,10 @@ class WebhooksResource
     }
 
     /**
+     * Partial update: an absent key is left alone. The create route's 16-character minimum on
+     * `secret` applies here too, with one exception: `''` is the documented "clear the secret"
+     * value and is accepted, as `[]` is for `headers`.
+     *
      * @param array<string,mixed> $body
      * @return array<string,mixed>
      */

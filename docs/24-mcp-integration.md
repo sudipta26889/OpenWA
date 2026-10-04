@@ -39,8 +39,10 @@ group management — so an agent can drive WhatsApp through the same business lo
 REST API uses.
 
 Set `MCP_ENABLED=true` to mount a stateless Streamable-HTTP transport at **`POST /mcp`**
-on the existing server (same port, no extra process). When `MCP_ENABLED` is unset, the
-MCP module and the `@modelcontextprotocol/sdk` package are never loaded.
+on the existing server (same port, no extra process). The transport offers no SSE stream
+and no sessions, so `GET /mcp` and `DELETE /mcp` answer `405` with `Allow: POST`. When
+`MCP_ENABLED` is unset, the MCP module and the `@modelcontextprotocol/sdk` package are
+never loaded.
 
 ## 24.2 Design Goals
 
@@ -116,17 +118,21 @@ down on response close — any request can hit any instance.
 
 The surface is an **allowlist by construction** — a capability is exposed only if a
 `ToolDescriptor` is written for it. There is no automatic route reflection. Each tool
-declares a `tier` (`read` | `write`) and, for writes, a required role.
+declares a `tier` (`read` | `write`) and a `requiredRole` when the call warrants one: every
+write carries its privilege level, and a read carries the role its REST twin requires. The
+reads at OPERATOR are `WebhooksList`, `WebhookFindBySession` and `WebhookFindOne`,
+`AutomationRuleFindAll` and `AutomationRuleFindOne`, and `GroupGetInviteCode` (the invite
+code is a transferable join capability, so it sits at OPERATOR like the QR endpoint).
 
 | Domain         | Read tools                                              | Write tools                                                                                   |
 | -------------- | ------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
 | **Session**    | list, get, chats, stats, presence                       | mark read/unread, typing, subscribe presence                                                  |
 | **Message**    | list, history, reactions                                | send text/image/video/audio/document/location/contact/sticker/template, reply, forward, react |
 | **Contact**    | list, get, check-number, resolve-phone, profile-picture | block, unblock                                                                                |
-| **Group**      | list, get, invite-code                                  | create, add participants, set subject, set description                                        |
-| **Webhook**    | list, get (read-only)                                   | —                                                                                             |
+| **Group**      | list, get, invite-code (OPERATOR)                       | create, add participants, set subject, set description                                        |
+| **Webhook**    | list, get (OPERATOR)                                    | —                                                                                             |
 | **Label**      | list, get, chats for a label, labels on a chat          | upsert, delete, add to chat, remove from chat                                                 |
-| **Automation** | rules list, get                                         | —                                                                                             |
+| **Automation** | rules list, get (OPERATOR)                              | —                                                                                             |
 
 > **Labels split across the engines**, and each tool's description says which way. Every label
 > _read_ needs whatsapp-web.js — Baileys exposes no label query at all. Editing a label (upsert,
@@ -172,7 +178,11 @@ only when an agent genuinely needs to send messages / mutate state.
   missing/invalid key would otherwise reach a DB lookup unthrottled). It keys on the
   resolved client IP (honoring `TRUSTED_PROXIES`) and is tuned with `MCP_IP_RATE_LIMIT_MAX`
   (default `120`) and `MCP_IP_RATE_LIMIT_WINDOW_MS` (default `60000`), with the same
-  fallback rules — independent of the per-key vars.
+  fallback rules, independent of the per-key vars. It counts JSON-RPC messages, not HTTP
+  requests: each element of a batch spends one unit, and a batch larger than the
+  remaining budget is refused whole with a `429`. None of its messages run, but the
+  refusal still spends whatever budget was left, so the IP is at the cap until the
+  window slides.
 - **Response parity.** Tools reuse the REST response DTOs, so sensitive fields the REST
   API strips (e.g. webhook HMAC secrets and custom headers, session proxy URLs and engine
   config) are **not** exposed over MCP.
@@ -188,7 +198,7 @@ MCP_ENABLED=true npm run start:prod   # or set MCP_ENABLED in your .env / compos
 MCP_READONLY=false                    # expose write tools (default is read-only when unset)
 MCP_RATE_LIMIT_MAX=60                 # max tool calls per key per window (default 60)
 MCP_RATE_LIMIT_WINDOW_MS=60000        # sliding window in ms (default 60000 = 1 min)
-MCP_IP_RATE_LIMIT_MAX=120             # pre-auth per-IP request cap per window (default 120)
+MCP_IP_RATE_LIMIT_MAX=120             # pre-auth per-IP message cap per window (default 120)
 MCP_IP_RATE_LIMIT_WINDOW_MS=60000     # per-IP window in ms (default 60000 = 1 min)
 ```
 
@@ -232,7 +242,9 @@ Guidelines:
 - **Reuse the response DTO** the matching REST controller uses (e.g.
   `WebhookResponseDto.fromEntity`, `SessionResponseDto.fromEntity`). Returning a raw entity
   can leak fields the REST API deliberately strips.
-- Mark writes with `tier: 'write'` and the appropriate `requiredRole`.
+- Mark writes with `tier: 'write'` and the appropriate `requiredRole`. Give a read the same
+  `requiredRole` as the REST route it mirrors: the webhook and automation-rule reads and
+  `GroupGetInviteCode` sit at OPERATOR because their REST routes do.
 - Use `sessionScoped: true` and a non-empty `sessionId` field for any per-session tool so
   the scope check applies.
 - A snapshot test (`tool-registry.spec.ts`) locks the public tool-name set; update it

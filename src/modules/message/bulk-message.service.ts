@@ -19,6 +19,7 @@ import {
   BatchMessageResult,
 } from './entities/message-batch.entity';
 import { SendBulkMessageDto } from './dto/bulk-message.dto';
+import { isMediaUrl } from '../../common/media/media-url';
 import { MessageStatus } from './entities/message.entity';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { MessageService, DEFAULT_TEMPLATE_RENDER_MAX_CHARS } from './message.service';
@@ -35,6 +36,8 @@ import { SsrfBlockedError, SSRF_BLOCKED_CLIENT_MESSAGE } from '../../common/secu
 import { renderTemplate } from '../../common/utils/template-render';
 import { IWhatsAppEngine, MessageResult } from '../../engine/interfaces/whatsapp-engine.interface';
 import { resolveNonNegativeIntEnv } from '../../config/configuration';
+import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
+import { isUniqueViolation } from '../../common/utils/db-errors';
 
 // Type definitions for bulk message content
 interface BulkMessageContent {
@@ -211,11 +214,17 @@ export class BulkMessageService implements OnApplicationBootstrap {
     // its base64 payloads) is persisted into the batch row. Mirrors the single-send cap in
     // MessageService.buildMediaInput. The same check runs again per item after variables and the
     // message:sending gate are applied (see executeBatch).
-    for (const { content } of messages) {
+    for (const { type, content } of messages) {
       this.assertContentMediaWithinCap(content);
+      this.assertItemContent(type, content, true);
     }
 
     const batchId = dto.batchId || `batch_${randomUUID().split('-')[0]}`;
+    // '.' and '..' are dot segments: URL clients collapse them, so the statusUrl and the status and
+    // cancel routes for such a batch would resolve to a different path and it could never be reached.
+    if (batchId === '.' || batchId === '..') {
+      throw new BadRequestException(`Batch ID '${batchId}' is not allowed`);
+    }
 
     // Check if this batchId already exists FOR THIS SESSION. Scoping by sessionId (matching how
     // getBatchStatus/cancelBatch already query) makes (sessionId, batchId) the namespace: one session
@@ -263,6 +272,11 @@ export class BulkMessageService implements OnApplicationBootstrap {
       await this.batchRepository.save(batch);
     } catch (error) {
       this.inFlightBatches--;
+      // Two concurrent creates with the same caller-supplied batchId both pass the read above; the
+      // unique index decides, and the loser gets the same 400 as the sequential case.
+      if (isUniqueViolation(error)) {
+        throw new BadRequestException(`Batch ID '${batchId}' already exists`);
+      }
       throw error;
     }
     this.logger.log(
@@ -367,15 +381,14 @@ export class BulkMessageService implements OnApplicationBootstrap {
   private async executeBatch(batch: MessageBatch): Promise<void> {
     if (!(await this.markBatchProcessing(batch))) return;
 
-    const engine = this.engines.get(batch.sessionId);
-    if (!engine) {
+    if (!this.engines.get(batch.sessionId)) {
       await this.failBatchWithoutEngine(batch);
       return;
     }
 
     const results: BatchMessageResult[] = batch.results || [];
     const state: BatchExecutionState = { results, stoppedOnError: false, cancelledByDb: false };
-    await this.processBatchMessages(batch, engine, state);
+    await this.processBatchMessages(batch, state);
     await this.finalizeBatch(batch, state);
   }
 
@@ -408,13 +421,9 @@ export class BulkMessageService implements OnApplicationBootstrap {
     } as QueryDeepPartialEntity<MessageBatch>);
   }
 
-  private async processBatchMessages(
-    batch: MessageBatch,
-    engine: IWhatsAppEngine,
-    state: BatchExecutionState,
-  ): Promise<void> {
+  private async processBatchMessages(batch: MessageBatch, state: BatchExecutionState): Promise<void> {
     for (let i = batch.currentIndex; i < batch.messages.length; i++) {
-      if (!(await this.processBatchMessage(batch, engine, i, state))) break;
+      if (!(await this.processBatchMessage(batch, i, state))) break;
     }
   }
 
@@ -422,12 +431,7 @@ export class BulkMessageService implements OnApplicationBootstrap {
    * Send one batch message through the moderation gate, record the outcome, and persist progress.
    * Returns false when the batch loop must stop (cancellation or stopOnError).
    */
-  private async processBatchMessage(
-    batch: MessageBatch,
-    engine: IWhatsAppEngine,
-    i: number,
-    state: BatchExecutionState,
-  ): Promise<boolean> {
+  private async processBatchMessage(batch: MessageBatch, i: number, state: BatchExecutionState): Promise<boolean> {
     const { results } = state;
     // Check for cancellation
     if (!this.processingBatches.get(batch.id)) {
@@ -460,9 +464,11 @@ export class BulkMessageService implements OnApplicationBootstrap {
       // Per-message moderation gate — the SAME message:sending hook single sends use, so a
       // compliance/moderation plugin sees bulk traffic too (bulk previously bypassed it entirely).
       // A block fails just THIS message (honouring stopOnError below); a plugin may also rewrite it.
+      // `input` carries the recipient like a single send's DTO does, so a recipient-based plugin can
+      // decide; a rewritten chatId is ignored, the item always goes to its own msg.chatId.
       const gate = await this.hookManager.execute(
         'message:sending',
-        { sessionId: batch.sessionId, input: content, type: msg.type },
+        { sessionId: batch.sessionId, input: { ...content, chatId: msg.chatId }, type: msg.type },
         { sessionId: batch.sessionId, source: 'BulkMessageService' },
       );
       if (!gate.continue) {
@@ -494,6 +500,12 @@ export class BulkMessageService implements OnApplicationBootstrap {
       // gate rewrite can grow base64 media past the limit createBatch verified on the raw input.
       // A violation fails just this item (honouring stopOnError) instead of sending it.
       this.assertContentMediaWithinCap(content);
+      this.assertItemContent(msg.type, content);
+
+      // Resolved per item, not once per batch: a session restart or reconnect registers a fresh
+      // adapter, and a batch still holding the retired one would fail every remaining item.
+      const engine = this.engines.get(batch.sessionId);
+      if (!engine) throw new EngineNotReadyError();
 
       // Send message based on type. The engine call is bracketed on its own so the pacing breaker
       // hears exactly what the single-send path feeds it (message.service failSend/persistSentState):
@@ -541,7 +553,12 @@ export class BulkMessageService implements OnApplicationBootstrap {
       if (!blockedByPlugin && !isPacingLimitedError(error)) {
         await this.hookManager.execute(
           'message:failed',
-          { sessionId: batch.sessionId, error: sanitized.message, input: content, type: msg.type },
+          {
+            sessionId: batch.sessionId,
+            error: sanitized.message,
+            input: { ...content, chatId: msg.chatId },
+            type: msg.type,
+          },
           { sessionId: batch.sessionId, source: 'BulkMessageService' },
         );
       }
@@ -633,6 +650,31 @@ export class BulkMessageService implements OnApplicationBootstrap {
     }
 
     this.logger.log(`Batch ${batch.batchId} completed: ${batch.progress.sent} sent, ${batch.progress.failed} failed`);
+  }
+
+  /**
+   * Require the field the item's type sends: a non-empty text for a text item, a url or base64 under
+   * the matching media key otherwise. The DTO cannot express this per type, so it runs at batch
+   * creation (a 400) and again per item after variables and the message:sending gate.
+   */
+  private assertItemContent(type: string, content: BulkMessageContent, beforeRender = false): void {
+    if (type === 'text') {
+      if (typeof content?.text !== 'string' || !content.text) {
+        throw new BadRequestException('A text item requires a non-empty content.text');
+      }
+      return;
+    }
+    const media = content?.[type as 'image' | 'video' | 'audio' | 'document'];
+    if (stripBase64DataUri(media?.base64)) return;
+    if (!media?.url) {
+      throw new BadRequestException(`A ${type} item requires content.${type}.url or content.${type}.base64`);
+    }
+    // Checked here rather than on the DTO because `variables` may supply the whole URL: before
+    // rendering, a value holding a placeholder is left to the per-item check, which sees the rendered
+    // (and plugin-rewritten) URL.
+    if (!(beforeRender && typeof media.url === 'string' && media.url.includes('{')) && !isMediaUrl(media.url)) {
+      throw new BadRequestException(`content.${type}.url must be an absolute http(s) URL`);
+    }
   }
 
   /**
@@ -732,21 +774,24 @@ export class BulkMessageService implements OnApplicationBootstrap {
     content: BulkMessageContent,
     result: MessageResult,
   ): Promise<void> {
-    const media = content.image ?? content.video ?? content.audio ?? content.document;
+    // Store what sendMessage sent: the media under the item's own type key, and the caption for a
+    // media item (audio carries none). Other keys on the item were never delivered.
+    const media = type === 'text' ? undefined : content[type as 'image' | 'video' | 'audio' | 'document'];
+    const body = type === 'text' ? content.text : type === 'audio' ? undefined : content.caption;
     // A bulk audio item flagged ptt is a voice note; store it in the 'voice' bucket like inbound PTT.
     const persistType = type === 'audio' && content.audio?.ptt ? 'voice' : type;
     try {
       await this.messageService.saveOutgoingMessage(sessionId, {
         waMessageId: result.id,
         chatId,
-        body: content.text ?? content.caption ?? '',
+        body: body ?? '',
         type: persistType,
         timestamp: result.timestamp,
         status: MessageStatus.SENT,
         metadata: media
           ? {
               media: {
-                mimetype: media.mimetype,
+                mimetype: this.mediaMimetype(type, content),
                 data: stripBase64DataUri(media.base64) || media.url,
                 filename: media.filename,
               },
@@ -758,6 +803,23 @@ export class BulkMessageService implements OnApplicationBootstrap {
       // merges onto the echo's row. Anything reaching this point is a real persistence fault.
       this.logger.warn(`Batch message persisted-after-send failed: ${String(error)}`);
     }
+  }
+
+  /**
+   * The mimetype a media item is sent with, and so the one its row must record: a stored row with no
+   * mimetype cannot be served back from the media endpoint. An undeclared URL item gets the
+   * 'application/octet-stream' placeholder buildMediaInput uses, which both engines read as "unknown",
+   * so the fetched Content-Type wins. A voice note keeps ogg/opus either way, as on the single send.
+   */
+  private mediaMimetype(type: string, content: BulkMessageContent): string {
+    const media = content[type as 'image' | 'video' | 'audio' | 'document'];
+    if (media?.mimetype) return media.mimetype;
+    if (type === 'audio' && content.audio?.ptt) return 'audio/ogg; codecs=opus';
+    if (!stripBase64DataUri(media?.base64)) return 'application/octet-stream';
+    if (type === 'image') return 'image/jpeg';
+    if (type === 'video') return 'video/mp4';
+    if (type === 'audio') return 'audio/mpeg';
+    return 'application/octet-stream';
   }
 
   private sendMessage(
@@ -773,14 +835,14 @@ export class BulkMessageService implements OnApplicationBootstrap {
           : engine.sendTextMessage(chatId, content.text || '');
       case 'image':
         return engine.sendImageMessage(chatId, {
-          mimetype: content.image?.mimetype || 'image/jpeg',
+          mimetype: this.mediaMimetype(type, content),
           data: stripBase64DataUri(content.image?.base64) || content.image?.url || '',
           caption: content.caption,
           mentions: content.mentions,
         });
       case 'video':
         return engine.sendVideoMessage(chatId, {
-          mimetype: content.video?.mimetype || 'video/mp4',
+          mimetype: this.mediaMimetype(type, content),
           data: stripBase64DataUri(content.video?.base64) || content.video?.url || '',
           caption: content.caption,
           mentions: content.mentions,
@@ -791,14 +853,14 @@ export class BulkMessageService implements OnApplicationBootstrap {
         // (see sendAudioMessage in baileys-messaging.ts). Dropping it here would accept the field and
         // then deliver an untagged voice note with nothing to say so.
         return engine.sendAudioMessage(chatId, {
-          mimetype: content.audio?.mimetype || (content.audio?.ptt ? 'audio/ogg; codecs=opus' : 'audio/mpeg'),
+          mimetype: this.mediaMimetype(type, content),
           data: stripBase64DataUri(content.audio?.base64) || content.audio?.url || '',
           ptt: content.audio?.ptt,
           mentions: content.mentions,
         });
       case 'document':
         return engine.sendDocumentMessage(chatId, {
-          mimetype: content.document?.mimetype || 'application/octet-stream',
+          mimetype: this.mediaMimetype(type, content),
           data: stripBase64DataUri(content.document?.base64) || content.document?.url || '',
           filename: content.document?.filename,
           caption: content.caption,

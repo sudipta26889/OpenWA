@@ -14,13 +14,12 @@ import {
   Copy,
   RefreshCw,
   Trash2,
-  Eye,
-  EyeOff,
   Loader2,
   Check,
   KeyRound,
   AlertTriangle,
   AlertCircle,
+  Pencil,
 } from 'lucide-react';
 import type { ApiKey } from '../services/api';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
@@ -29,14 +28,20 @@ import {
   useCreateApiKeyMutation,
   useDeleteApiKeyMutation,
   useRevokeApiKeyMutation,
+  useSessionsQuery,
+  useUpdateApiKeyMutation,
 } from '../hooks/queries';
 import { PageHeader } from '../components/PageHeader';
 import { Modal } from '../components/Modal';
+import { SessionScopePicker } from '../components/SessionScopePicker';
 import { useToast } from '../hooks/useToast';
 import { copyToClipboard } from '../utils/clipboard';
+import { canScopeSessions, sameSessionScope, sessionScopeNames } from '../utils/sessionScope';
 import './ApiKeys.css';
 
 const roleNames = ['admin', 'operator', 'viewer'] as const;
+
+const emptyKeyForm = { name: '', role: 'operator', allowedSessions: [] as string[] };
 
 function useWindowSize() {
   const [width, setWidth] = useState(window.innerWidth);
@@ -59,15 +64,18 @@ export function ApiKeys() {
   const { t } = useTranslation();
   const toast = useToast();
   useDocumentTitle(t('apiKeys.title'));
-  const { data: apiKeys = [], isLoading: loading, isError: apiKeysError } = useApiKeysQuery();
+  const { data: apiKeys = [], isLoading: loading, error: apiKeysError } = useApiKeysQuery();
+  const { data: sessions = [] } = useSessionsQuery();
   const createMutation = useCreateApiKeyMutation();
+  const updateMutation = useUpdateApiKeyMutation();
   const deleteMutation = useDeleteApiKeyMutation();
   const revokeMutation = useRevokeApiKeyMutation();
-  const [visibleKeys, setVisibleKeys] = useState<Set<string>>(new Set());
   const [showModal, setShowModal] = useState(false);
-  const [newKey, setNewKey] = useState({ name: '', role: 'operator' });
+  const [newKey, setNewKey] = useState(emptyKeyForm);
   const [createdKey, setCreatedKey] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
+  const [editingKey, setEditingKey] = useState<ApiKey | null>(null);
+  const [editSessions, setEditSessions] = useState<string[]>([]);
   const [confirmAction, setConfirmAction] = useState<{ type: 'delete' | 'revoke'; id: string; name: string } | null>(
     null,
   );
@@ -81,15 +89,52 @@ export function ApiKeys() {
     setColumnVisibility({ key: !isSmall, lastUsed: !isMobile });
   }, [isMobile, isSmall]);
 
+  const closeCreateModal = () => {
+    setShowModal(false);
+    setCreatedKey(null);
+    setNewKey(emptyKeyForm);
+  };
+
   const handleCreate = async () => {
     if (!newKey.name) return;
     try {
-      const created = await createMutation.mutateAsync({ name: newKey.name, role: newKey.role });
+      const created = await createMutation.mutateAsync({
+        name: newKey.name,
+        role: newKey.role,
+        ...(canScopeSessions(newKey.role) ? { allowedSessions: newKey.allowedSessions } : {}),
+      });
       setCreatedKey(created.apiKey || null);
-      setNewKey({ name: '', role: 'operator' });
+      setNewKey(emptyKeyForm);
     } catch (err) {
       console.error('Failed to create:', err);
       toast.error(t('apiKeys.createBtn'), err instanceof Error ? err.message : t('common.unknownError'));
+    }
+  };
+
+  const openEditSessions = (apiKey: ApiKey) => {
+    setEditingKey(apiKey);
+    setEditSessions(apiKey.allowedSessions ?? []);
+  };
+
+  const handleSaveSessions = async () => {
+    if (!editingKey) return;
+    // An unchanged Save must not be sent. The server writes `allowedSessions` whenever the field is
+    // present, and storing [] over a key that was never scoped reads back as an authorization
+    // change: it drops every live /events socket holding that key and writes an audit row saying
+    // the scope moved when it did not.
+    if (sameSessionScope(editSessions, editingKey.allowedSessions ?? [])) {
+      setEditingKey(null);
+      return;
+    }
+    try {
+      await updateMutation.mutateAsync({
+        id: editingKey.id,
+        data: { allowedSessions: editSessions },
+      });
+      setEditingKey(null);
+    } catch (err) {
+      console.error('Failed to update sessions:', err);
+      toast.error(t('apiKeys.sessions.editTitle'), err instanceof Error ? err.message : t('common.unknownError'));
     }
   };
 
@@ -118,15 +163,6 @@ export function ApiKeys() {
     setConfirmAction(null);
   };
 
-  const toggleKeyVisibility = (id: string) => {
-    setVisibleKeys(prev => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  };
-
   const handleCopy = async (text: string, id: string) => {
     if (await copyToClipboard(text)) {
       setCopied(id);
@@ -144,25 +180,30 @@ export function ApiKeys() {
         columnHelper.accessor('keyPrefix', {
           id: 'key',
           header: () => t('apiKeys.columns.key'),
-          cell: info => {
-            const apiKey = info.row.original;
-            return (
-              <span className="key-cell">
-                <code>{visibleKeys.has(apiKey.id) ? apiKey.keyPrefix + '...' : apiKey.keyPrefix + '****'}</code>
-                <button
-                  className="icon-btn-sm"
-                  onClick={() => toggleKeyVisibility(apiKey.id)}
-                  aria-label={visibleKeys.has(apiKey.id) ? t('common.hideApiKey') : t('common.showApiKey')}
-                >
-                  {visibleKeys.has(apiKey.id) ? <EyeOff size={14} /> : <Eye size={14} />}
-                </button>
-              </span>
-            );
-          },
+          // The list carries only the prefix: the full key exists once, in the post-creation modal.
+          cell: info => (
+            <span className="key-cell">
+              <code>{info.getValue()}****</code>
+            </span>
+          ),
         }),
         columnHelper.accessor('role', {
           header: () => t('apiKeys.columns.role'),
           cell: info => <span className="permission-badge">{info.getValue()}</span>,
+        }),
+        columnHelper.accessor('allowedSessions', {
+          id: 'sessions',
+          header: () => t('apiKeys.columns.sessions'),
+          cell: info => {
+            const names = sessionScopeNames(info.getValue(), sessions);
+            if (!names) {
+              return <span className="sessions-cell all">{t('apiKeys.sessions.all')}</span>;
+            }
+            if (names.length <= 2) {
+              return <span className="sessions-cell">{names.join(', ')}</span>;
+            }
+            return <span className="sessions-cell">{t('apiKeys.sessions.restricted', { count: names.length })}</span>;
+          },
         }),
         columnHelper.accessor('isActive', {
           header: () => t('apiKeys.columns.status'),
@@ -190,6 +231,15 @@ export function ApiKeys() {
               <span className="actions-cell">
                 {/* No per-row copy: the full key only exists once (post-creation modal); the row
                     only has the prefix, so a copy button here could only copy a useless fragment. */}
+                {canScopeSessions(apiKey.role) && apiKey.isActive && (
+                  <button
+                    className="icon-btn"
+                    onClick={() => openEditSessions(apiKey)}
+                    title={t('apiKeys.actions.editSessions')}
+                  >
+                    <Pencil size={16} />
+                  </button>
+                )}
                 {apiKey.isActive && (
                   <button
                     className="icon-btn"
@@ -211,7 +261,7 @@ export function ApiKeys() {
           },
         }),
       ]),
-    [visibleKeys, t],
+    [t, sessions],
   );
 
   const table = useTable({
@@ -246,7 +296,7 @@ export function ApiKeys() {
         }
       />
 
-      {apiKeysError && (
+      {apiKeysError && apiKeys.length > 0 && (
         <div className="error-banner" role="alert">
           <AlertCircle size={20} />
           <span className="error-banner-text">{t('dashboard.loadError')}</span>
@@ -256,16 +306,13 @@ export function ApiKeys() {
       {showModal && (
         <Modal
           open
-          onClose={() => {
-            setShowModal(false);
-            setCreatedKey(null);
-          }}
+          onClose={closeCreateModal}
           title={createdKey ? t('apiKeys.createdTitle') : t('apiKeys.modalTitle')}
           closeLabel={t('common.close')}
           footer={
             !createdKey ? (
               <>
-                <button className="btn-secondary" onClick={() => setShowModal(false)}>
+                <button className="btn-secondary" onClick={closeCreateModal}>
                   {t('common.cancel')}
                 </button>
                 <button
@@ -310,21 +357,90 @@ export function ApiKeys() {
                 onChange={e => setNewKey({ ...newKey, name: e.target.value })}
               />
               <label htmlFor="ak-2">{t('common.role')}</label>
-              <select id="ak-2" value={newKey.role} onChange={e => setNewKey({ ...newKey, role: e.target.value })}>
+              <select
+                id="ak-2"
+                value={newKey.role}
+                onChange={e =>
+                  setNewKey({
+                    ...newKey,
+                    role: e.target.value,
+                    allowedSessions: canScopeSessions(e.target.value) ? newKey.allowedSessions : [],
+                  })
+                }
+              >
                 {roleNames.map(r => (
                   <option key={r} value={r}>
                     {t(`apiKeys.roles.${r}`)}
                   </option>
                 ))}
               </select>
+              {canScopeSessions(newKey.role) && (
+                <SessionScopePicker
+                  sessions={sessions}
+                  selectedIds={newKey.allowedSessions}
+                  onChange={ids => setNewKey({ ...newKey, allowedSessions: ids })}
+                  disabled={createMutation.isPending}
+                />
+              )}
             </>
           )}
         </Modal>
       )}
 
+      {editingKey && (
+        <Modal
+          open
+          onClose={() => setEditingKey(null)}
+          title={t('apiKeys.sessions.editTitle')}
+          closeLabel={t('common.close')}
+          footer={
+            <>
+              <button className="btn-secondary" onClick={() => setEditingKey(null)}>
+                {t('common.cancel')}
+              </button>
+              <button
+                className="btn-primary"
+                onClick={() => void handleSaveSessions()}
+                disabled={updateMutation.isPending}
+              >
+                {updateMutation.isPending ? <Loader2 className="animate-spin" size={16} /> : t('apiKeys.sessions.save')}
+              </button>
+            </>
+          }
+        >
+          <p className="session-scope-edit-name">
+            <strong>{editingKey.name}</strong>
+          </p>
+          <SessionScopePicker
+            sessions={sessions}
+            selectedIds={editSessions}
+            onChange={setEditSessions}
+            disabled={updateMutation.isPending}
+          />
+        </Modal>
+      )}
+
       <div className="api-keys-content">
         <div className="keys-table-container">
-          {apiKeys.length === 0 ? (
+          {apiKeysError && apiKeys.length === 0 ? (
+            // A failed read is not an empty list: an admin key restricted to sessions always gets 403
+            // here (the route needs an unscoped key), and "No API keys created" would read as a gateway
+            // with no keys at all.
+            <div className="empty-table-state" role="alert">
+              <AlertCircle size={48} strokeWidth={1} />
+              {(apiKeysError as { status?: number }).status === 403 ? (
+                <>
+                  <h3>{t('apiKeys.empty.forbiddenTitle')}</h3>
+                  <p>{t('apiKeys.empty.forbiddenDesc')}</p>
+                </>
+              ) : (
+                <>
+                  <h3>{t('apiKeys.empty.loadErrorTitle')}</h3>
+                  <p>{apiKeysError.message}</p>
+                </>
+              )}
+            </div>
+          ) : apiKeys.length === 0 ? (
             <div className="empty-table-state">
               <KeyRound size={48} strokeWidth={1} />
               <h3>{t('apiKeys.empty.title')}</h3>

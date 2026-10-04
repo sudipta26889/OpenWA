@@ -118,6 +118,26 @@ curl -X POST "$BASE/api/sessions" \
   -d '{ "name": "my-bot", "proxyUrl": "http://user:pass@your-real-proxy.host:8080", "proxyType": "http" }'
 ```
 
+#### GET /api/sessions/:sessionId/proxy
+
+Read a session's masked proxy configuration (credentials never returned).
+
+```bash
+curl "$BASE/api/sessions/$SESSION_ID/proxy" \
+  -H "X-API-Key: $API_KEY"
+```
+
+#### PATCH /api/sessions/:sessionId/proxy
+
+Update per-session proxy settings (OPERATOR). No restart — changes apply on the next start. Send `"proxyUrl": null` to clear.
+
+```bash
+curl -X PATCH "$BASE/api/sessions/$SESSION_ID/proxy" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "proxyUrl": "http://user:pass@your-real-proxy.host:8080" }'
+```
+
 #### POST /api/sessions/:sessionId/start
 
 Start a session and initialize the connection (OPERATOR).
@@ -217,8 +237,8 @@ curl -X POST "$BASE/api/sessions/8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a/chats/read
   -d '{ "chatId": "1234567890@c.us", "messageIds": ["3EB0C767D26B8A3F1A2B"] }'
 ```
 
-`messageIds` is optional and holds up to 100 ids. Omit it and only the newest message the engine still
-holds in memory is acknowledged, which on Baileys leaves the earlier messages of a burst unread.
+`messageIds` is optional and holds up to 100 ids. Omit it and only the newest received message the engine
+still holds in memory is acknowledged, which on Baileys leaves the earlier messages of a burst unread.
 
 #### POST /api/sessions/:sessionId/chats/unread
 
@@ -689,7 +709,7 @@ curl -X GET "$BASE/api/sessions/$SESSION_ID/groups/120363021234567890@g.us" \
 
 #### GET /api/sessions/:sessionId/groups/:groupId/invite-code
 
-Get the group invite code and full invite link.
+Get the group invite code and full invite link (OPERATOR).
 
 ```bash
 curl -X GET "$BASE/api/sessions/$SESSION_ID/groups/120363021234567890@g.us/invite-code" \
@@ -1136,11 +1156,12 @@ curl -X POST "$BASE/api/sessions/$SESSION_ID/webhooks" \
   -d '{
     "url": "https://your-server.com/webhook",
     "events": ["message.received", "session.status"],
-    "secret": "your-secret-key",
+    "secret": "your-webhook-signing-secret",
     "headers": { "X-Custom-Header": "value" },
     "filters": {
       "conditions": [
         { "field": "sender", "operator": "is", "value": ["1234567890@c.us"] },
+        { "field": "chatId", "operator": "is", "value": ["120363000000000000@g.us"] },
         { "field": "body", "operator": "contains", "value": "invoice" }
       ]
     },
@@ -1184,7 +1205,7 @@ curl -X DELETE "$BASE/api/sessions/$SESSION_ID/webhooks/f1e2d3c4-b5a6-7890-1234-
 
 ### 07.11 API Keys
 
-All `/api/auth/api-keys` routes require an **ADMIN** key. `POST /api/auth/validate` accepts any valid key. The plaintext key is returned only by the create call.
+All `/api/auth/api-keys` routes require an unscoped **ADMIN** key: one with `allowedSessions` or `allowedChats` set is refused with `403`. `POST /api/auth/validate` accepts any valid key except one restricted with `allowedChats`, which gets `403`. The plaintext key is returned only by the create call.
 
 #### GET /api/auth/api-keys
 
@@ -1257,7 +1278,7 @@ curl -X DELETE "$BASE/api/auth/api-keys/3f2a1c9e-1b2d-4a5f-9c8e-aa11bb22cc33" \
 
 #### POST /api/auth/validate
 
-Validate the supplied key and report its role (empty body; key read from the header).
+Validate the supplied key and report its role and the running engine (`engineType`); empty body, key read from the header.
 
 ```bash
 curl -X POST "$BASE/api/auth/validate" \
@@ -1437,7 +1458,7 @@ curl "$BASE/api/infra/export-data" \
 
 #### POST /api/infra/import-data
 
-Replace all Data DB rows with a prior export (destructive, all-or-nothing). Every one of the 14 migration tables is emptied first, so a key you omit restores **empty** rather than untouched — send a body produced by `GET /api/infra/export-data`, not a hand-built subset. All 14 keys are shown below for that reason.
+Replace all Data DB rows with a prior export (destructive, all-or-nothing). Every one of the 16 migration tables is emptied first, so a key you omit restores **empty** rather than untouched — send a body produced by `GET /api/infra/export-data`, not a hand-built subset. All 16 keys are shown below for that reason.
 
 ```bash
 curl -X POST "$BASE/api/infra/import-data" \
@@ -1447,8 +1468,9 @@ curl -X POST "$BASE/api/infra/import-data" \
     "tables": {
       "sessions": [ { "id": "s1", "name": "main", "status": "ready", "phone": "15551234567", "pushName": "Me", "config": {}, "proxyUrl": null, "proxyType": null, "connectedAt": "2026-06-25T00:00:00.000Z", "lastActiveAt": "2026-06-25T00:00:00.000Z", "createdAt": "2026-06-25T00:00:00.000Z", "updatedAt": "2026-06-25T00:00:00.000Z" } ],
       "webhooks": [], "messages": [], "messageBatches": [], "templates": [], "baileysStoredMessages": [],
-      "lidMappings": [], "pluginInstances": [], "conversationMappings": [], "ingressEvents": [],
-      "webhookDeliveryFailures": [], "integrationDeliveryFailures": [], "statusUpdates": [], "automationRules": []
+      "lidMappings": [], "chatStates": [], "pluginInstances": [], "conversationMappings": [], "ingressEvents": [],
+      "webhookDeliveryFailures": [], "webhookOutboxEvents": [], "integrationDeliveryFailures": [], "statusUpdates": [],
+      "automationRules": []
     }
   }'
 ```
@@ -1540,13 +1562,14 @@ curl -X POST "$BASE/api/plugins/install" \
 
 #### POST /api/plugins/install-url
 
-Install a plugin by downloading its .zip from a URL (SSRF-guarded).
+Install a plugin by downloading its .zip from a URL (SSRF-guarded). Under `NODE_ENV=production` the
+URL needs a `#sha256=` pin by default; the digest below is a placeholder for the SHA-256 of the `.zip`.
 
 ```bash
 curl -X POST "$BASE/api/plugins/install-url" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{ "url": "https://github.com/openwa-plugins/chat-flow/releases/download/v1.0.0/chat-flow.zip" }'
+  -d '{ "url": "https://github.com/openwa-plugins/chat-flow/releases/download/v1.0.0/chat-flow.zip#sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }'
 ```
 
 #### POST /api/plugins/:id/enable
@@ -1602,13 +1625,14 @@ curl -X PUT "$BASE/api/plugins/chat-flow/sessions" \
 
 #### POST /api/plugins/:id/update
 
-Update an installed plugin in place from a URL.
+Update an installed plugin in place from a URL. The URL follows the same pin rule as `install-url`; the
+digest below is a placeholder for the SHA-256 of the `.zip`.
 
 ```bash
 curl -X POST "$BASE/api/plugins/chat-flow/update" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{ "url": "https://example.com/plugins/chat-flow-1.1.0.zip" }'
+  -d '{ "url": "https://example.com/plugins/chat-flow-1.1.0.zip#sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }'
 ```
 
 #### DELETE /api/plugins/:id

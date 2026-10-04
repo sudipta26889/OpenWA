@@ -1,5 +1,6 @@
 import { Client, ClientConfig } from 'pg';
 import { DataSource, DataSourceOptions } from 'typeorm';
+import { assertDataConnectionUtc, postgresUtcExtra } from './postgres-utc';
 
 // The postgres data connection runs its boot migrations while holding a session-scoped Postgres
 // advisory lock, so replicas that boot at the same time serialize instead of racing DDL against
@@ -36,6 +37,9 @@ type PostgresOptions = Extract<DataSourceOptions, { type: 'postgres' }>;
  * @nestjs/typeorm's default path: construct only, let the wrapper initialize as before. The
  * wrapper also skips its own initialize() for the postgres branch because the DataSource comes
  * back already initialized, and keeps applying retryAttempts/retryDelay to this whole factory.
+ *
+ * It is also where the postgres data connection's UTC pin is applied and then verified, for the same
+ * reason: this is the only place that connection is constructed at runtime.
  */
 export async function createBootDataSource(
   options: DataSourceOptions | undefined,
@@ -51,17 +55,32 @@ export async function createBootDataSource(
   }
 
   // This connection's migrations run HERE, under the lock — neutralize migrationsRun so the
-  // DataSource itself never starts them unsynchronized inside initialize().
-  const dataSource = createDataSource({ ...options, migrationsRun: false });
+  // DataSource itself never starts them unsynchronized inside initialize(). The UTC pin is merged in
+  // at the same point, because this is the one place the runtime postgres data connection is built
+  // (the migration CLI's own data source carries it directly).
+  const build = (extra: Record<string, unknown> | undefined): DataSource =>
+    createDataSource({ ...options, migrationsRun: false, extra: { ...extra, ...postgresUtcExtra() } });
+  const runtimeExtra = options.extra as Record<string, unknown> | undefined;
+
+  // statement_timeout bounds live runtime queries, and pg sends it in the startup packet, so every
+  // statement on a pool built with it inherits the limit. A backfill or index build over a large
+  // table can legitimately run longer, so the chain runs on its own short-lived pool without it (as
+  // the migration CLI does), and the runtime DataSource is built only once the chain is applied.
+  const migrationExtra = { ...runtimeExtra };
+  delete migrationExtra.statement_timeout;
+  const migrator = build(migrationExtra);
   try {
-    await dataSource.initialize();
+    await migrator.initialize();
+    // Before any migration writes a row: a connection whose UTC pin did not take stores timestamps in
+    // one zone and reads them in another, which nothing downstream can detect (see postgres-utc.ts).
+    await assertDataConnectionUtc(migrator);
     const lockClient = createLockClient(lockClientConfig(options));
     try {
       await lockClient.connect();
       await lockClient.query('SELECT pg_advisory_lock($1, $2)', [...POSTGRES_BOOT_MIGRATION_LOCK_KEYS]);
       try {
         // Same transaction mode DataSource.initialize() passes for the built-in migrationsRun.
-        await dataSource.runMigrations({ transaction: options.migrationsTransactionMode });
+        await migrator.runMigrations({ transaction: options.migrationsTransactionMode });
       } finally {
         // Session-scoped lock: even when the unlock call itself fails, end() below tears the
         // session — and with it the lock — down, so no crashed boot can leave it held.
@@ -72,10 +91,18 @@ export async function createBootDataSource(
     } finally {
       await lockClient.end().catch(() => undefined);
     }
+  } finally {
+    // The migration pool never outlives this block: on success the runtime DataSource below replaces
+    // it, and on failure a half-open one would stack pools across the boot retry loop. The failure
+    // still fails boot via the factory's rejection; a teardown error never masks it.
+    await migrator.destroy().catch(() => undefined);
+  }
+
+  const dataSource = build(runtimeExtra);
+  try {
+    await dataSource.initialize();
+    await assertDataConnectionUtc(dataSource);
   } catch (error) {
-    // Same failure handling as DataSource.initialize()'s own migrate step: never leave a
-    // half-open DataSource behind (the boot retry loop would stack their pools). The error still
-    // fails boot via the factory's rejection.
     await dataSource.destroy().catch(() => undefined);
     throw error;
   }
@@ -95,6 +122,8 @@ function lockClientConfig(options: PostgresOptions): ClientConfig {
     ssl: options.ssl as ClientConfig['ssl'],
     // Bound a stuck connect like the pool does (app.module's extra carries the same setting).
     connectionTimeoutMillis: extra.connectionTimeoutMillis ?? 10000,
+    // No UTC pin here on purpose: this client only ever calls pg_advisory_lock/unlock, so it neither
+    // binds nor reads a timestamp and its session zone cannot reach a column.
     // This client's only statements are pg_advisory_lock/unlock, and statement_timeout applies to
     // ANY command — including the wait inside pg_advisory_lock — so it must be OFF here. A config
     // `statement_timeout: 0` would NOT do it: pg drops falsy values from the startup packet, so

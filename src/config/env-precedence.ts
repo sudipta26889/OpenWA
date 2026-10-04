@@ -31,6 +31,8 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'MEDIA_DOWNLOAD_MAX_BYTES',
   'MEDIA_DOWNLOAD_TIMEOUT_MS',
   'INBOUND_MEDIA_CONCURRENCY',
+  // Whether a caller-supplied URL is fetched through the named session's egress proxy.
+  'SESSION_PROXY_URL_FETCH',
   // Database selection + connection details (#488)
   'DATABASE_TYPE',
   'DATABASE_HOST',
@@ -40,6 +42,9 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'DATABASE_PASSWORD',
   // PostgreSQL schema (dashboard-managed + compose blank-forwarded, like the other DATABASE_* keys)
   'POSTGRES_SCHEMA',
+  // PostgreSQL TLS, same arrangement: a blank forward must not pin a dashboard-saved value off.
+  'DATABASE_SSL',
+  'DATABASE_SSL_REJECT_UNAUTHORIZED',
   // Storage selection + S3 details (#488)
   'STORAGE_TYPE',
   'STORAGE_LOCAL_PATH',
@@ -111,6 +116,7 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'PUPPETEER_HEADLESS',
   'SESSION_DATA_PATH',
   'PUPPETEER_ARGS',
+  'PUPPETEER_PROTOCOL_TIMEOUT_MS',
   // Rate-limit values are blank-forwarded by Compose so a host value can take precedence without an
   // empty forward masking the lower-priority loaded .env / data/.env.generated value.
   'RATE_LIMIT_SHORT_TTL',
@@ -199,6 +205,7 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'BAILEYS_LOG_LEVEL',
   'BAILEYS_MESSAGE_STORE_LIMIT',
   'BAILEYS_SESSION_STORE_MAX_ENTRIES',
+  'BAILEYS_CHAT_STATE_CACHE_MAX',
   'WWEBJS_ONBOARDING_CONTINUE_LABELS',
   'SHUTDOWN_DELAY_MS',
   'SIMULATE_TYPING_MAX_MS',
@@ -222,6 +229,7 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'PLUGIN_CATALOG_URL',
   'PLUGIN_CAP_TIMEOUT_MS',
   'PLUGIN_STORAGE_MAX_BYTES',
+  'UPDATE_CHECK_ENABLED',
   'AUDIT_RETENTION_DAYS',
   'BULK_MAX_CONCURRENT_BATCHES',
   'TEMPLATE_RENDER_MAX_CHARS',
