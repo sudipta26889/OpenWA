@@ -151,7 +151,15 @@ describe('StatusService media validation and selection', () => {
       expect(media.mimetype).toBe('application/octet-stream');
     });
 
-    it.each(['image/svg+xml;charset=utf-8', 'image/svg+xml ', 'image/svg+xml ;charset=utf-8'])(
+    it.each([
+      'image/svg+xml;charset=utf-8',
+      'image/svg+xml ',
+      'image/svg+xml ;charset=utf-8',
+      'image/SVG+XML',
+      'image/Svg+Xml; charset=utf-8',
+      'IMAGE/svg+xml;charset=utf-8',
+      ' image/svg+xml',
+    ])(
       'serves the parameterized/spaced form %s as inert octet-stream too (browsers parse it as SVG)',
       async mimetype => {
         // The stored mimetype is engine-reported verbatim, so it can carry MIME parameters or
@@ -166,7 +174,21 @@ describe('StatusService media validation and selection', () => {
       },
     );
 
-    it('still serves a parameterized NON-scriptable image with its declared mimetype', async () => {
+    // A browser splits a Content-Type on commas and takes the last valid type, so a stored value
+    // that is not one single type must not be echoed back.
+    it.each(['image/png,text/html', 'image/svg+xml,', 'image/png, image/svg+xml'])(
+      'serves the comma-joined form %s as inert octet-stream',
+      async mimetype => {
+        store.getMedia.mockResolvedValue({ path: 'statuses/sess/x', mimetype });
+        storageService.getFile.mockResolvedValue(Buffer.from('x'));
+
+        const media = await service.getStatusMedia('sess', 'w1');
+
+        expect(media.mimetype).toBe('application/octet-stream');
+      },
+    );
+
+    it('still serves a parameterized NON-scriptable image as its essence', async () => {
       // The exclusion is scoped to SVG: a perfectly ordinary `image/jpeg` with a charset parameter
       // (or any other image/video/audio type) must not be dragged down to octet-stream by it.
       store.getMedia.mockResolvedValue({ path: 'statuses/sess/x.jpg', mimetype: 'image/jpeg;charset=ISO-8859-1' });
@@ -174,7 +196,21 @@ describe('StatusService media validation and selection', () => {
 
       const media = await service.getStatusMedia('sess', 'w1');
 
-      expect(media.mimetype).toBe('image/jpeg;charset=ISO-8859-1');
+      expect(media.mimetype).toBe('image/jpeg');
+    });
+
+    it.each([
+      ['text/HTML', 'application/octet-stream'],
+      ['IMAGE/JPEG', 'image/jpeg'],
+      ['audio/ogg; codecs=opus', 'audio/ogg'],
+      ['image/png;x=1,text/html', 'image/png'],
+    ])('serves a stored %s as %s', async (stored, served) => {
+      store.getMedia.mockResolvedValue({ path: 'statuses/sess/x', mimetype: stored });
+      storageService.getFile.mockResolvedValue(Buffer.from('x'));
+
+      const media = await service.getStatusMedia('sess', 'w1');
+
+      expect(media.mimetype).toBe(served);
     });
   });
 
@@ -292,6 +328,17 @@ describe('StatusService media validation and selection', () => {
     });
   });
 
+  // The status adapters fetch a URL with no fallback type of their own, so a host serving a generic
+  // Content-Type would leave the bytes labelled octet-stream; the route default is the only label they get.
+  it('labels an untyped URL with the route default for its kind', async () => {
+    const url = 'https://example.com/banner';
+    await service.postImageStatus('s1', { url }, { recipients: ['1@c.us'] });
+    await service.postVideoStatus('s1', { url }, { recipients: ['1@c.us'] });
+
+    expect(engine.postImageStatus).toHaveBeenCalledWith({ mimetype: 'image/jpeg', data: url }, expect.anything());
+    expect(engine.postVideoStatus).toHaveBeenCalledWith({ mimetype: 'video/mp4', data: url }, expect.anything());
+  });
+
   it('strips a data-URI prefix before handing base64 bytes to either engine path', async () => {
     const prefixed = 'data:image/png;base64,QUJD';
     await service.postImageStatus('s1', { base64: prefixed, mimetype: 'image/png' }, { recipients: ['1@c.us'] });
@@ -339,14 +386,16 @@ describe('StatusService media validation and selection', () => {
   // A status post publishes content from the account, so it passes the same `message:sending`
   // moderation gate as a chat send rather than going out unseen by plugins.
   describe('message:sending gate', () => {
-    it('consults the gate for text, image and video status posts', async () => {
+    it('consults the gate and the pacing check for text, image, video and voice status posts', async () => {
       await service.postTextStatus('s1', 'hello', { recipients: [] });
       await service.postImageStatus('s1', { base64: 'QUJD', mimetype: 'image/png' }, { recipients: [] });
       await service.postVideoStatus('s1', { base64: 'QUJD', mimetype: 'video/mp4' }, { recipients: [] });
+      await service.postVoiceStatus('s1', { base64: 'QUJD' }, { recipients: [] });
 
       const types = hookManager.execute.mock.calls.map(([, data]) => (data as { type: string }).type);
-      expect(types).toEqual(['status-text', 'status-image', 'status-video']);
+      expect(types).toEqual(['status-text', 'status-image', 'status-video', 'status-voice']);
       expect(hookManager.execute.mock.calls.every(([event]) => event === 'message:sending')).toBe(true);
+      expect(pacing.assertSendAllowed).toHaveBeenCalledTimes(4);
     });
 
     it('identifies itself as StatusService so a plugin can tell it from a chat send', async () => {
@@ -362,7 +411,11 @@ describe('StatusService media validation and selection', () => {
       await expect(service.postTextStatus('s1', 'spam', { recipients: [] })).rejects.toBeInstanceOf(
         BadRequestException,
       );
+      await expect(service.postVoiceStatus('s1', { base64: 'QUJD' }, { recipients: [] })).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
       expect(engine.postTextStatus).not.toHaveBeenCalled();
+      expect(engine.postVoiceStatus).not.toHaveBeenCalled();
     });
 
     it('sends the plugin-rewritten text rather than the original', async () => {

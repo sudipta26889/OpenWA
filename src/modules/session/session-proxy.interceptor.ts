@@ -31,8 +31,9 @@ const RELAYED_RESPONSE_HEADERS = [
   'content-disposition',
   'x-content-type-options',
   // Throttle answers come from the OWNER's counters, so the client must be told what the owner
-  // said: without these a forwarded 429 arrives with no indication of when to retry. The suffixed
-  // names are the ones the throttler actually sets (there is no bare Retry-After).
+  // said: without these a forwarded 429 arrives with no indication of when to retry.
+  // ProxyAwareThrottlerGuard sets the plain Retry-After that HTTP clients read; the base throttler
+  // adds the per-tier Retry-After-<name> and X-RateLimit-* headers. All of them are relayed.
   'retry-after',
   'retry-after-short',
   'retry-after-medium',
@@ -102,8 +103,8 @@ export function forwardTarget(originalUrl: string, ownerNodeUrl: string): string
  * landing on the wrong node — a load balancer round-robining across replicas knows nothing about
  * session placement — is forwarded to the owner's `nodeUrl` and the owner's response is relayed
  * back. Interceptor rather than middleware so it runs AFTER the API-key guard: a node only spends
- * outbound work on requests that authenticated here first (the owner authenticates them again —
- * both nodes share the auth database).
+ * outbound work on requests that authenticated here first (the owner authenticates them again
+ * against its own key store; API keys live in each node's main SQLite file and are not shared).
  *
  * Entirely inert unless the operator configured routing: without NODE_URL on this node the
  * interceptor never even looks up the session, so single-node deployments pay nothing.

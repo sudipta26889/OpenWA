@@ -15,6 +15,7 @@ import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error'
 import { createProxyDispatcher, hasUnauthenticatableSocks4Credentials } from '../../common/security/proxy-dispatcher';
 import { type createLogger } from '../../common/services/logger.service';
 import { BaileysAdapterConfig } from '../types/baileys.types';
+import { useAtomicMultiFileAuthState } from './baileys-auth-store';
 import { createBaileysLogger } from './baileys-logger';
 import { BaileysVersionResolver } from './baileys-version-resolver';
 import { unappliedPatches, unappliedPatchesMessage } from './engine-patch-status';
@@ -153,6 +154,8 @@ export interface BaileysLifecycleHost {
   handleGroupJoinRequest: BaileysEvents['handleGroupJoinRequest'];
   handleCallEvents: BaileysEvents['handleCallEvents'];
   handlePresenceUpdate: BaileysEvents['handlePresenceUpdate'];
+  /** Drop the store writes of messages still being processed; called before an unlink wipes the store. */
+  fenceStoredWrites: BaileysEvents['fenceStoredWrites'];
   captureHistoryMessages: BaileysHistory['captureHistoryMessages'];
   /** Backfill names the initial sync skipped (runs on connection 'open'). */
   hydrateNames: BaileysHistory['hydrateNames'];
@@ -177,8 +180,8 @@ export interface BaileysLifecycleHost {
 }
 
 export class BaileysLifecycle {
-  /** A close this long after the previous close means the connection had been healthy in between —
-   *  the backoff counter restarts from scratch instead of inheriting an old incident's attempts. */
+  /** A close more than this long after the previous close restarts the backoff counter from scratch
+   *  instead of inheriting an old incident's attempts. The backoff wait counts toward the gap. */
   private static readonly RECONNECT_STABILITY_RESET_MS = 5 * 60_000;
   /** How long a first link's history sync must stay silent before the address-book pull runs. */
   private static readonly ADDRESSBOOK_QUIET_MS = 20_000;
@@ -296,7 +299,7 @@ export class BaileysLifecycle {
       }
     }
     const b = await this.loadLib();
-    const { state, saveCreds } = await b.useMultiFileAuthState(this.host.authPath);
+    const { state, saveCreds } = await useAtomicMultiFileAuthState(this.host.authPath, b, this.host.logger);
     const version = await this.versionResolver.resolve(b, { dispatcher: this.fetchDispatcher() });
     // BaileysLogger matches ILogger exactly; cast needed because the module resolves the type
     // through a deep import path that TypeScript does not auto-unify here. Shared by the key
@@ -609,8 +612,9 @@ export class BaileysLifecycle {
       if (me?.id && me.lid) {
         this.host.addLidMappings([{ lid: `${userPart(me.lid)}@lid`, pn: `${userPart(me.id)}@s.whatsapp.net` }]);
       }
-      // I4: reset the reconnect counter on a successful connection.
-      this.reconnectAttempts = 0;
+      // The reconnect counter is not reset here: a connection that drops seconds after the handshake
+      // would otherwise redial at attempt 1 forever. The close branch resets it once more than the
+      // stability window passes between drops.
       this.setStatus(EngineStatus.READY);
       this.host.getOnReady()?.(this.phoneNumber ?? '', this.pushName ?? '');
       // WhatsApp only PUSHES a timelock when it changes, so a gateway that starts (or reconnects)
@@ -668,8 +672,8 @@ export class BaileysLifecycle {
 
       // Every other close (408/411/428/500/503/515/undefined) is transient: reconnect with capped
       // backoff and NO attempt ceiling — a long network outage must
-      // not kill the session. The counter resets on 'open', on a scan, when a QR window runs out, and via
-      // the stability window below.
+      // not kill the session. The counter resets on a scan, when a QR window runs out, and via the
+      // stability window below.
       // Do NOT fire onDisconnected here; this is a transient drop, not a terminal disconnect.
       this.host.logger.log('Baileys connection dropped; reconnecting', {
         sessionId: this.host.config.sessionId,
@@ -698,8 +702,10 @@ export class BaileysLifecycle {
         return;
       }
 
-      // Stability reset: a close >5 min after the previous one means the connection had been
-      // healthy in between — start the backoff fresh instead of inheriting the old counter.
+      // Stability reset: a close more than 5 minutes after the previous one starts the backoff fresh
+      // instead of inheriting the old counter. The gap runs close to close, so the backoff wait counts
+      // toward it. A drop sooner than that keeps climbing it, so a link that fails right after each
+      // handshake backs off instead of redialing every second or two.
       // A QR window that ran out resets it too: WhatsApp answered, and a QR left unscanned for hours
       // must not add up to a reconnect loop.
       const now = Date.now();
@@ -886,6 +892,7 @@ export class BaileysLifecycle {
       // Acknowledged. End/null the captured socket, clear live call handles, and drop to
       // DISCONNECTED before the awaited cleanup so no send/path observes a half-torn-down socket.
       this.localSocketShutdown(sourceSock);
+      this.host.fenceStoredWrites();
       await this.host.config.messageStore?.clearSession(this.host.config.dbSessionId).catch(() => undefined);
       await this.host.config.chatStateStore?.clearSession(this.host.config.sessionId).catch(() => undefined);
       // Wipe the multi-file auth dir so a fresh link starts clean — stale creds would otherwise be
@@ -951,6 +958,8 @@ export class BaileysLifecycle {
     // Cached call handles die with the connection — drop them so a later rejectCall() reports
     // not-found (404) instead of acting on a dead socket (mirrors disconnect/logout/destroy).
     this.host.liveCalls.clear();
+    // A message still being processed must not recreate a row of the unlinked account after the wipe below.
+    this.host.fenceStoredWrites();
     void dead?.end(undefined);
 
     const cleanup = (async (): Promise<void> => {

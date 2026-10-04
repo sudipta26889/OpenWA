@@ -1,6 +1,6 @@
 # rmyndharis-openwa
 
-Official Python SDK for the [OpenWA](https://github.com/rmyndharis/OpenWA) WhatsApp API Gateway.
+Official Python SDK for [OpenWA](https://github.com/rmyndharis/OpenWA), the open-source WhatsApp API Gateway. OpenWA is an independent project, not affiliated with or endorsed by WhatsApp or Meta.
 
 A synchronous client built on [httpx](https://www.python-httpx.org/), with bundled type hints (PEP 561).
 
@@ -11,6 +11,16 @@ pip install rmyndharis-openwa
 ```
 
 Requires Python 3.9+. The importable module is `openwa`.
+
+This README describes `main`. The 0.5.0 release lacks, among other additions, `sessions.get_proxy`,
+`sessions.update_proxy`, `messages.click_button`, `verify_webhook_signature`, the `WebhookDelivery`
+type, the `.code`, `.retry_after_seconds` and `.headers` error attributes, the `name` key of
+`ListSessionsQuery`, the `after` and `inlineMedia` keys of `ListMessagesQuery`, the `archived`,
+`pinned`, `muted` and `muteExpiration` keys of `ChatSummary`, the `order` and `product` keys of
+`ChatHistoryMessage`, the refusal of an empty, `.` or `..` id and the `ValueError` that
+`client.request` raises for a path that does not begin with `/` (0.5.0 resolves `api/health`
+against the base URL); they ship with the next SDK release. See
+[the SDK overview](../README.md#coverage).
 
 ## Usage
 
@@ -27,6 +37,8 @@ client = OpenWAClient(
 session = client.sessions.create({"name": "my-session"})
 client.sessions.start(session["id"])
 
+# Link the account before sending: scan sessions.get_qr_code or use sessions.request_pairing_code,
+# then wait for status "ready". An unlinked session answers the send with 409.
 result = client.messages.send_text(session["id"], {
     "chatId": "628123456789@c.us",
     "text": "Hello from the OpenWA Python SDK!",
@@ -75,11 +87,16 @@ A non-2xx response raises a typed `OpenWAApiError` subclass — `OpenWAAuthError
 timeout raises `OpenWATimeoutError`. 503 is transient, but a catalog 503 can persist because
 WhatsApp may never answer that query, so bound any retry. A 429 from the global rate limiter
 lifts when its window expires (seconds for the per-second tier, up to an hour for the hourly
-tier by default); its delay is only in the `Retry-After` response header, which the error does
-not carry. A 429 whose body has `code: "SEND_PACING_LIMITED"` is not transient: do not retry it
-before the body's `retryAfterSeconds`, which can be hours. In a routed deployment only 503
-proves the request was never carried out: a forward that fails after the request reached the
-owner node answers 502 or 504.
+tier by default), and `.retry_after_seconds` carries its `Retry-After` header. A 429 whose
+`.code` is `"SEND_PACING_LIMITED"` is usually not transient: do not retry it before
+`.retry_after_seconds`, which then comes from the body: a few seconds when only sends still in
+flight caused it, the rest of the failure breaker's cooldown (`SEND_PACING_BREAKER_COOLDOWN_MS`,
+15 minutes by default) after a run of send failures, otherwise up to the next UTC day. Every API
+error also exposes the response `.headers`. A 503 does not prove a write was never carried out: the
+engine answers it when WhatsApp did not confirm in time, and the change may still have been applied,
+so re-read the state before repeating it. In a routed deployment a forward that fails before
+reaching the owner node answers 503, one that fails after the request reached it answers 502 or 504,
+and a 503 from the owner itself is relayed unchanged.
 
 ```python
 from openwa import OpenWANotFoundError
@@ -98,6 +115,34 @@ except OpenWANotFoundError as e:
   reverse proxy) is preserved.
 - Escape hatch for endpoints the SDK does not wrap:
   `client.request(method, path, query=…, body=…)`.
+
+## Receiving webhooks
+
+A webhook configured with a secret signs each delivery in its `X-OpenWA-Signature` header. Check it
+with `verify_webhook_signature` against the raw, unparsed request body (`bytes` or `str`), exactly
+as received, and parse the JSON only after the check passes: a re-serialized body can differ byte
+for byte and will not verify. The helper returns `False` (never raises) for a missing, malformed or
+non-matching signature. `WebhookDelivery` (in `openwa.types`) types the parsed body.
+
+```python
+import json
+
+from flask import Flask, request
+from openwa import verify_webhook_signature
+from openwa.types import WebhookDelivery
+
+app = Flask(__name__)
+
+
+@app.post("/openwa/webhook")
+def openwa_webhook():
+    raw_body = request.get_data()
+    if not verify_webhook_signature(raw_body, request.headers.get("X-OpenWA-Signature"), secret):
+        return "Invalid signature", 401
+    delivery: WebhookDelivery = json.loads(raw_body)
+    # Process delivery["event"] and delivery["data"] here.
+    return "OK", 200
+```
 
 ## Releasing
 

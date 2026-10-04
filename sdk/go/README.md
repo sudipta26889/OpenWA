@@ -4,11 +4,25 @@ Idiomatic Go client for the [OpenWA](https://github.com/rmyndharis/OpenWA) Whats
 API Gateway. Stdlib-only (no dependencies), context-first, with typed errors and
 an injectable transport pipeline.
 
+OpenWA is an independent project, not affiliated with or endorsed by WhatsApp or
+Meta.
+
 ```bash
 go get github.com/rmyndharis/OpenWA/sdk/go
 ```
 
 Requires Go 1.22+.
+
+This README describes `main`. The v0.5.0 release lacks, among other additions,
+`Sessions.GetProxy`, `Sessions.UpdateProxy`, `Messages.ClickButton`,
+`VerifyWebhookSignature`, the `WebhookDelivery` type, the `ListSessionsQuery.Name`
+filter, the `After` and `InlineMedia` fields of `ListMessagesQuery`, the
+`Archived`, `Pinned`, `Muted` and `MuteExpiration` fields of `ChatSummary`, the
+`Order` and `Product` fields of `ChatHistoryMessage`, the `APIError` fields
+`Code`, `RetryAfter` and `Header`, the refusal of empty and dot ids and the
+refusal of a `Do` path that does not begin with `/`; they ship with the next SDK
+release. See
+[the SDK overview](../README.md#coverage).
 
 ## Quick start
 
@@ -39,6 +53,8 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Link the account before sending: scan Sessions.QRCode or use Sessions.RequestPairingCode,
+	// then wait for status "ready". An unlinked session answers the send with 409.
 	res, err := client.Messages.SendText(ctx, session.ID, openwa.SendTextRequest{
 		ChatID: "628123456789@c.us",
 		Text:   "Hello from the OpenWA Go SDK!",
@@ -100,18 +116,26 @@ case err != nil:
 }
 ```
 
-Sentinels: `ErrUnauthorized` (401), `ErrForbidden` (403), `ErrNotFound` (404),
-`ErrConflict` (409), `ErrRateLimited` (429), `ErrNotImplemented` (501),
+Sentinels: `ErrBadRequest` (400), `ErrUnauthorized` (401),
+`ErrForbidden` (403), `ErrNotFound` (404), `ErrConflict` (409),
+`ErrRateLimited` (429), `ErrNotImplemented` (501),
 `ErrServiceUnavailable` (503). 503 is transient, but a catalog 503 can persist
 because WhatsApp may never answer that query, so bound any retry. A 429 from
 the global rate limiter lifts when its window expires (seconds for the
-per-second tier, up to an hour for the hourly tier by default); its delay is
-only in the `Retry-After` response header, which `APIError` does not carry but
-`WithRetry` honors. A 429 whose body has `code: "SEND_PACING_LIMITED"` is not
-transient: do not retry it before the body's `retryAfterSeconds`, which can be
-hours. A timeout surfaces as `*openwa.TimeoutError`. In a routed deployment
-only 503 proves the request was never carried out: a forward that fails after
-the request reached the owner node answers 502 or 504.
+per-second tier, up to an hour for the hourly tier by default);
+`APIError.RetryAfter` carries its `Retry-After` header, which `WithRetry` also
+honors. A 429 whose `APIError.Code` is `"SEND_PACING_LIMITED"` is usually not
+transient: do not retry it before `RetryAfter`, which then comes from the body:
+a few seconds when only sends still in flight caused it, the rest of the failure
+breaker's cooldown (`SEND_PACING_BREAKER_COOLDOWN_MS`, 15 minutes by default)
+after a run of send failures, otherwise up to the next UTC day. `APIError.Header`
+holds the response headers. A timeout surfaces as `*openwa.TimeoutError`. A 503
+does not prove a write was never carried out: the
+engine answers it when WhatsApp did not confirm in time, and the change may still
+have been applied, so re-read the state before repeating it. In a routed
+deployment a forward that fails before reaching the owner node answers 503, one
+that fails after the request reached it answers 502 or 504, and a 503 from the
+owner itself is relayed unchanged.
 
 ## Retries
 
@@ -173,6 +197,36 @@ var out map[string]any
 err := client.Do(ctx, "GET", "/api/some/new/path", nil, nil, &out)
 ```
 
+## Receiving webhooks
+
+A webhook configured with a secret signs each delivery in its
+`X-OpenWA-Signature` header. Check it with `VerifyWebhookSignature` against the
+raw request body, exactly as received, and decode the JSON only after the check
+passes: a re-serialized body can differ byte for byte and will not verify. The
+helper returns `false` for a missing, malformed or non-matching signature.
+`WebhookDelivery` types the decoded body.
+
+```go
+http.HandleFunc("/openwa/webhook", func(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if !openwa.VerifyWebhookSignature(body, r.Header.Get("X-OpenWA-Signature"), secret) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	var delivery openwa.WebhookDelivery
+	if err := json.Unmarshal(body, &delivery); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	// Process delivery.Event and delivery.Data here.
+	w.WriteHeader(http.StatusOK)
+})
+```
+
 ## Security & reliability
 
 - **Use HTTPS in production.** The API key is sent as `X-API-Key` on every
@@ -182,6 +236,10 @@ err := client.Do(ctx, "GET", "/api/some/new/path", nil, nil, &out)
   than re-sending the API key to the redirect target.
 - Path segments (chat/message ids) are percent-encoded; a base-URL path prefix
   (e.g. behind a proxy at `/v1`) is preserved.
+- **Empty and dot ids are refused.** An empty, `.` or `..` id returns an error
+  and nothing is sent, so a proxy that resolves dot segments cannot turn the
+  call into one on the parent resource. `Client.Do` refuses a `.` or `..`
+  segment the same way but sends an empty one (a trailing slash) as written.
 
 ## Development
 

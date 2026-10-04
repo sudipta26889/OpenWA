@@ -14,6 +14,7 @@ import { TemplateService } from '../template/template.service';
 import { Template } from '../template/entities/template.entity';
 import { SsrfBlockedError } from '../../common/security/ssrf-guard';
 import { SendPacingService } from './send-pacing.service';
+import { EnginePageError } from '../../common/errors/engine-page.error';
 import type { MessageProjector } from '../session/message-projector.service';
 
 /** Pacing is off by default in these tests; the governor's own spec covers its behaviour. */
@@ -124,6 +125,7 @@ describe('MessageSendService', () => {
 
       await service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'Hello' });
 
+      expect(mockEngine.sendChatState).toHaveBeenCalledTimes(1);
       expect(mockEngine.sendChatState).toHaveBeenCalledWith('628123456789@c.us', 'typing');
       expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('628123456789@c.us', 'Hello');
     });
@@ -316,6 +318,28 @@ describe('MessageSendService', () => {
       expect(warn).toHaveBeenCalledWith(
         'Send failed in the engine (text)',
         expect.objectContaining({ sessionId: 'sess-1', chatId: '628123456789@c.us', error: 't: t' }),
+      );
+    });
+
+    it('logs the full in-page summary of a page failure while the caller and hooks get its reason and build', async () => {
+      const warn = jest.spyOn(
+        (service as unknown as { logger: { warn: (...args: unknown[]) => void } }).logger,
+        'warn',
+      );
+      const raw = new Error('page threw {"build":"2.3000.1","name":"TypeError","message":"x","stack":"at y"}');
+      const pageError = new EnginePageError({ name: 'TypeError', message: 'x', build: '2.3000.1' }, raw);
+      mockEngine.sendTextMessage.mockRejectedValueOnce(pageError);
+
+      await expect(service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'hi' })).rejects.toBe(pageError);
+
+      expect(warn).toHaveBeenCalledWith(
+        'Send failed in the engine (text)',
+        expect.objectContaining({ cause: raw.message }),
+      );
+      expect(hookManager.execute).toHaveBeenCalledWith(
+        'message:failed',
+        expect.objectContaining({ error: 'WhatsApp Web rejected the operation: TypeError: x (build 2.3000.1)' }),
+        expect.anything(),
       );
     });
 
@@ -1331,6 +1355,48 @@ describe('MessageSendService', () => {
       });
 
       expect(assertSendAllowed).toHaveBeenCalledWith('sess-1', 'to@c.us');
+    });
+  });
+
+  // ── pacing admission release ──────────────────────────────────────
+
+  // A send that fails before its PENDING row exists never counts into the daily caps, so its pacing
+  // admission must go back at once; one that fails after keeps its row as FAILED, which is counted.
+  describe('pacing admission release', () => {
+    let release: jest.Mock;
+    beforeEach(() => {
+      release = jest.fn();
+      const { assertSendAllowed } = (service as unknown as { pacing: { assertSendAllowed: jest.Mock } }).pacing;
+      assertSendAllowed.mockResolvedValue(release);
+    });
+
+    it.each([
+      [
+        'a plugin blocks it',
+        () => {
+          (hookManager.execute as jest.Mock).mockResolvedValueOnce({ continue: false });
+          return service.sendText('sess-1', { chatId: 'test@c.us', text: 'hi' });
+        },
+      ],
+      [
+        'the session has no engine',
+        () => service.sendLocation('no-engine', { chatId: 'test@c.us', latitude: 1, longitude: 2 }),
+      ],
+      ['its media is invalid', () => service.sendImage('sess-1', { chatId: 'test@c.us', url: '/files/x.png' })],
+      ['its audio is invalid', () => service.sendAudio('sess-1', { chatId: 'test@c.us', ptt: true })],
+    ])('releases it when %s', async (_label, send) => {
+      await expect(send()).rejects.toThrow();
+
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(repository.save).not.toHaveBeenCalled();
+    });
+
+    it('keeps it when the engine fails after the row was written', async () => {
+      mockEngine.sendTextMessage.mockRejectedValueOnce(new BadRequestException('refused'));
+
+      await expect(service.sendText('sess-1', { chatId: 'test@c.us', text: 'hi' })).rejects.toThrow('refused');
+
+      expect(release).not.toHaveBeenCalled();
     });
   });
 

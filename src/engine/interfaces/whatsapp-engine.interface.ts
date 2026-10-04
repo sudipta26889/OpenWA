@@ -114,7 +114,12 @@ export interface IncomingMessage {
    *  in the raw payload. 0 or undefined = no disappearing timer.
    *  Known values: 86400 (24h), 604800 (7d), 7776000 (90d). */
   ephemeralDuration?: number;
-  /** For group messages, the WID of the participant who actually sent it (`from` is the group JID there). */
+  /**
+   * For group, status and broadcast-list messages, the WID of the sender, where `from` is the group or
+   * `status@broadcast`. A broadcast-list message the account received is filed under the sender's own
+   * chat on Baileys, as WhatsApp lists it, so there `chatId` and `from` name the sender and `author`
+   * repeats it.
+   */
   author?: string;
   /** WIDs @mentioned in the message (empty/absent when none). Surfaced for command targeting. */
   mentionedIds?: string[];
@@ -652,7 +657,7 @@ export interface ReactionEvent {
  *    surfaced), `groups.update` (subject/desc/announce/restrict), `groups.upsert` (this
  *    session added to or joining a group; participantIds is the session's own id) and `group.join-request`
  *    (action 'created' only — the wwebjs event has no revoke/reject counterpart, so only
- *    the shared signal is surfaced; rc13 itself emits the event only for non-admin-add
+ *    the shared signal is surfaced; rc14 itself emits the event only for non-admin-add
  *    requests — the direct self-request stub 144 is unhandled upstream, marked TODO at
  *    Utils/process-message.js:569 — so an invite-link self-request may not fire on Baileys).
  * All ids are in the neutral dialect (`@g.us` / `@c.us`; a lid stays `<id>@lid` when the
@@ -822,10 +827,13 @@ export interface EngineEventCallbacks {
    * the credentials are still good. Purely informational, so a consumer must not tear anything down on
    * it; the engine keeps owning the retry.
    *
-   * `attempt` is the 1-based number of the attempt being scheduled, and it resets once the connection
-   * is back, a QR is scanned or a QR window runs out (or after a long enough healthy stretch), so
-   * attempt 1 always opens a fresh episode. The close that ends an unscanned QR window is not a reconnect
-   * and is never reported; any other close while a QR waits is.
+   * `attempt` is the 1-based number of the attempt being scheduled. An engine may carry it across a
+   * short-lived connection, so a link that drops right after opening keeps climbing the backoff; it
+   * resets on a scan, when a QR window runs out, or once no drop has occurred for the engine's
+   * stability window. An episode can therefore start at attempt > 1 after a brief READY, so a
+   * consumer should treat the first attempt after a READY, not only attempt 1, as a new episode.
+   * The close that ends an unscanned QR window is not a reconnect and is never reported; any other
+   * close while a QR waits is.
    * `nextDelayMs` is how long the engine waits before making it. Together they are what a consumer
    * needs to tell a one-second blip from a session that has been down for an hour, which the status
    * alone cannot: the engine reports INITIALIZING for the whole episode, exactly as it does for a
@@ -1130,9 +1138,11 @@ export interface ContactCapability {
   getNumberId(number: string): Promise<string | null>;
 
   /**
-   * Best-effort resolution of a contact id to a phone number (MSISDN digits), or `null` when the
-   * engine cannot map it (e.g. a privacy `@lid` the account has never seen). The contact id is the
-   * engine's native scheme; the adapter decides how to resolve it.
+   * Best-effort resolution of a contact id to a phone number (MSISDN digits). `null` is a definitive
+   * "no phone for this id"; a lookup that could not decide (a failed page read, or a lid no cache,
+   * table or key store maps) rejects instead, so a caller that stores the answer never overwrites a
+   * known mapping with a null. The contact id is the engine's native scheme; the adapter decides how
+   * to resolve it.
    */
   resolveContactPhone(contactId: string): Promise<string | null>;
 
@@ -1492,9 +1502,17 @@ export interface PresenceCapability {
    * A linked device that announces itself online routes notifications away from the phone, so a
    * headless bot that never goes offline suppresses the phone's own alerts — which is why this is
    * NOT best-effort, unlike sendChatState: the caller asked for a specific visibility, and a
-   * swallowed failure would leave the account silently online. The setting belongs to the
-   * connection and resets on reconnect (Baileys re-announces per its `markOnlineOnConnect`
-   * socket option), so callers re-issue it after a reconnect.
+   * swallowed failure would leave the account silently online. Chat-state updates are a separate
+   * wire operation (`<chatstate>` / `sendStateTyping`) and do not publish this.
+   *
+   * The call itself is one-shot. The gateway remembers a successful one for the life of the running
+   * engine and re-applies it once each time that connection opens: Baileys announces itself on
+   * connect per `markOnlineOnConnect` (`available` by default), which would otherwise replace the
+   * caller's choice on a transient reconnect. Replacing the engine drops the preference: stop,
+   * restart, reconnect recovery, a watchdog recycle, or a takeover by another node.
+   *
+   * On Baileys this throws when the account push name is not set yet. `sendPresenceUpdate`
+   * resolves without sending in that case (`no name present, ignoring presence update request`).
    */
   setOnlinePresence(available: boolean): Promise<void>;
 

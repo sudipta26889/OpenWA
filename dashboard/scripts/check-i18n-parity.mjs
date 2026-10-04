@@ -13,7 +13,8 @@
  *   4. PLURAL FORMS (hard fail): for every plural key in en.json (one with an `_other` variant), a
  *      locale carries a form for each category `Intl.PluralRules` gives its language. i18next falls
  *      back to the bare (singular) key for a missing category, so French without `_many` renders
- *      "1000000 abonné". The bare key covers `one`.
+ *      "1000000 abonné". The bare key covers `one`. LEGACY_PLURAL_CATEGORIES adds a category a
+ *      supported browser still selects from older CLDR data (Hebrew `many`).
  *
  * Wire into CI with: `npm run i18n:check`
  */
@@ -66,6 +67,16 @@ function setsEqual(a, b) {
   return a.size === b.size && [...a].every((x) => b.has(x));
 }
 
+/**
+ * Exempt a string from the "likely untranslated" warning if it has no translatable prose.
+ * A value made up only of {{placeholder}} tokens plus short separator punctuation (spaces, ·, /, :, etc. — no actual alphabetic prose outside the tokens), or a value matching a URL shape (scheme://...) should not be flagged.
+ */
+function hasTranslatableProse(str) {
+  if (/^[a-z][a-z0-9+.-]*:\/\/\S+$/i.test(str)) return false;
+  const noTokens = str.replace(/\{\{.*?\}\}/g, '');
+  return /\p{L}{2,}/u.test(noTokens);
+}
+
 function load(file) {
   return JSON.parse(readFileSync(join(LOCALES_DIR, file), 'utf8'));
 }
@@ -75,6 +86,10 @@ const referenceEntries = flattenEntries(load(REFERENCE));
 const pluralBases = [...referenceKeys].filter((k) => k.endsWith('_other')).map((k) => k.slice(0, -'_other'.length));
 const pluralBaseSet = new Set(pluralBases);
 const PLURAL_SUFFIX = /_(zero|one|two|few|many|other)$/;
+// Categories a language had in CLDR releases a supported browser still ships. Hebrew lost `many` in
+// CLDR 42, but Safari takes its plural data from the operating system, so Safari 16.4 and 17 on
+// macOS 12 still select it. Without the form i18next renders the singular bare key for 20, 30, 40.
+const LEGACY_PLURAL_CATEGORIES = { he: ['many'] };
 const localeFiles = readdirSync(LOCALES_DIR)
   .filter((f) => f.endsWith('.json') && f !== REFERENCE)
   .sort();
@@ -85,7 +100,13 @@ for (const file of localeFiles) {
   const keys = flatten(load(file));
   const entries = flattenEntries(load(file));
   const missing = [...referenceKeys].filter((k) => !keys.has(k)).sort();
-  const pluralCategories = new Intl.PluralRules(file.replace(/\.json$/, '')).resolvedOptions().pluralCategories;
+  const lang = file.replace(/\.json$/, '');
+  const pluralCategories = [
+    ...new Set([
+      ...new Intl.PluralRules(lang).resolvedOptions().pluralCategories,
+      ...(LEGACY_PLURAL_CATEGORIES[lang] ?? []),
+    ]),
+  ];
   const pluralForms = new Set(pluralBases.flatMap((base) => pluralCategories.map((c) => `${base}_${c}`)));
   const missingPlurals = [...pluralForms]
     .filter((k) => !keys.has(k) && !(k.endsWith('_one') && keys.has(k.slice(0, -'_one'.length))))
@@ -99,7 +120,7 @@ for (const file of localeFiles) {
     const val = entries.get(path);
     if (typeof val !== 'string') continue;
     if (!setsEqual(placeholders(refVal), placeholders(val))) placeholderMismatches.set(path, placeholders(refVal));
-    if (refVal === val && refVal.length >= UNTRANSLATED_MIN_LEN) untranslated.push(path);
+    if (refVal === val && refVal.length >= UNTRANSLATED_MIN_LEN && hasTranslatableProse(refVal)) untranslated.push(path);
   }
   // A plural form en.json has no counterpart for (fr `_many`, ar `_few`, he `_two`) is held to the
   // tokens of the base's `_other`. A subset, not equality: a form for one exact number may spell the
