@@ -13,6 +13,8 @@ import { OnModuleDestroy } from '@nestjs/common';
 import { createLogger } from '../../common/services/logger.service';
 import { ConfigService } from '@nestjs/config';
 import { AuthService } from '../auth/auth.service';
+import { ChatScopeService } from '../auth/chat-scope.service';
+import { isWsRedisEnabled } from './redis-io.adapter';
 import { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { resolveCorsPolicy } from '../../config/bootstrap-security';
@@ -61,6 +63,40 @@ import type {
 import { SUBSCRIBABLE_EVENTS, buildRoomName } from './dto/ws-messages.dto';
 import type { DeliveryStatus } from '../../engine/interfaces/whatsapp-engine.interface';
 
+// The events a chat-restricted key may receive, each delivered only for a chat inside its allowlist.
+// group.join_request is not one of them: it names the people asking to join, who are outside the
+// allowed chats by definition, and the REST membership-request routes refuse these keys for that reason.
+const CHAT_EVENTS = new Set([
+  'message.received',
+  'message.sent',
+  'message.ack',
+  'message.revoked',
+  'message.reaction',
+  'message.edited',
+  'group.join',
+  'group.leave',
+  'group.update',
+  'presence.update',
+  'event.response',
+]);
+
+/**
+ * The frame with a `requestId` that is not a short string dropped. A reply that carried client JSON back
+ * made the transport serialize whatever structure the client nested in it, which is not the client's to
+ * choose; the handlers below then never see anything but a string or nothing.
+ */
+function withSafeRequestId(message: WSClientMessage | null | undefined): WSClientMessage | null | undefined {
+  if (typeof message !== 'object' || message === null || Array.isArray(message)) return message;
+  const { requestId } = message as { requestId?: unknown };
+  if (requestId === undefined) return message;
+  if (typeof requestId === 'string' && requestId.length <= MAX_REQUEST_ID_LENGTH) return message;
+  return { ...message, requestId: undefined };
+}
+
+function chatRoom(sessionId: string, event: string, chatId: string): string {
+  return `${buildRoomName(sessionId, event)}:chat:${encodeURIComponent(chatId)}`;
+}
+
 /**
  * Whether an API key may subscribe to a session's WebSocket event rooms.
  * An unrestricted key (no `allowedSessions`) may subscribe to anything, including
@@ -96,7 +132,15 @@ const QR_ALLOWED_ROLES: ReadonlySet<string> = new Set([ApiKeyRole.OPERATOR, ApiK
  * subscription rooms, far above every event of every session a client would follow.
  */
 const MAX_SUBSCRIBE_SESSION_ID_LENGTH = 128;
+// A request id only correlates a reply with its request, so only a short string is ever echoed back.
+const MAX_REQUEST_ID_LENGTH = 128;
 const MAX_ROOMS_PER_SOCKET = 4096;
+const TOO_MANY_SUBSCRIPTIONS_MESSAGE = `A connection may hold at most ${MAX_ROOMS_PER_SOCKET} subscriptions; unsubscribe first`;
+
+/** `*` or a session id: all a subscription room, and a reply that names one, may carry. */
+function isSessionSelector(sessionId: string): boolean {
+  return sessionId === '*' || (sessionId.length <= MAX_SUBSCRIBE_SESSION_ID_LENGTH && isSafeSessionName(sessionId));
+}
 
 /** Why an API key's live WebSocket sockets are being torn down — drives the client-facing message. */
 export type ApiKeyEvictionReason = 'revoked' | 'deleted' | 'authorization_changed' | 'expired';
@@ -126,6 +170,7 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
    * an already-subscribed socket keeps receiving events until it happens to disconnect).
    */
   private readonly socketsByKeyId = new Map<string, Set<Socket>>();
+  private readonly chatDeliveries = new Map<string, Promise<void>>();
   private authzSweepTimer?: ReturnType<typeof setInterval>;
 
   /**
@@ -155,6 +200,7 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     private readonly authService: AuthService,
     private readonly auditService: AuditService,
     private readonly configService: ConfigService,
+    private readonly chatScope: ChatScopeService = new ChatScopeService(),
   ) {
     this.rateLimits = readWsRateLimitConfig();
     this.frameLimiter = new TokenBucketLimiter(this.rateLimits.framePerSecond, this.rateLimits.frameBurst);
@@ -367,20 +413,6 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       // for "Client IP could not be determined".
       const validKey = await this.authService.validateApiKey(apiKey, clientIp);
 
-      // A chat-restricted key cannot yet be filtered on a live event stream (chat scoping of the
-      // event surface is the follow-up slice), so refuse the handshake rather than stream every
-      // chat's events to it. Mirrors the REST guard's default-deny for unmarked routes.
-      if ((validKey.allowedChats?.length ?? 0) > 0) {
-        this.logger.warn(`Client ${client.id} rejected: chat-scoped key ${validKey.id} cannot subscribe to events`);
-        this.auditChatScopedRefusal(validKey, clientIp);
-        client.emit(
-          'message',
-          this.createError('UNAUTHORIZED', 'API keys restricted to selected chats cannot subscribe to events'),
-        );
-        client.disconnect();
-        return;
-      }
-
       // Cap simultaneous sockets per key: each socket holds rooms, engine fan-out, and memory,
       // so one key must not open connections without bound. Enough for multi-tab dashboards;
       // excess connections get a clear error, not a silent drop.
@@ -441,15 +473,14 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
   }
 
   /**
-   * A refused chat-scoped key is a stored key turned away, which the REST guard, the MCP surface and
-   * Bull Board all record; the socket refusal returns before the handshake's catch, so it audits here.
+   * Record a stored key refused after its authorization changed while the socket was connected.
    */
-  private auditChatScopedRefusal(apiKey: ApiKey, clientIp: string): void {
+  private auditAuthorizationRefusal(apiKey: ApiKey, clientIp: string, message: string): void {
     void this.auditService.logWarn(AuditAction.API_KEY_AUTH_FAILED, {
       apiKey,
       ipAddress: clientIp,
       metadata: { surface: 'websocket' },
-      errorMessage: 'API keys restricted to selected chats cannot subscribe to events',
+      errorMessage: message,
     });
   }
 
@@ -481,7 +512,8 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
   @SubscribeMessage('message')
   // A client may emit 'message' with no payload or with null, so the body is typed as possibly nil and
   // every read is guarded: such a frame answers INVALID_MESSAGE instead of throwing in the handler.
-  async handleMessage(@ConnectedSocket() client: Socket, @MessageBody() message: WSClientMessage | null | undefined) {
+  async handleMessage(@ConnectedSocket() client: Socket, @MessageBody() incoming: WSClientMessage | null | undefined) {
+    const message = withSafeRequestId(incoming);
     // Per-key token bucket on every inbound frame. Keyed by the validated key id; a socket
     // whose handshake validation is still in flight has no key yet and is metered by IP.
     // Over-budget frames get an error frame back and are NOT dispatched to a handler — in
@@ -535,7 +567,7 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     if (!sessionId || typeof sessionId !== 'string') {
       return this.createError('INVALID_SESSION', 'sessionId is required', requestId);
     }
-    if (sessionId !== '*' && !(sessionId.length <= MAX_SUBSCRIBE_SESSION_ID_LENGTH && isSafeSessionName(sessionId))) {
+    if (!isSessionSelector(sessionId)) {
       return this.createError('INVALID_SESSION', 'sessionId must be "*" or a session id', requestId);
     }
 
@@ -571,17 +603,15 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       return this.createError('UNAUTHORIZED', 'Connection is closed', requestId);
     }
 
-    // The connect handshake refuses a chat-restricted key, but the key can gain allowedChats after
-    // connect (a direct write to this node's main database, or an operator update that committed
-    // between this socket's validation and its registration), so the fresh key is held to the same
-    // rule here.
-    if ((subscriberKey.allowedChats?.length ?? 0) > 0) {
-      const refusal = this.createError(
-        'UNAUTHORIZED',
-        'API keys restricted to selected chats cannot subscribe to events',
-        requestId,
-      );
-      this.auditChatScopedRefusal(subscriberKey, clientIp);
+    const snapshot = (client.data as { apiKey?: ApiKey }).apiKey;
+    const chatRestricted = this.chatScope.isRestricted(subscriberKey);
+    // A changed chat fence cannot reuse rooms granted under the previous authorization.
+    if (
+      (chatRestricted || this.chatScope.isRestricted(snapshot)) &&
+      apiKeyAuthorizationFingerprint(subscriberKey) !== this.snapshotFingerprint(client)
+    ) {
+      const refusal = this.createError('UNAUTHORIZED', EVICTION_MESSAGES.authorization_changed, requestId);
+      this.auditAuthorizationRefusal(subscriberKey, clientIp, refusal.message);
       client.emit('message', refusal);
       client.disconnect();
       return refusal;
@@ -609,9 +639,11 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     }
 
     // Validate each event type
-    const validEvents = events.filter(
-      e => e === '*' || SUBSCRIBABLE_EVENTS.includes(e as (typeof SUBSCRIBABLE_EVENTS)[number]),
-    );
+    const validEvents = [
+      ...new Set(
+        events.filter(e => e === '*' || SUBSCRIBABLE_EVENTS.includes(e as (typeof SUBSCRIBABLE_EVENTS)[number])),
+      ),
+    ];
     if (validEvents.length === 0) {
       return this.createError(
         'INVALID_EVENTS',
@@ -620,23 +652,41 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       );
     }
 
-    // Only subscription rooms count: the socket also sits in its own id room and may hold a role room.
-    const held = [...client.rooms].filter(room => room.startsWith('session:')).length;
-    const newRooms = validEvents.filter(event => !client.rooms.has(buildRoomName(sessionId, event))).length;
-    if (held + newRooms > MAX_ROOMS_PER_SOCKET) {
+    const permittedEvents = chatRestricted
+      ? validEvents.filter(event => event === '*' || CHAT_EVENTS.has(event))
+      : validEvents;
+    if (permittedEvents.length === 0) {
+      return this.createError('FORBIDDEN_EVENTS', 'API key may subscribe only to chat events', requestId);
+    }
+    const chats = chatRestricted ? [...this.chatScope.scopeFor(subscriberKey)!.allowed] : undefined;
+    // A socket holds every room it asks for, so events x chats rooms that exceed the cap can never fit.
+    // Refused here, before the names are built: a large allowlist made each refused frame cost real time.
+    // No amount of unsubscribing makes that fit, so the reply names the cost per event, not the generic text.
+    if (chats && permittedEvents.length * chats.length > MAX_ROOMS_PER_SOCKET) {
+      // Fewer events help only while one event fits: a list stored before allowedChats was bounded may not.
+      const remedy = chats.length <= MAX_ROOMS_PER_SOCKET ? 'name fewer events or use "*"' : 'shorten the allowlist';
       return this.createError(
         'TOO_MANY_SUBSCRIPTIONS',
-        `A connection may hold at most ${MAX_ROOMS_PER_SOCKET} subscriptions; unsubscribe first`,
+        `This key's chat allowlist makes every event ${chats.length} subscriptions and a connection may hold at most ${MAX_ROOMS_PER_SOCKET}; ${remedy}`,
         requestId,
       );
     }
+    const rooms = permittedEvents.flatMap(event =>
+      chats ? chats.map(chatId => chatRoom(sessionId, event, chatId)) : [buildRoomName(sessionId, event)],
+    );
+    if (rooms.length === 0) {
+      return this.createError('FORBIDDEN_EVENTS', 'API key has no valid chats to subscribe to', requestId);
+    }
+    // Only subscription rooms count: the socket also sits in its own id room and may hold a role room.
+    const held = [...client.rooms].filter(room => room.startsWith('session:')).length;
+    const newRooms = rooms.filter(room => !client.rooms.has(room)).length;
+    if (held + newRooms > MAX_ROOMS_PER_SOCKET) {
+      return this.createError('TOO_MANY_SUBSCRIPTIONS', TOO_MANY_SUBSCRIPTIONS_MESSAGE, requestId);
+    }
 
     // Join rooms for each session/event combination
-    const rooms: string[] = [];
-    for (const event of validEvents) {
-      const room = buildRoomName(sessionId, event);
+    for (const room of rooms) {
       void client.join(room);
-      rooms.push(room);
     }
 
     this.logger.debug(`Client ${client.id} subscribed to: ${rooms.join(', ')}`);
@@ -644,7 +694,7 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     return {
       type: 'subscribed',
       sessionId,
-      events: validEvents,
+      events: permittedEvents,
       requestId,
       timestamp: new Date().toISOString(),
     };
@@ -661,10 +711,14 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
 
   private handleUnsubscribe(client: Socket, message: WSUnsubscribeRequest): WSUnsubscribedResponse | WSErrorResponse {
     const { sessionId, requestId } = message;
-    // Same check as subscribe: a missing sessionId matched no room, left every subscription in place,
-    // and was still answered 'unsubscribed'.
+    // Same checks as subscribe: a missing sessionId matched no room, left every subscription in place,
+    // and was still answered 'unsubscribed'. The reply carries the id back, so one no subscribe could
+    // have accepted is refused rather than echoed.
     if (!sessionId || typeof sessionId !== 'string') {
       return this.createError('INVALID_SESSION', 'sessionId is required', requestId);
+    }
+    if (!isSessionSelector(sessionId)) {
+      return this.createError('INVALID_SESSION', 'sessionId must be "*" or a session id', requestId);
     }
 
     // Leave all rooms for this session
@@ -763,6 +817,47 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       .to(buildRoomName('*', event))
       .to(buildRoomName('*', '*'));
     (exceptRoom ? broadcast.except(exceptRoom) : broadcast).emit('message', eventMessage);
+    if (!CHAT_EVENTS.has(event) || data === null || typeof data !== 'object') return;
+    const value = data as Record<string, unknown>;
+    const chatId = event.startsWith('group.') ? value.groupId : value.chatId;
+    if (typeof chatId !== 'string' || !chatId.trim()) return;
+    if (
+      !isWsRedisEnabled() &&
+      !Array.from(this.socketsByKeyId.values()).some(sockets =>
+        Array.from(sockets).some(client => this.chatScope.isRestricted((client.data as { apiKey?: ApiKey }).apiKey)),
+      )
+    ) {
+      return;
+    }
+    // Expand the emitted identity using current persisted mappings, so new LID mappings work
+    // without rejoining rooms. Literal allowlist rooms also enforce the fence across Redis nodes.
+    // Resolve identities concurrently, but retain event order within each session, including
+    // after a failed lookup. Other sessions and unrestricted broadcasts remain independent.
+    const delivery = Promise.allSettled([
+      this.chatDeliveries.get(sessionId),
+      this.chatScope.idsForFilter({ allowedChats: [chatId] }),
+    ])
+      .then(([, resolved]) => {
+        if (resolved.status === 'rejected') throw resolved.reason;
+        const ids = resolved.value;
+        if (!ids?.length) return;
+        const rooms = ids.flatMap(id => [
+          chatRoom(sessionId, event, id),
+          chatRoom(sessionId, '*', id),
+          chatRoom('*', event, id),
+          chatRoom('*', '*', id),
+        ]);
+        this.server.to(rooms).emit('message', eventMessage);
+      })
+      .catch(error =>
+        this.logger.warn('Could not resolve chat identity for WebSocket delivery', {
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      )
+      .finally(() => {
+        if (this.chatDeliveries.get(sessionId) === delivery) this.chatDeliveries.delete(sessionId);
+      });
+    this.chatDeliveries.set(sessionId, delivery);
   }
 
   /**
@@ -824,6 +919,11 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     this.emitToRooms(sessionId, 'presence.update', data);
   }
 
+  /** Emit an RSVP to a WhatsApp event (Baileys only). Payload mirrors the `event.response` webhook. */
+  emitEventResponse(sessionId: string, data: Record<string, unknown>) {
+    this.emitToRooms(sessionId, 'event.response', data);
+  }
+
   /**
    * Emit QR code update for a session. Scanning the QR links a device to the account, so it only
    * reaches keys that may read it over REST (OPERATOR and above).
@@ -863,10 +963,14 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
 
   /**
    * Emit a live delivery-status update. The payload mirrors the `message.ack` webhook exactly
-   * (`id`, `messageId`, neutral `status`, and the deprecated legacy numeric `ack`) so a socket
-   * client and a webhook consumer see the same shape.
+   * (`id`, `messageId`, neutral `status`, the deprecated legacy numeric `ack`, and `chatId` when
+   * the engine's update named the chat) so a socket client and a webhook consumer see the same
+   * shape.
    */
-  emitMessageAck(sessionId: string, data: { id: string; messageId: string; status: DeliveryStatus; ack: number }) {
+  emitMessageAck(
+    sessionId: string,
+    data: { id: string; messageId: string; status: DeliveryStatus; ack: number; chatId?: string },
+  ) {
     this.emitToRooms(sessionId, 'message.ack', data);
   }
 

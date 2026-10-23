@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpenWA\Tests;
 
+use OpenWA\Client;
 use OpenWA\Exceptions\OpenWANotFoundException;
 use PHPUnit\Framework\TestCase;
 
@@ -304,6 +305,15 @@ class ResourcesTest extends TestCase
 
     // ── Chats & Health ────────────────────────────────────────────────
 
+    public function testChatsPreserveOptionalLastMessageType(): void
+    {
+        $backend = new MockBackend();
+        $backend->on(200, [['id' => 'photo@c.us', 'lastMessageType' => 'image'], ['id' => 'empty@c.us']]);
+        $chats = $backend->makeClient()->chats->list('s');
+        $this->assertSame('image', $chats[0]['lastMessageType']);
+        $this->assertArrayNotHasKey('lastMessageType', $chats[1]);
+    }
+
     public function testChats(): void
     {
         $backend = new MockBackend();
@@ -548,6 +558,8 @@ class ResourcesTest extends TestCase
         $client->groups->rejectMembershipRequests('s', 'g1@g.us');
         $this->assertStringEndsWith('/membership-requests/reject', $backend->lastCall()['url']);
         $this->assertSame([], $backend->lastCall()['body']);
+        // On the wire that is an empty object, as in the other SDKs, not an empty array.
+        $this->assertSame('{}', $backend->rawBody(2));
     }
 
     public function testCreateCallLink(): void
@@ -560,6 +572,135 @@ class ResourcesTest extends TestCase
         $this->assertStringEndsWith('/sessions/s/calls/link', $backend->lastCall()['url']);
         $this->assertSame(['type' => 'video', 'startTime' => 1800000000000], $backend->lastCall()['body']);
         $this->assertStringContainsString('call.whatsapp.com', $res['link']);
+    }
+
+    public function testRedriveDeliveryFailuresPostsTheFilterOrAnEmptyObject(): void
+    {
+        $result = ['redriven' => 1, 'delivered' => 1, 'enqueued' => 0, 'failed' => 0, 'skipped' => 0, 'remaining' => 0];
+        $backend = new MockBackend();
+        $backend->on(200, $result);
+        $backend->on(200, $result);
+        $client = $backend->makeClient();
+
+        $this->assertSame($result, $client->webhooks->redriveDeliveryFailures(['sessionId' => 's', 'limit' => 10]));
+        $this->assertRequest($backend, 'POST', '/api/webhooks/delivery-failures/redrive');
+        $this->assertSame('{"sessionId":"s","limit":10}', $backend->rawBody(0));
+
+        // An empty filter must go out as a JSON object: `[]` is not a valid body for the DTO.
+        $client->webhooks->redriveDeliveryFailures();
+        $this->assertSame('{}', $backend->rawBody(1));
+    }
+
+    public function testRedriveDeliveryFailuresKeepsAnExplicitEmptyIdsList(): void
+    {
+        // The gateway reads ids: [] as "replay nothing" and an omitted ids as "replay up to 100 rows".
+        $backend = new MockBackend();
+        $backend->on(200, ['redriven' => 0, 'delivered' => 0, 'enqueued' => 0, 'failed' => 0, 'skipped' => 0, 'remaining' => 3]);
+
+        $backend->makeClient()->webhooks->redriveDeliveryFailures(['ids' => []]);
+
+        $this->assertSame('{"ids":[]}', $backend->rawBody(0));
+    }
+
+    public function testSendMethodsForwardIdempotencyKeysWithoutChangingJson(): void
+    {
+        $cases = [
+            ['sendText', 'send-text', ['chatId' => 'a@c.us', 'text' => 'hello', 'quotedMessageId' => 'q']],
+            ['sendImage', 'send-image', ['chatId' => 'a@c.us', 'url' => 'https://media/image', 'caption' => 'image']],
+            ['sendVideo', 'send-video', ['chatId' => 'a@c.us', 'url' => 'https://media/video']],
+            ['sendAudio', 'send-audio', ['chatId' => 'a@c.us', 'url' => 'https://media/audio', 'ptt' => true]],
+            ['sendDocument', 'send-document', ['chatId' => 'a@c.us', 'url' => 'https://media/doc', 'filename' => 'doc.pdf']],
+            ['sendSticker', 'send-sticker', ['chatId' => 'a@c.us', 'url' => 'https://media/sticker']],
+            ['sendLocation', 'send-location', ['chatId' => 'a@c.us', 'latitude' => -6.2, 'longitude' => 106.8]],
+            ['sendContact', 'send-contact', ['chatId' => 'a@c.us', 'contactName' => 'A', 'contactNumber' => '628']],
+            ['sendTemplate', 'send-template', ['chatId' => 'a@c.us', 'templateId' => 't', 'vars' => []]],
+            ['sendPoll', 'send-poll', ['chatId' => 'a@c.us', 'name' => 'Q', 'options' => ['A', 'B']]],
+            ['reply', 'reply', ['chatId' => 'a@c.us', 'quotedMessageId' => 'q', 'text' => 'reply']],
+            ['forward', 'forward', ['fromChatId' => 'a@c.us', 'toChatId' => 'b@c.us', 'messageId' => 'm']],
+        ];
+        foreach ([null, '!', '~', 'a', str_repeat('a', 255)] as $key) {
+            $backend = new MockBackend();
+            $client = $backend->makeClient();
+            foreach ($cases as $index => [$method, $segment, $body]) {
+                $backend->on(200, ['messageId' => 'm', 'timestamp' => 1]);
+                if ($key === null) {
+                    $client->messages->{$method}('s', $body);
+                } else {
+                    $client->messages->{$method}('s', $body, $key);
+                }
+                $call = $backend->lastCall();
+                $this->assertSame('POST', $call['method'], $method);
+                $this->assertSame('/api/sessions/s/messages/' . $segment, $call['path'], $method);
+                // The key travels in its header only: in the URL it would reach proxy and access logs.
+                $this->assertSame('', $call['query'], $method);
+                $this->assertSame($body, $call['body'], $method);
+                $expected = $body;
+                if ($method === 'sendTemplate') {
+                    $expected['vars'] = new \stdClass();
+                }
+                $this->assertSame(json_encode($expected), $backend->rawBody($index), $method);
+                if ($key === null) {
+                    $this->assertArrayNotHasKey('idempotency-key', $call['headers'], $method);
+                } else {
+                    $this->assertSame($key, $call['headers']['idempotency-key'], $method);
+                }
+            }
+        }
+    }
+
+    public function testSendKeysStayLocalToEachRequest(): void
+    {
+        $backend = new MockBackend();
+        $client = $backend->makeClient();
+        $body = ['chatId' => 'a@c.us', 'text' => 'hello'];
+        foreach (['first-key', 'second-key', null] as $key) {
+            $backend->on(200, ['messageId' => 'm', 'timestamp' => 1]);
+            if ($key === null) {
+                $client->messages->sendText('s', $body);
+                $this->assertArrayNotHasKey('idempotency-key', $backend->lastCall()['headers']);
+            } else {
+                $client->messages->sendText('s', $body, $key);
+                $this->assertSame($key, $backend->lastCall()['headers']['idempotency-key']);
+            }
+            $this->assertSame('', $backend->lastCall()['query']);
+            $this->assertSame($body, $backend->lastCall()['body']);
+        }
+    }
+
+    public function testSendKeyOverridesDefaultHeaderWithoutChangingDefaults(): void
+    {
+        $backend = new MockBackend();
+        $defaults = ['iDeMpOtEnCy-KeY' => 'default-key', 'X-Trace' => 'trace'];
+        $client = new Client([
+            'baseUrl' => 'http://localhost:2785',
+            'apiKey' => 'owa_k1_test',
+            'httpClient' => $backend->httpClient(),
+            'defaultHeaders' => $defaults,
+        ]);
+        $body = ['chatId' => 'a@c.us', 'text' => 'hello'];
+        $backend->on(200, ['messageId' => 'm', 'timestamp' => 1]);
+        $client->messages->sendText('s', $body, 'request-key');
+        $this->assertSame('request-key', $backend->lastCall()['headers']['idempotency-key']);
+        $this->assertSame('trace', $backend->lastCall()['headers']['x-trace']);
+        $backend->on(200, ['messageId' => 'm', 'timestamp' => 1]);
+        $client->messages->sendText('s', $body);
+        $this->assertSame('default-key', $backend->lastCall()['headers']['idempotency-key']);
+        $this->assertSame(['iDeMpOtEnCy-KeY' => 'default-key', 'X-Trace' => 'trace'], $defaults);
+    }
+
+    public function testInvalidSendKeysAreRefusedBeforeTransport(): void
+    {
+        $backend = new MockBackend();
+        $client = $backend->makeClient();
+        foreach (['', ' ', 'contains space', "key\n", "\xC3\xA9", "a\x7Fb", str_repeat('a', 256)] as $key) {
+            try {
+                $client->messages->sendText('s', ['chatId' => 'a@c.us', 'text' => 'hello'], $key);
+                $this->fail('Expected invalid key to be refused');
+            } catch (\InvalidArgumentException $error) {
+                $this->assertStringContainsString('1-255 visible ASCII', $error->getMessage());
+                $this->assertSame([], $backend->calls());
+            }
+        }
     }
 
     private function assertRequest(MockBackend $backend, string $method, string $path): void

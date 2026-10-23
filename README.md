@@ -32,7 +32,7 @@
 
 **OpenWA** is a free, open-source WhatsApp API Gateway designed for developers who need full control over their messaging infrastructure—without vendor lock-in or hidden paywalls.
 
-Built on a **pluggable architecture**, OpenWA lets you select database engines (SQLite/PostgreSQL), backup/migration storage backends (Local/S3), and cache layers (disabled/Redis) through configuration rather than application-code changes. Message media itself is returned inline to API and webhook consumers; it is not automatically persisted to the storage backend.
+Built on a **pluggable architecture**, OpenWA lets you select database engines (SQLite/PostgreSQL), media storage backends (Local/S3), and cache layers (disabled/Redis) through configuration rather than application-code changes. The storage backend is the live store for status media and, when chat-media archiving is enabled, archived chat media; other message media is returned inline to API and webhook consumers. Of the media, `scripts/backup.sh` archives only the local media directory, so an S3 bucket needs a backup of its own.
 
 |                               |                                                                                                                                          |
 | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
@@ -64,11 +64,11 @@ A session-scoped key still reaches every chat on the sessions it may use. A key 
 - **One or more selected** — the key reaches only those chats. Every authenticated REST route not explicitly marked as safe for a chat-scoped key refuses it with `403` (a request naming a session outside `allowedSessions` is refused first, with `403 "API key not authorized for this session"`), including routes added in later releases: the refusal is the default. Inside its chats an operator key can do what the marked routes allow, which is more than reading and sending: it can also delete or clear a chat, leave or rename a group, and block the contact. It cannot change who belongs to a group: adding, removing, promoting or demoting participants, answering join requests and reading or resetting the invite link all stay closed.
 - **The two scopes are independent** — a key may be limited to sessions, to chats, to both, or to neither.
 
-This lets you point an **AI agent or third-party integration at a shared account** without handing it every chat. Give the agent a key scoped to the few groups (or DMs) it is meant to handle: it can send and reply there, but it cannot list your other chats, read any other DM, message a contact outside its set, or reach the queue dashboard. It reads its chats' stored messages on either engine through `GET /sessions/{sessionId}/messages?chatId=`, where `chatId` is required for such a key, and live history through `GET /sessions/{sessionId}/messages/{chatId}/history` on whatsapp-web.js only. It receives no pushed events, so it has to poll. It can still read the session's own status (`GET /sessions/{sessionId}`) so an integration can tell whether it is connected.
+This lets you point an **AI agent or third-party integration at a shared account** without handing it every chat. Give the agent a key scoped to the few groups (or DMs) it is meant to handle: it can send and reply there, but it cannot list your other chats, read any other DM, message a contact outside its set, or reach the queue dashboard. It reads its chats' stored messages on either engine through `GET /sessions/{sessionId}/messages?chatId=`, where `chatId` is required for such a key, and live history through `GET /sessions/{sessionId}/messages/{chatId}/history` on whatsapp-web.js only. It can subscribe to the `/events` WebSocket, which delivers only events for its chats. It can still read the session's own status (`GET /sessions/{sessionId}`) so an integration can tell whether it is connected.
 
 Identity is matched through the lid mapping table: a contact allowlisted by phone number also matches the same person's `@lid` privacy id once the table maps the two, and an unmapped `@lid` is refused rather than guessed. A lid's digits are never mistaken for a phone number, so `555000111@lid` does not admit `555000111@c.us`.
 
-The default covers REST routes only. Surfaces that authenticate outside the REST guard do not inherit it, so each one that can return chat data refuses a chat-scoped key with its own check: the `/events` WebSocket, the MCP mount (per tool call), and the Bull Board queue dashboard. Four list routes are usable, each filtered to the key's chats before paging: `GET /sessions/{sessionId}/chats`, `GET /sessions/{sessionId}/groups` (id, name and community parent id only), `GET /sessions/{sessionId}/contacts` and `GET /sessions/{sessionId}/labels/{labelId}/chats`.
+The default covers REST routes only. Surfaces that authenticate outside the REST guard do not inherit it, so each one that can return chat data applies the fence with its own check: the `/events` WebSocket delivers only events inside the key's chats, the MCP mount authorizes each tool call against them, and the Bull Board queue dashboard refuses the key. Five list routes are usable, each filtered to the key's chats before paging: `GET /sessions/{sessionId}/chats`, `GET /sessions/{sessionId}/groups` (id, name and community parent id only), `GET /sessions/{sessionId}/contacts`, `GET /sessions/{sessionId}/labels/{labelId}/chats` and `GET /api/search` (the built-in provider; a search plugin answers `403`).
 
 The API also accepts `allowedChats` on an admin key, but no admin-only route is open to a chat-scoped key, and the last usable admin key cannot be scoped this way.
 
@@ -161,15 +161,15 @@ For any deployment where ethical, legal, or regulatory compliance matters (healt
 
 ### Infrastructure
 
-| Feature          | Status | Description                              |
-| ---------------- | ------ | ---------------------------------------- |
-| SQLite           | ✅     | Zero-config embedded database            |
-| PostgreSQL       | ✅     | Production-grade database                |
-| Redis Cache      | ✅     | Optional performance caching             |
-| S3/MinIO Storage | ✅     | Media-directory backup/migration backend |
-| Docker           | ✅     | One-command deployment                   |
-| Health Checks    | ✅     | Kubernetes-ready probes                  |
-| Data Migration   | ✅     | Export/import between backends           |
+| Feature          | Status | Description                                      |
+| ---------------- | ------ | ------------------------------------------------ |
+| SQLite           | ✅     | Zero-config embedded database                    |
+| PostgreSQL       | ✅     | Production-grade database                        |
+| Redis Cache      | ✅     | Optional performance caching                     |
+| S3/MinIO Storage | ✅     | Live media store (statuses, archived chat media) |
+| Docker           | ✅     | One-command deployment                           |
+| Health Checks    | ✅     | Kubernetes-ready probes                          |
+| Data Migration   | ✅     | Export/import between backends                   |
 
 ---
 
@@ -190,7 +190,8 @@ docker compose -f docker-compose.dev.yml up -d
 ```
 
 **Your API key.** The first boot generates an admin API key, prints it once in the log and stores it at
-`/app/data/.api-key` inside the container. Read it with `docker exec openwa-api cat /app/data/.api-key`,
+`/app/data/.api-key` inside the container. Read it with `docker exec openwa-api cat /app/data/.api-key`
+(the file has no trailing newline, so the shell prompt follows the key on the same line; copy only the key),
 then use it to sign in to the dashboard and as the `X-API-Key` header wherever this README shows
 `YOUR_API_KEY`. Later boots log only a masked prefix. See [API Key](docs/README.md#api-key).
 
@@ -224,7 +225,7 @@ npm run dev
 # Swagger: http://localhost:2785/api/docs
 ```
 
-The first boot writes the admin API key to `data/.api-key` (read it with `cat data/.api-key`).
+The first boot writes the admin API key to `data/.api-key` (read it with `cat data/.api-key`; the file has no trailing newline, so copy only the key).
 
 Use `npm install` instead when intentionally changing dependencies. OpenWA's committed lockfile uses
 registry artifacts only, so npm 12 works with its secure default that blocks Git dependencies; do not

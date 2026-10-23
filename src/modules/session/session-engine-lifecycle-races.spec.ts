@@ -20,7 +20,11 @@ import { EventsGateway } from '../events/events.gateway';
 import { WebhookService } from '../webhook/webhook.service';
 import { HookManager } from '../../core/hooks';
 import { StatusStoreService } from '../status-store/status-store.service';
-import { EngineStatus, type EngineEventCallbacks } from '../../engine/interfaces/whatsapp-engine.interface';
+import {
+  EngineStatus,
+  type EngineEventCallbacks,
+  type IWhatsAppEngine,
+} from '../../engine/interfaces/whatsapp-engine.interface';
 
 const ID = 'sess-uuid-1';
 const NAME = 'test-session';
@@ -85,6 +89,7 @@ describe('SessionEngineLifecycle races', () => {
   let internals: Internals;
   let repository: { findOne: jest.Mock; update: jest.Mock; exists: jest.Mock };
   let engineFactory: { create: jest.Mock; purgeSessionData: jest.Mock };
+  let webhookService: { dispatch: jest.Mock };
   let config: Record<string, unknown>;
 
   beforeEach(async () => {
@@ -134,6 +139,7 @@ describe('SessionEngineLifecycle races', () => {
     }).compile();
     lifecycle = module.get(SessionEngineLifecycle);
     internals = lifecycle as unknown as Internals;
+    webhookService = module.get(WebhookService);
   });
 
   afterEach(() => {
@@ -385,6 +391,114 @@ describe('SessionEngineLifecycle races', () => {
     });
   });
 
+  // The engine reports DISCONNECTED itself, so the liveness watchdog never probes it again, and it stays
+  // registered with its lease renewed: a disconnect whose row read fails once is not handled again by anything.
+  describe('a disconnect whose session read fails', () => {
+    afterEach(() => jest.useRealTimers());
+
+    const disconnectWithFailedRead = async (): Promise<{
+      engine: Record<string, jest.Mock>;
+      state: ReconnectState;
+    }> => {
+      await lifecycle.start(ID);
+      const engine = (engineFactory.create.mock.results[0] as { value: Record<string, jest.Mock> }).value;
+      const callbacks = (engine.initialize.mock.calls as [EngineEventCallbacks][])[0][0];
+      const state = internals.reconnectStates.get(ID)!;
+      jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] });
+      repository.findOne.mockRejectedValueOnce(new Error('SQLITE_BUSY: database is locked'));
+
+      callbacks.onDisconnected?.('NAVIGATION');
+      await flush();
+      return { engine, state };
+    };
+
+    it('handles the disconnect again, so a reconnect is armed once the read succeeds', async () => {
+      const { engine, state } = await disconnectWithFailedRead();
+      expect(state.attempts).toBe(0);
+      expect(state.timer).not.toBeNull();
+
+      jest.advanceTimersByTime(state.baseDelay);
+      await flush();
+
+      expect(state.attempts).toBe(1);
+      expect(state.timer).not.toBeNull();
+      expect(internals.engines.get(ID)).toBe(engine);
+    });
+
+    it('waits longer after each failed read, up to the reconnect backoff cap', async () => {
+      const { state } = await disconnectWithFailedRead();
+      repository.findOne.mockRejectedValue(new Error('SQLITE_BUSY: database is locked'));
+      const base = state.baseDelay;
+      const before = repository.findOne.mock.calls.length;
+      const readsAfter = async (ms: number): Promise<number> => {
+        jest.advanceTimersByTime(ms);
+        await flush();
+        return repository.findOne.mock.calls.length - before;
+      };
+
+      expect(await readsAfter(base)).toBe(1);
+      expect(await readsAfter(2 * base - 1)).toBe(1);
+      expect(await readsAfter(1)).toBe(2);
+      expect(await readsAfter(4 * base)).toBe(3);
+      expect(await readsAfter(8 * base)).toBe(4);
+      expect(await readsAfter(16 * base)).toBe(5);
+      expect(await readsAfter(32 * base)).toBe(6);
+      // The next wait would be 64 times the base delay, past the 5-minute cap the reconnect backoff keeps.
+      expect(await readsAfter(300_000)).toBe(7);
+    });
+
+    it('starts the backoff over once the session reaches READY', async () => {
+      const { engine, state } = await disconnectWithFailedRead();
+      repository.findOne.mockRejectedValue(new Error('SQLITE_BUSY: database is locked'));
+      jest.advanceTimersByTime(state.baseDelay);
+      await flush();
+      jest.advanceTimersByTime(2 * state.baseDelay);
+      await flush();
+      internals.handleEngineReady(ID, engine, '628111', 'Push');
+      await flush();
+      expect(state.timer).toBeNull();
+
+      const callbacks = (engine.initialize.mock.calls as [EngineEventCallbacks][])[0][0];
+      const before = repository.findOne.mock.calls.length;
+      callbacks.onDisconnected?.('NAVIGATION');
+      await flush();
+      expect(repository.findOne.mock.calls.length - before).toBe(1);
+
+      jest.advanceTimersByTime(state.baseDelay);
+      await flush();
+      expect(repository.findOne.mock.calls.length - before).toBe(2);
+    });
+
+    it('drops the pending retry when another report of the same disconnect reads the row', async () => {
+      const { engine, state } = await disconnectWithFailedRead();
+      const retry = state.timer;
+      expect(retry).not.toBeNull();
+      const published = (): number =>
+        webhookService.dispatch.mock.calls.filter(([, event]) => event === 'session.disconnected').length;
+
+      await lifecycle.handleEngineDisconnected(ID, engine as unknown as IWhatsAppEngine, 'NAVIGATION');
+      await flush();
+
+      // The reconnect was armed by this report, in place of the retry, which would publish it again.
+      expect(published()).toBe(1);
+      expect(state.attempts).toBe(1);
+      expect(state.timer).not.toBeNull();
+      expect(state.timer).not.toBe(retry);
+    });
+
+    it('does not read again once a stop has retired the engine', async () => {
+      const { state } = await disconnectWithFailedRead();
+      await lifecycle.stop(ID);
+      const reads = repository.findOne.mock.calls.length;
+
+      jest.advanceTimersByTime(state.baseDelay * 2);
+      await flush();
+
+      expect(repository.findOne.mock.calls.length).toBe(reads);
+      expect(internals.reconnectStates.has(ID)).toBe(false);
+    });
+  });
+
   describe('a reconnect attempt failing while the next one tears its engine down', () => {
     it('leaves the episode to the later attempt instead of arming another over it', async () => {
       const state: ReconnectState = { attempts: 1, timer: null, maxAttempts: 5, baseDelay: 5000 };
@@ -422,6 +536,60 @@ describe('SessionEngineLifecycle races', () => {
       expect(internals.engines.get(ID)).toBe(engineB);
       expect(state.timer).toBeNull();
       expect(engineFactory.create).toHaveBeenCalledTimes(2);
+    });
+
+    // The browser of an attempt dies during its own init: it reports the disconnect while the session
+    // read fails once, which arms a read retry on the episode's timer, and the same crash rejects init.
+    describe('when the disconnect of its own engine armed a read retry', () => {
+      afterEach(() => jest.useRealTimers());
+
+      const crashDuringInit = async (readFails: boolean): Promise<ReconnectState> => {
+        jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] });
+        const state: ReconnectState = {
+          attempts: 1,
+          timer: null,
+          maxAttempts: Number.POSITIVE_INFINITY,
+          baseDelay: 5000,
+        };
+        internals.reconnectStates.set(ID, state);
+        const init = deferred();
+        const engine = { ...makeEngine(), initialize: jest.fn().mockReturnValue(init.promise) };
+        engineFactory.create.mockReturnValueOnce(engine);
+        const attempt = internals.executeReconnect(ID, session(), state);
+        await flush();
+        const callbacks = (engine.initialize.mock.calls as [EngineEventCallbacks][])[0][0];
+
+        if (readFails) repository.findOne.mockRejectedValueOnce(new Error('SQLITE_BUSY: database is locked'));
+        callbacks.onDisconnected?.('NAVIGATION');
+        await flush();
+        init.reject(new Error('Protocol error: Target closed'));
+        await attempt;
+        await flush();
+        return state;
+      };
+
+      it('arms the next attempt instead of leaving the session with no engine and no timer', async () => {
+        const state = await crashDuringInit(true);
+
+        for (let i = 0; i < 4; i++) {
+          jest.advanceTimersByTime(300_000);
+          await flush();
+        }
+
+        expect(engineFactory.create.mock.calls.length).toBeGreaterThan(1);
+        expect(state.readRetry).toBeUndefined();
+      });
+
+      it('relaunches the same way when the read answered', async () => {
+        await crashDuringInit(false);
+
+        for (let i = 0; i < 4; i++) {
+          jest.advanceTimersByTime(300_000);
+          await flush();
+        }
+
+        expect(engineFactory.create.mock.calls.length).toBeGreaterThan(1);
+      });
     });
 
     it('re-arms when the attempt armed after it was cancelled by a READY before it fired', async () => {

@@ -195,6 +195,8 @@ const check = (id, ok, detail) => results.push({ id, ok, detail });
   const problems = [
     podContext(byDefault) && 'the default render sets a pod securityContext',
     !addsCaps(byDefault) && 'the default render lost the capabilities the root entrypoint needs',
+    !/^ {14}- KILL$/m.test(byKind(byDefault, 'StatefulSet')[0] ?? '') &&
+      'the root init cannot forward shutdown signals after the privilege drop',
     !/runAsNonRoot: true/.test(pod) && 'podSecurityContext.runAsNonRoot does not reach the pod spec',
     !/fsGroup: 997/.test(pod) && 'podSecurityContext.fsGroup does not reach the pod spec',
     // Without it the kubelet re-owns every file on the volume on every mount before the pod starts.
@@ -305,6 +307,24 @@ const check = (id, ok, detail) => results.push({ id, ok, detail });
     wrong.length === 0,
     wrong.length ? `NOTES got the plain-http ingress warning wrong for: ${wrong.join(', ')}` : 'NOTES warns only when the ingress has no TLS and the CSP upgrade is on',
   );
+}
+
+// `helm upgrade --reuse-values` renders the new templates with the PREVIOUS release's values, which hold
+// none of the keys a newer chart added. A template that reads one without a default fails the upgrade
+// with a nil pointer, and so does a chart that stops rendering when a block is removed.
+{
+  let detail;
+  let ok = false;
+  try {
+    const probe = mapAt(byKind(render('--set', 'startupProbe=null'), 'StatefulSet')[0] ?? '', ['startupProbe']);
+    ok = probe?.periodSeconds === '5' && probe?.failureThreshold === '60';
+    detail = ok
+      ? 'values without the startupProbe block render with the 5 s period and 60 failures'
+      : `values without startupProbe rendered periodSeconds ${probe?.periodSeconds}, failureThreshold ${probe?.failureThreshold}`;
+  } catch (error) {
+    detail = `the chart does not render with values that predate startupProbe: ${String(error.stderr ?? error.message).split('\n')[0]}`;
+  }
+  check('renders-with-previous-release-values', ok, detail);
 }
 
 const failed = results.filter(r => !r.ok);

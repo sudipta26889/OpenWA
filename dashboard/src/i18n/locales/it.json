@@ -98,6 +98,7 @@
     "loadingMessages": "Caricamento messaggi...",
     "loadingOlderMessages": "Caricamento messaggi precedenti...",
     "loadOlderMessagesError": "Impossibile caricare i messaggi precedenti. Scorri verso l’alto per riprovare.",
+    "loadOlderMessagesRetryHint": "Scorri verso l’alto per riprovare.",
     "noMessagesInChat": "Ancora nessun messaggio. Invia il primo messaggio per iniziare!",
     "downloadDocument": "Scarica documento",
     "actions": {
@@ -535,6 +536,7 @@
       "session.reconnect_loop": "Quando una sessione continua a non riuscire a riconnettersi",
       "session.restriction": "Quando WhatsApp limita l'account o rimuove una limitazione",
       "presence.update": "Quando una chat seguita va online, scrive o va offline",
+      "event.response": "Quando un invitato risponde a un evento WhatsApp (partecipa, non partecipa, forse)",
       "group.join": "Quando dei partecipanti entrano in un gruppo o vengono aggiunti",
       "group.leave": "Quando dei partecipanti lasciano un gruppo o vengono rimossi",
       "group.update": "Quando cambiano il nome, la descrizione o le impostazioni di un gruppo",
@@ -707,8 +709,9 @@
     },
     "chats": {
       "label": "Accesso alle chat (facoltativo)",
-      "hint": "Una chat per riga: un ID di gruppo che termina con @g.us, un ID di contatto che termina con @c.us o @lid, oppure un numero di telefono. Lascia vuoto per tutte le chat. Una chiave limitata alle chat può usare solo le rotte aperte a questo tipo di chiave; il WebSocket degli eventi e MCP la rifiutano.",
-      "invalid": "Non è un ID chat né un numero di telefono: {{value}}"
+      "hint": "Una chat per riga: un ID di gruppo che termina con @g.us, un ID di contatto che termina con @c.us o @lid, oppure un numero di telefono. Lascia vuoto per tutte le chat. Una chiave limitata alle chat può usare solo le rotte aperte a questo tipo di chiave; il suo accesso tramite il WebSocket degli eventi e MCP resta limitato a queste chat.",
+      "invalid": "Non è un ID chat né un numero di telefono: {{value}}",
+      "tooMany": "Troppe chat ({{count}}): una chiave può elencarne al massimo {{max}}."
     },
     "expiry": {
       "label": "Scade il (facoltativo)",

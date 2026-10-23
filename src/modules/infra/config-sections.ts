@@ -20,6 +20,16 @@ function setSecret(updates: Record<string, string>, key: string, value: string |
   if (value) updates[key] = value;
 }
 
+// What the next boot's validation (env.validation.ts) reads from these keys, refused here instead: the saved
+// file is loaded at boot, and a value it rejects crash-loops the instance and the dashboard that could undo it.
+function portValue(label: string, value: string): string {
+  const port = value.trim();
+  if (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
+    throw new BadRequestException(`${label} must be an integer port in [1, 65535] (got ${JSON.stringify(value)})`);
+  }
+  return port;
+}
+
 // Database. NOTE: these keys must match what src/config/configuration.ts reads.
 export function applyDatabaseSection(
   database: DatabaseConfigDto,
@@ -63,9 +73,13 @@ export function applyDatabaseSection(
       if (database.builtIn === false && existing.POSTGRES_BUILTIN === 'true' && !database.password) {
         staleKeys.add('DATABASE_PASSWORD');
       }
-      if (database.host !== undefined) updates.DATABASE_HOST = database.host || 'localhost';
-      if (database.port !== undefined) updates.DATABASE_PORT = database.port || '5432';
-      if (database.username !== undefined) updates.DATABASE_USERNAME = database.username || 'postgres';
+      // A blank host or user is what boot reads as unset, which it refuses for PostgreSQL, so a padded or
+      // whitespace-only value falls back to the default like an empty one.
+      if (database.host !== undefined) updates.DATABASE_HOST = database.host.trim() || 'localhost';
+      if (database.port !== undefined) {
+        updates.DATABASE_PORT = database.port.trim() ? portValue('database.port', database.port) : '5432';
+      }
+      if (database.username !== undefined) updates.DATABASE_USERNAME = database.username.trim() || 'postgres';
       setSecret(updates, 'DATABASE_PASSWORD', database.password);
       if (database.database !== undefined) updates.DATABASE_NAME = database.database || 'openwa';
       if (database.schema !== undefined) {
@@ -76,6 +90,11 @@ export function applyDatabaseSection(
       }
     }
     if (database.poolSize !== undefined) {
+      if (!Number.isInteger(database.poolSize) || database.poolSize < 0) {
+        throw new BadRequestException(
+          `database.poolSize must be a non-negative integer (got ${JSON.stringify(database.poolSize)})`,
+        );
+      }
       updates.DATABASE_POOL_SIZE = String(database.poolSize || 10);
     }
     if (database.sslEnabled !== undefined) {
@@ -123,8 +142,10 @@ export function applyRedisSection(
     if (!redis.password) staleKeys.add('REDIS_PASSWORD');
   } else {
     // External Redis (explicit, or inherited when builtIn is absent)
-    if (redis.host !== undefined) updates.REDIS_HOST = redis.host || 'localhost';
-    if (redis.port !== undefined) updates.REDIS_PORT = redis.port || '6379';
+    if (redis.host !== undefined) updates.REDIS_HOST = redis.host.trim() || 'localhost';
+    if (redis.port !== undefined) {
+      updates.REDIS_PORT = redis.port.trim() ? portValue('redis.port', redis.port) : '6379';
+    }
   }
   setSecret(updates, 'REDIS_PASSWORD', redis.password);
   const redisEnabled = redis.enabled ?? existing.REDIS_ENABLED === 'true';

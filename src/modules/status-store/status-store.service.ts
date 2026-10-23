@@ -139,7 +139,10 @@ export class StatusStoreService implements OnModuleInit, OnModuleDestroy {
 
     let saved: StatusUpdate;
     try {
-      saved = await this.repository.save(row);
+      // Without a transaction: a single-row save() wraps itself in one, and on SQLite's single shared
+      // connection the rollback of the unique violation expected below also discards the rows other callers
+      // wrote while it was open, after they were reported stored.
+      saved = await this.repository.save(row, { transaction: false });
     } catch (error) {
       // The unique (sessionId, waStatusId) index is the idempotency backstop for a concurrent ingest
       // of the same status racing past the findOne check above; on a unique-constraint violation the
@@ -290,18 +293,24 @@ export class StatusStoreService implements OnModuleInit, OnModuleDestroy {
     return phone ? `${phone}@c.us` : jid;
   }
 
+  // The nullable columns read back as null, while Status declares these fields optional: `?? undefined`
+  // keeps them off the wire, as the contract (StatusDto, openapi) says.
   private toStatus(row: StatusUpdate): Status {
     return {
       id: row.waStatusId,
-      contact: { id: this.canonicalContactJid(row.contactJid), name: row.contactName, pushName: row.contactPushName },
+      contact: {
+        id: this.canonicalContactJid(row.contactJid),
+        name: row.contactName ?? undefined,
+        pushName: row.contactPushName ?? undefined,
+      },
       type: row.type,
-      caption: row.caption,
+      caption: row.caption ?? undefined,
       mediaUrl:
         row.mediaPath && !row.mediaOmitted
           ? `/api/sessions/${row.sessionId}/status/${row.waStatusId}/media`
           : undefined,
-      backgroundColor: row.backgroundColor,
-      font: row.font,
+      backgroundColor: row.backgroundColor ?? undefined,
+      font: row.font ?? undefined,
       timestamp: new Date(row.postedAt),
       expiresAt: new Date(row.expiresAt),
     };

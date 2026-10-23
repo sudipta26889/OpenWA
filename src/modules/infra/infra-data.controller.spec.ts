@@ -43,6 +43,7 @@ import { WebhookOutboxEvent } from '../webhook/entities/webhook-outbox-event.ent
 import { WebhookOutboxService } from '../webhook/webhook-outbox.service';
 import { IntegrationDeliveryFailure } from '../integration/entities/integration-delivery-failure.entity';
 import { StatusUpdate } from '../status-store/entities/status-update.entity';
+import { SendIdempotencyKey } from '../message/entities/send-idempotency-key.entity';
 import { AutomationRule } from '../automation/entities/automation-rule.entity';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { ScopeBindingService } from '../integration/scope-binding.service';
@@ -85,6 +86,7 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
         IntegrationDeliveryFailure,
         StatusUpdate,
         AutomationRule,
+        SendIdempotencyKey,
       ],
       synchronize: true,
     });
@@ -157,6 +159,40 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
 
     expect((await ds.getRepository(Session).findOneByOrFail({ id: 's1' })).desiredState).toBe('stopped');
     expect((await ds.getRepository(Session).findOneByOrFail({ id: 's2' })).desiredState).toBeNull();
+  });
+
+  it('drops the send idempotency claims of a session the restore removes and keeps those of one it restores', async () => {
+    await seedSession('s1');
+    await seedSession('s2');
+    const claims = ds.getRepository(SendIdempotencyKey);
+    for (const sessionId of ['s1', 's2']) {
+      await claims.save(
+        claims.create({
+          sessionId,
+          idempotencyKey: 'order-42',
+          route: 'send-text',
+          requestHash: 'h',
+          state: 'completed',
+          responseBody: { messageId: `sent-by-${sessionId}` },
+          expiresAt: new Date(Date.now() + 3_600_000),
+        }),
+      );
+    }
+    const both = await controller.exportData();
+    const onlyS2 = {
+      tables: {
+        ...both.tables,
+        sessions: (both.tables.sessions as unknown as Array<{ id: string }>).filter(row => row.id === 's2'),
+      },
+    };
+
+    expect(await controller.importData(onlyS2 as never)).toMatchObject({ imported: true });
+    expect((await claims.find()).map(claim => claim.sessionId)).toEqual(['s2']);
+
+    // A later restore that brings s1 back must not answer a retried send with the old stored response.
+    expect(await controller.importData({ tables: both.tables })).toMatchObject({ imported: true });
+    expect(await claims.findOneBy({ sessionId: 's1' })).toBeNull();
+    expect(await claims.findOneBy({ sessionId: 's2' })).not.toBeNull();
   });
 
   it('carries LIVE claims forward by their remaining time, including a peer node’s', async () => {
@@ -1562,6 +1598,99 @@ describe('InfraDataController.import/export preserves every data-DB table', () =
     expect(res.imported).toBe(true);
     expect(await outboxRepo.count()).toBe(1);
     expect((await outboxRepo.findOneByOrFail({ idempotencyKey: 'key-1' })).state).toBe('pending');
+  });
+
+  it('restores legacy terminal failures using a deterministic keeper without losing independent records', async () => {
+    await seedSession('s1');
+    const dump = await controller.exportData();
+    const base = {
+      webhookId: 'wh-1',
+      sessionId: 's1',
+      event: 'message.received',
+      url: 'https://receiver.example',
+      idempotencyKey: 'key-1',
+      deliveryId: null,
+      attempts: 3,
+      lastStatusCode: 503,
+      lastError: 'HTTP 503',
+      createdAt: '2026-10-05T00:00:00.000Z',
+    };
+    dump.tables.webhookDeliveryFailures = [
+      { ...base, id: 'a', attempts: 8 },
+      { ...base, id: 'b', payload: '{"body":"retained"}' },
+      { ...base, id: 'c', attempts: 0 },
+      { ...base, id: 'd', idempotencyKey: null },
+      { ...base, id: 'e', idempotencyKey: null },
+      { ...base, id: 'f', idempotencyKey: 'key-2', attempts: 5 },
+      { ...base, id: 'g', idempotencyKey: 'key-2', attempts: 5 },
+    ];
+    const result = await controller.importData({ tables: dump.tables });
+    expect(result.imported).toBe(true);
+    expect(result.warnings).toEqual([]);
+    const repository = ds.getRepository(WebhookDeliveryFailure);
+    expect((await repository.find({ order: { id: 'ASC' } })).map(row => row.id)).toEqual(['b', 'c', 'd', 'e', 'g']);
+    expect(result.counts.webhookDeliveryFailures).toBe(5);
+    expect(await repository.createQueryBuilder('failure').addSelect('failure.payload').getMany()).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: 'b', payload: null })]),
+    );
+  });
+
+  it.each(['primary-key', 'missing-url'] as const)(
+    'preserves restore rollback for a %s error in terminal failures',
+    async problem => {
+      await seedSession('s1');
+      const dump = await controller.exportData();
+      const base = {
+        id: 'same-id',
+        webhookId: 'wh-1',
+        sessionId: 's1',
+        event: 'message.received',
+        url: 'https://receiver.example',
+        deliveryId: null,
+        attempts: 3,
+        lastStatusCode: 503,
+        lastError: 'HTTP 503',
+        createdAt: '2026-10-05T00:00:00.000Z',
+      };
+      dump.tables.webhookDeliveryFailures =
+        problem === 'primary-key'
+          ? [
+              { ...base, idempotencyKey: 'key-1' },
+              { ...base, idempotencyKey: 'key-2' },
+            ]
+          : [
+              { ...base, id: 'a', idempotencyKey: 'key-1', attempts: 1, url: null as unknown as string },
+              { ...base, id: 'b', idempotencyKey: 'key-1' },
+            ];
+      const result = await controller.importData({ tables: dump.tables });
+      expect(result.imported).toBe(false);
+      expect(result.warnings.join(' ')).toMatch(/UNIQUE constraint failed|NOT NULL constraint failed/);
+      expect(await ds.getRepository(Session).count()).toBe(1);
+    },
+  );
+
+  it('projects failure audit columns before reading retained payloads and supports the pre-payload schema', async () => {
+    await seedSession('s1');
+    const repository = ds.getRepository(WebhookDeliveryFailure);
+    await repository.save({
+      webhookId: 'wh-1',
+      sessionId: 's1',
+      event: 'message.received',
+      url: 'https://receiver.example',
+      idempotencyKey: 'key-1',
+      attempts: 3,
+      lastError: 'HTTP 503',
+      payload: { body: 'x'.repeat(2 * 1024 * 1024) },
+    });
+    const query = jest.spyOn(ds, 'query');
+    const dump = await controller.exportData();
+    expect(dump.tables.webhookDeliveryFailures).toHaveLength(1);
+    expect(dump.tables.webhookDeliveryFailures[0]).not.toHaveProperty('payload');
+    const reads = query.mock.calls.filter(([sql]) => /^SELECT .*FROM webhook_delivery_failures$/i.test(sql));
+    expect(reads).toHaveLength(1);
+    expect(reads[0][0]).not.toMatch(/\*|payload/);
+    await ds.query('ALTER TABLE webhook_delivery_failures DROP COLUMN payload');
+    expect((await controller.exportData()).tables.webhookDeliveryFailures).toEqual(dump.tables.webhookDeliveryFailures);
   });
 
   // A PostgreSQL export serializes CreateDateColumn/UpdateDateColumn values as ISO `...T...Z`, while

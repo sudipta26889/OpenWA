@@ -86,6 +86,15 @@ describe('validateEnv', () => {
     expect(() => validateEnv({ PORT: '2785' })).not.toThrow();
   });
 
+  // main.ts listens on the raw PORT and the image healthcheck puts it in a URL verbatim, so a padded
+  // value would boot on 2785 while every probe of `http://localhost:2785 /...` fails as malformed.
+  it('rejects a PORT with surrounding whitespace and takes only an empty one as unset', () => {
+    expect(() => validateEnv({ PORT: '2785 ' })).toThrow(/PORT/);
+    expect(() => validateEnv({ PORT: ' 8080' })).toThrow(/PORT/);
+    expect(() => validateEnv({ PORT: '   ' })).toThrow(/PORT/);
+    expect(() => validateEnv({ PORT: '' })).not.toThrow();
+  });
+
   it('rejects a non-numeric database timeout knob (a typo would become NaN and break the pg pool)', () => {
     expect(() => validateEnv({ DATABASE_STATEMENT_TIMEOUT_MS: 'abc' })).toThrow(/DATABASE_STATEMENT_TIMEOUT_MS/);
     expect(() => validateEnv({ DATABASE_IDLE_TIMEOUT_MS: '30s' })).toThrow(/DATABASE_IDLE_TIMEOUT_MS/);
@@ -102,6 +111,21 @@ describe('validateEnv', () => {
     expect(() => validateEnv({ STORAGE_TYPE: 'ss' })).toThrow(/STORAGE_TYPE/);
     expect(() => validateEnv({ STORAGE_TYPE: 'local' })).not.toThrow();
     expect(() => validateEnv({ STORAGE_TYPE: 's3' })).not.toThrow();
+  });
+
+  it('accepts MESSAGE_INLINE_MEDIA inline or archive, and refuses a typo', () => {
+    expect(() => validateEnv({ MESSAGE_INLINE_MEDIA: 'inline' })).not.toThrow();
+    expect(() => validateEnv({ MESSAGE_INLINE_MEDIA: 'archive', CHAT_MEDIA_ARCHIVE_ENABLED: 'true' })).not.toThrow();
+    expect(() => validateEnv({ MESSAGE_INLINE_MEDIA: 'archived' })).toThrow(/MESSAGE_INLINE_MEDIA must be one of/);
+  });
+
+  it('refuses MESSAGE_INLINE_MEDIA=archive without the archiver, which would silently do nothing', () => {
+    expect(() => validateEnv({ MESSAGE_INLINE_MEDIA: 'archive' })).toThrow(
+      /MESSAGE_INLINE_MEDIA=archive needs CHAT_MEDIA_ARCHIVE_ENABLED=true/,
+    );
+    expect(() => validateEnv({ MESSAGE_INLINE_MEDIA: 'archive', CHAT_MEDIA_ARCHIVE_ENABLED: 'false' })).toThrow(
+      /needs CHAT_MEDIA_ARCHIVE_ENABLED=true/,
+    );
   });
 
   // The runtime compares these raw (`=== 'postgres'`, the engine plugin lookup, `=== 's3'`), so a
@@ -248,6 +272,19 @@ describe('validateEnv', () => {
     expect(() => validateEnv({ [key]: '9999999' })).toThrow(new RegExp(`${key} must be at most 36500`));
     expect(() => validateEnv({ [key]: '36501' })).toThrow(new RegExp(`${key} must be at most 36500`));
     expect(() => validateEnv({ [key]: '36500' })).not.toThrow();
+  });
+
+  // The same 36500-day cutoff bound, in hours. A malformed value fell back to 0 downstream, which keeps no
+  // payload on a failure row and leaves the redrive endpoint nothing to replay, with no boot error.
+  it('rejects a malformed or oversized WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS and keeps 0 (no payload kept)', () => {
+    const key = 'WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS';
+    for (const bad of ['24h', '-1', '1.5']) {
+      expect(() => validateEnv({ [key]: bad })).toThrow(new RegExp(`${key} must be a non-negative integer`));
+    }
+    expect(() => validateEnv({ [key]: '876001' })).toThrow(new RegExp(`${key} must be at most 876000`));
+    for (const ok of ['0', '24', '876000']) {
+      expect(() => validateEnv({ [key]: ok })).not.toThrow();
+    }
   });
 
   it('rejects a non-positive / non-integer WEBHOOK_MAX_PAYLOAD_BYTES (0 would reject every dispatch)', () => {
@@ -649,6 +686,7 @@ describe('validateEnv', () => {
     ['TEMPLATE_RENDER_MAX_CHARS', '64k'],
     ['STORAGE_IMPORT_MAX_BYTES', '200mb'],
     ['STORAGE_IMPORT_MAX_ENTRIES', '1e5'],
+    ['STORAGE_IMPORT_MAX_TOTAL_BYTES', '10gb'],
     ['STORAGE_LIST_MAX_FILES', '100k'],
     ['BAILEYS_MESSAGE_STORE_LIMIT', '5k'],
   ])('rejects a unit-suffixed or zero %s', (key, bad) => {
@@ -660,6 +698,18 @@ describe('validateEnv', () => {
   it('rejects a unit-suffixed SHUTDOWN_DELAY_MS but keeps 0 (no drain)', () => {
     expect(() => validateEnv({ SHUTDOWN_DELAY_MS: '3s' })).toThrow(/SHUTDOWN_DELAY_MS must be a non-negative integer/);
     expect(() => validateEnv({ SHUTDOWN_DELAY_MS: '0' })).not.toThrow();
+  });
+
+  it('rejects a malformed WEBHOOK_SHUTDOWN_DRAIN_MS but keeps 0 (no wait), like the other shutdown knobs', () => {
+    // A malformed value was silently replaced by 5000, which also sets the force-exit budget, so a typo
+    // such as `30s` quietly cut the drain the operator asked for.
+    for (const bad of ['30s', '-5', 'abc', '1.5']) {
+      expect(() => validateEnv({ WEBHOOK_SHUTDOWN_DRAIN_MS: bad })).toThrow(
+        /WEBHOOK_SHUTDOWN_DRAIN_MS must be a non-negative integer/,
+      );
+    }
+    expect(() => validateEnv({ WEBHOOK_SHUTDOWN_DRAIN_MS: '0' })).not.toThrow();
+    expect(() => validateEnv({ WEBHOOK_SHUTDOWN_DRAIN_MS: '12000' })).not.toThrow();
   });
 
   it.each([

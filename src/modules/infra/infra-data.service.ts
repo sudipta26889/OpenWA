@@ -20,7 +20,7 @@ import { In } from 'typeorm';
 import { DateUtils } from 'typeorm/util/DateUtils';
 import type { MigrationTables, TableCounts } from './migration-tables.types';
 import { EXPORT_TABLES, EXPORT_TABLE_EXCLUSIONS, type AnyExportTable } from './export-tables';
-import { TABLE_IMPORTERS } from './table-importers';
+import { TABLE_IMPORTERS, deduplicateArchivedWebhookFailures } from './table-importers';
 
 /**
  * The ownership quartet SessionOwnershipService maintains: which process holds a session's engine and
@@ -417,7 +417,10 @@ export class InfraDataService {
       const droppedBefore = inlineMediaBudget.droppedPayloads();
       const rows: unknown[] = entry.inlineMedia
         ? await this.readInlineMediaTable(entry, entry.inlineMedia, sql => readTable(entry, sql), inlineMediaBudget)
-        : await readTable(entry, `SELECT * FROM ${entry.table}`);
+        : await readTable(
+            entry,
+            `SELECT ${entry.columns?.map(column => `"${column}"`).join(', ') ?? '*'} FROM ${entry.table}`,
+          );
       // `rows` was read for exactly this entry's table, so it holds the row type the entry's hooks
       // declare. That correlation is what the erased entry type cannot carry, and this loop is the
       // one place it is known — so the casts live here rather than at each hook.
@@ -757,9 +760,9 @@ export class InfraDataService {
         // OTHER failure (lock, I/O, aborted tx) propagate to the transaction rollback below — a blind
         // `.catch(() => {})` here could otherwise silently commit a MERGED (not replaced) restore on
         // SQLite, violating the endpoint's "replaces existing data" contract.
-        const clearTable = async (table: string): Promise<void> => {
+        const clearTable = async (table: string, where = ''): Promise<void> => {
           try {
-            await queryRunner.query(`DELETE FROM ${table}`);
+            await queryRunner.query(`DELETE FROM ${table}${where}`);
           } catch (err) {
             if (!isMissingTableError(err)) throw err;
             this.logger.debug('Skipped clearing a table that does not exist during import', { table });
@@ -846,7 +849,10 @@ export class InfraDataService {
         // PostgreSQL-made backup compares and sorts like rows the app wrote itself.
         const datetimeColumns = isPostgres ? undefined : sqliteDatetimeColumns(this.dataDataSource);
         restore: for (const importer of TABLE_IMPORTERS) {
-          const rows = data.tables[importer.key];
+          const rows =
+            importer.key === 'webhookDeliveryFailures'
+              ? deduplicateArchivedWebhookFailures(data.tables.webhookDeliveryFailures ?? [])
+              : data.tables[importer.key];
           if (!rows?.length) continue;
           const dateColumns = datetimeColumns?.get(importer.key) ?? [];
           for (const archivedRow of rows) {
@@ -926,6 +932,27 @@ export class InfraDataService {
             await ScrubNonPhoneLidMappings1786950000000.scrub(queryRunner);
           } catch (error) {
             warnings.push(`Failed to clean restored rows: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+
+        // send_idempotency_keys is not archived, so it is trimmed rather than cleared. A claim of a session
+        // this restore dropped would outlive it by up to 24 h, and a later restore that brings the id back
+        // would answer a retried send with the old stored response instead of sending it. The claims of a
+        // session the restore keeps stay: a retry of a send made before the restore still replays.
+        // Asked first rather than caught: on PostgreSQL a statement that fails, a missing table included,
+        // aborts the whole import transaction, and every later statement then fails with it.
+        if (warnings.length === 0 && (await queryRunner.hasTable('send_idempotency_keys'))) {
+          try {
+            // CAST: sessions.id is a uuid on PostgreSQL and the claim's sessionId a varchar, which `IN` does not
+            // compare.
+            await clearTable(
+              'send_idempotency_keys',
+              ' WHERE "sessionId" NOT IN (SELECT CAST("id" AS TEXT) FROM sessions)',
+            );
+          } catch (error) {
+            warnings.push(
+              `Failed to drop the send idempotency claims of removed sessions: ${error instanceof Error ? error.message : String(error)}`,
+            );
           }
         }
 

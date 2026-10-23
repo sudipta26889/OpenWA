@@ -281,11 +281,12 @@ change will come from the engine libraries implementing the step.
 - Linking the same account by QR works
 
 **Cause:** the pairing request carries the linked-device identity, and some accounts reject a
-non-standard one. The default device name is `OpenWA`; set `BAILEYS_BROWSER_NAME=Ubuntu` (or another
-standard OS name), restart OpenWA itself (the name is read at boot, so stopping and starting the session
-is not enough), and request a fresh code. The name applies to new pairings only;
-a session that is already linked keeps the name it was paired with until it is re-linked. See the
-phone-number pairing example in `docs/examples/session-phone-number-pairing.md`.
+non-standard one. The default device name is `Ubuntu`; if `BAILEYS_BROWSER_NAME` is set to a custom
+brand, set it back to `Ubuntu` (or another standard OS name like `macOS` or `Windows`),
+restart OpenWA itself (the name is read at boot, so stopping and starting the session is not enough),
+and request a fresh code. The name applies to new pairings only; a session that is already linked
+keeps the name it was paired with until it is re-linked. See the phone-number pairing example in
+`docs/examples/session-phone-number-pairing.md`.
 
 ### Issue: No QR code appears, or `POST /api/sessions/:sessionId/start` returns `504`
 
@@ -703,13 +704,13 @@ curl -H "X-API-Key: $API_KEY" \
 
 **Common Causes:**
 
-| Cause                            | Symptom                                                         | Solution                                                                          |
-| -------------------------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| Invalid phone number             | 400 error                                                       | Format: `628123456789@c.us`                                                       |
-| Rate limited                     | 429 error                                                       | Reduce sending rate                                                               |
-| Session not started or not ready | 400 (`is not active`) or 409                                    | Start or reconnect the session                                                    |
-| Media too large                  | 413 error                                                       | Compress or reduce size                                                           |
-| Number not on WhatsApp           | 400 on whatsapp-web.js; Baileys may accept it and never deliver | Verify the number first (`GET /api/sessions/{sessionId}/contacts/check/{number}`) |
+| Cause                            | Symptom                                                  | Solution                                                                          |
+| -------------------------------- | -------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Invalid phone number             | 400 error                                                | Format: `628123456789@c.us`                                                       |
+| Rate limited                     | 429 error                                                | Reduce sending rate                                                               |
+| Session not started or not ready | 400 (`is not active`) or 409                             | Start or reconnect the session                                                    |
+| Media too large                  | 413 error                                                | Compress or reduce size                                                           |
+| Number not on WhatsApp           | 400 when the recipient lookup reports it as unregistered | Verify the number first (`GET /api/sessions/{sessionId}/contacts/check/{number}`) |
 
 **Phone Number Validation:**
 
@@ -735,7 +736,8 @@ curl -H "X-API-Key: $API_KEY" \
 - `POST /api/sessions/{id}/messages/send-text` returns `{"statusCode":500,"message":"Internal server error"}` — but the message _is_ delivered
 - Logs show `the engine returned no message for this send, so it may not have been delivered`
 - Unrelated operations fail with the minified error `r: r`: `GET /api/sessions/{id}/chats`, media downloads, typing indicators
-- Startup logs may contain `The installed whatsapp-web.js is missing the message-id backport…`
+- Startup logs may contain `The installed whatsapp-web.js is missing the message-id backport…`, or
+  `The installed whatsapp-web.js carries only part of the message-id backport…` after an interrupted install
 
 **Cause:** WhatsApp Web 2.3000.x renamed the internal message-id property that whatsapp-web.js
 reads. OpenWA ships a backport that restores it, applied at install time by
@@ -860,6 +862,10 @@ MEDIA_DOWNLOAD_MAX_BYTES=52428800
 # Max request body — base64 media rides inside the JSON body, so raise this too.
 # Default 25mb.
 BODY_SIZE_LIMIT=25mb
+
+# Behind nginx, raise client_max_body_size to match: its default is 1m, so a base64 media send
+# is refused with nginx's own HTML 413 before OpenWA sees it. Behind ingress-nginx, set the
+# nginx.ingress.kubernetes.io/proxy-body-size annotation (default 1m).
 
 # Note: send the body uncompressed. A request carrying Content-Encoding: gzip (or deflate/br)
 # is refused with 415 — the aggregate in-flight cap counts bytes on the wire, so a compressed
@@ -1058,8 +1064,10 @@ curl -H "X-API-Key: $API_KEY" \
 ```sql
 -- Indexes ship with the schema (migrations) — there is nothing to add by hand. `messages`
 -- carries ("sessionId", "createdAt"), ("sessionId", "chatId", "createdAt"), ("chatId"),
--- ("status"), ("createdAt"), a partial ("mediaPath") where it is not null, a unique
--- ("sessionId", "waMessageId"), and on PostgreSQL a GIN index on the full-text "body_ts" column.
+-- ("status"), ("createdAt"), the message-time indexes ("sessionId", "timestamp", "id"),
+-- ("sessionId", "chatId", "timestamp", "id") and ("sessionId", "direction", "timestamp", "id"),
+-- a partial ("mediaPath") where it is not null, a unique ("sessionId", "waMessageId"), and on
+-- PostgreSQL a GIN index on the full-text "body_ts" column.
 
 -- PostgreSQL: refresh planner statistics on the hot tables
 ANALYZE sessions;
@@ -1135,7 +1143,7 @@ flowchart TD
 **Solutions:**
 
 ```bash
-# Show migration status (executed + pending)
+# From a source checkout: show migration status (executed + pending)
 npm run migration:show
 
 # Run all pending migrations
@@ -1144,13 +1152,17 @@ npm run migration:run
 # Rollback last migration
 npm run migration:revert
 
+# Inside the released image, which has no ts-node, use the :prod variants against dist/
+docker compose run --rm openwa-api npm run migration:show:prod
+docker compose run --rm openwa-api npm run migration:run:prod
+
 # Schema is managed by migrations (there is no schema:sync)
 # The auth/audit DB has parallel :main variants, e.g.:
 npm run migration:run:main
 npm run migration:run:main:prod   # inside the released image
 ```
 
-**PostgreSQL crash-loop on boot after upgrade** — if logs show `column "id" is of type uuid but default expression is of type character varying` or `foreign key constraint ... cannot be implemented ... incompatible types: character varying and uuid`, the deployment was previously bootstrapped with `DATABASE_SYNCHRONIZE=true` (native `uuid` columns vs the migrations' `varchar`). A guard migration converts the columns automatically on the next boot; for large `messages` tables, run the migration against the stopped app (`npm run migration:run`) during a maintenance window. See [14.5 / 14.9 — PostgreSQL crash-loop after upgrading a `DATABASE_SYNCHRONIZE=true` deployment](./14-migration-guide.md). `DATABASE_SYNCHRONIZE=true` is unsupported on PostgreSQL for production.
+**PostgreSQL crash-loop on boot after upgrade** — if logs show `column "id" is of type uuid but default expression is of type character varying` or `foreign key constraint ... cannot be implemented ... incompatible types: character varying and uuid`, the deployment was previously bootstrapped with `DATABASE_SYNCHRONIZE=true` (native `uuid` columns vs the migrations' `varchar`). A guard migration converts the columns automatically on the next boot; for large `messages` tables, run the migration against the stopped app (`npm run migration:run` from a source checkout, `npm run migration:run:prod` in the image) during a maintenance window. See [14.5 / 14.9 — PostgreSQL crash-loop after upgrading a `DATABASE_SYNCHRONIZE=true` deployment](./14-migration-guide.md). `DATABASE_SYNCHRONIZE=true` is unsupported on PostgreSQL for production.
 
 ## 12.7 Docker Issues
 
@@ -1167,8 +1179,9 @@ npm run migration:run:main:prod   # inside the released image
 By default the entrypoint starts as root, re-owns `/app/data` to the `openwa` user (uid/gid 997) on
 every start, and then drops privileges with `gosu`. Keep that path intact:
 
-- Keep the `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETGID` and `SETUID` entries under `cap_add` in
-  `docker-compose.yml`; the `chown` and the `gosu` drop need them.
+- Keep the `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `KILL`, `SETGID` and `SETUID` entries under `cap_add` in
+  `docker-compose.yml`; the entrypoint needs ownership and privilege-drop permissions, and
+  `dumb-init` needs `KILL` to forward shutdown signals to the process after its UID changes.
 - Setting `user:` on `openwa-api` (or `--user` on `docker run`) starts the entrypoint as that uid
   instead. It then skips the `chown` and the drop, so `/app/data` must already be writable by that
   uid: `user: "997:997"` works on a volume a root start has already re-owned, and the `cap_add` list
@@ -1243,7 +1256,16 @@ docker exec openwa-api curl http://host.docker.internal:8080
 >
 > With `ENGINE_TYPE=baileys` (browser-free), RAM per session is significantly lower — you can run more sessions on the same hardware. Exact figures depend on message volume and group membership.
 >
-> A media burst adds roughly `INBOUND_MEDIA_CONCURRENCY` x `MEDIA_DOWNLOAD_MAX_BYTES` per session on top of that (4 x 50 MiB by default; about a third more on whatsapp-web.js, which holds each payload as base64). Set `INBOUND_MEDIA_GLOBAL_CONCURRENCY` to cap concurrent inbound media downloads across all sessions. On whatsapp-web.js a download that times out keeps its slot until Puppeteer fails the call (`PUPPETEER_PROTOCOL_TIMEOUT_MS`, 180 s by default), since it cannot be aborted.
+> A media burst adds roughly `INBOUND_MEDIA_CONCURRENCY` x `MEDIA_DOWNLOAD_MAX_BYTES` per session on top of that (4 x 50 MiB by default; about a third more on whatsapp-web.js, which holds each payload as base64). On whatsapp-web.js Chromium also holds each file being downloaded, encrypted and decrypted, and a download starts whenever the size the sender declares is within `MEDIA_DOWNLOAD_MAX_BYTES`, so a sender that understates it can make one download exceed that cap. Set `INBOUND_MEDIA_GLOBAL_CONCURRENCY` to cap concurrent inbound media downloads across all sessions. On whatsapp-web.js a download that times out keeps its slot until Puppeteer fails the call (`PUPPETEER_PROTOCOL_TIMEOUT_MS`, 180 s by default), since it cannot be aborted.
+>
+> On PostgreSQL media messages can also wait in memory after the download: received media, and the echo of media this account sends, which is downloaded the same way (every media send on whatsapp-web.js; on Baileys, media sent from a linked phone). Each payload is held as base64, about 4/3 of the file size (roughly 67 MiB for a 50 MiB file), until its message row is stored. A session downloads media only into one of `INBOUND_MEDIA_CONCURRENCY` slots, and a slot stays taken until the row is stored and the engine has let go of the payload, so one session holds at most `INBOUND_MEDIA_CONCURRENCY` x 4 x ceil(`MEDIA_DOWNLOAD_MAX_BYTES` / 3) bytes of payload: 279,620,272 bytes (about 267 MiB) at the defaults, 69,905,068 with `INBOUND_MEDIA_CONCURRENCY=1`. That holds however slow the inserts are, including one that never finishes, and across a reconnect of the session; size a process for sessions x that bound. It does not count a Baileys download in progress (the decoded file, up to `MEDIA_DOWNLOAD_MAX_BYTES`, while it is encoded), the copies the PostgreSQL driver makes while it writes a row, or anything that keeps a message after its row is stored (webhook deliveries, archiving, plugins). Each payload takes a whole slot whatever its size, and a chat's messages are stored in arrival order, so a text waits for media that arrived before it in its chat while other chats keep flowing. When no slot is freed for 2 x `MEDIA_DOWNLOAD_TIMEOUT_MS` (60 s by default), media still waiting for one arrives with the omitted marker, so a stalled database costs media rather than memory. A chat message the sender deletes for everyone before its row is stored is stored cleared on both engines, and media it had not downloaded yet is not downloaded. A delete, edit or reaction from another chat, an edit from someone other than the sender, and a delete from the other side of a one-to-one chat are ignored, as they are for a stored message (a reaction to a message the account sent to a broadcast list or posted as a status is excepted, since its recipients react from their own chats); a delete inside a group is checked for its chat only, since an admin may delete anyone's message. On SQLite this now also holds while the message is still being downloaded, where Baileys used to pass such a change on. On Baileys, a status post deleted meanwhile, or a message a history sync reports deleted, is dropped instead, as before. On whatsapp-web.js a held message also looks up its sender's contact and its quoted message before it is emitted, and its chat's later messages wait for it: each lookup waits at most `MEDIA_DOWNLOAD_TIMEOUT_MS`, and the message goes out without what did not arrive. On a local PostgreSQL 16 where a 50 MiB row took about 0.4 s to insert, 24 files of 50 MiB arriving at 8 per second held at most 4 payloads (267 MiB; without the slots 17 waited, 1.1 GiB), and a table lock that stalled every insert for 30 s held 4 for the whole stall (without the slots all 24, 1.6 GiB) and shed none, since the 60 s wait had not run out. On SQLite rows are written as messages arrive and none wait, except behind a slow `message:received` or `message:sent` plugin hook, or with `RESOLVE_LID_TO_PHONE=true` a slow phone lookup for a privacy-id sender: there those hold payloads for as long as they run, with no limit on how many, and the chat's later messages wait behind them. On PostgreSQL they run inside the slots: a slot is held until its message's commit settles, which covers the hook chain, the phone lookup, the insert and, on whatsapp-web.js, a timed-out page download (until `PUPPETEER_PROTOCOL_TIMEOUT_MS` fails it). A plugin loaded from the plugins directory delays a slot by at most 5 s per hook (`SANDBOX_HOOK_TIMEOUT_MS`), but a hook registered in-process has no time limit: one that never settles keeps its chat's later messages from being stored, and holds every slot they or its own message took, until the process restarts, since a reconnect does not free them. Once `INBOUND_MEDIA_CONCURRENCY` slots are stuck that way, every media message of the session arrives with the omitted marker. The [high memory runbook](./11-operational-runbooks.md#runbook-high-memory-usage) shows how to find the holder.
+>
+> - `MEDIA_DOWNLOAD_MAX_BYTES` caps each waiting payload (larger media arrive as the omitted marker), and with it the bound. It also caps outbound media sends.
+> - `MEDIA_DOWNLOAD_ENABLED=false` holds no payload at all; every media message arrives as the omitted marker.
+> - Lowering `INBOUND_MEDIA_CONCURRENCY` lowers the bound on PostgreSQL, at the cost of fewer media downloaded and stored at once. On SQLite it only limits downloads in progress.
+> - Archiving (`CHAT_MEDIA_ARCHIVE_ENABLED=true`) adds to it on either database, in both `MESSAGE_INLINE_MEDIA` modes. Each message is archived after its row is written, with no limit on how many archive at once, and each one holds its base64 payload and the decoded bytes until the upload finishes. `MESSAGE_INLINE_MEDIA=archive` also holds the read-back file, the re-read metadata and its snapshot, and saves no memory, since the row is still written with the inline copy first. Only media up to `CHAT_MEDIA_ARCHIVE_MAX_BYTES` (25 MiB by default) are archived; larger media add nothing, so lowering it bounds the cost per message, not how many archive at once. How many overlap grows with storage latency (such as S3) and with how fast downloads complete. On SQLite, 40 files of 20 MiB at 10 per second peaked at about 0.55 GiB RSS without archiving, and at 1.4 GiB with archiving in the default inline mode when each upload took 2 s (17 at once). In a burst of 24 files of 50 MiB at 8 per second, with `CHAT_MEDIA_ARCHIVE_MAX_BYTES` raised so the 50 MiB files were archived to local disk storage, peak RSS on SQLite rose from about 1 GiB to 2.1 to 3 GiB in inline mode and to 4.2 to 5.1 GiB in archive mode (up to 20 archives at once).
+>
+> With the queue off (`QUEUE_ENABLED=false`), every webhook delivery that is running, parked or waiting out a retry backoff also holds its event's payload, including inline media up to `WEBHOOK_MEDIA_INLINE_MAX_BYTES` (1 MiB by default) as base64. Up to `WEBHOOK_DISPATCH_CONCURRENCY` + `WEBHOOK_DISPATCH_MAX_QUEUED` deliveries (1016 by default) wait this way, so receivers that stop answering during a media burst can hold about 1.3 GiB per process at the defaults. Lower either dispatch setting or `WEBHOOK_MEDIA_INLINE_MAX_BYTES`, or enable the queue, which keeps those payloads in Redis instead.
 
 **Q: Can I run 10+ sessions in one container? Will they get banned for sharing one IP?**
 
@@ -1315,6 +1337,11 @@ curl -X POST http://localhost:2785/api/sessions/{id}/messages/reply \
 server {
     listen 443 ssl;
     server_name api.example.com;
+
+    # nginx refuses a request body over 1m by default, below the 25mb OpenWA itself accepts
+    # (BODY_SIZE_LIMIT), so base64 media sends would answer 413 before reaching OpenWA.
+    # Keep this at or above BODY_SIZE_LIMIT.
+    client_max_body_size 25m;
 
     location / {
         proxy_pass http://localhost:2785;
@@ -1391,19 +1418,32 @@ Remember OpenWA is **single-port**: the Dashboard, REST API, and Socket.IO all s
 ```bash
 # Production compose, whose data is the openwa-data volume: back up inside the container, then copy
 # the archive off the volume. In crontab, for example every six hours:
-# 0 */6 * * * docker exec -e BACKUP_DIR=/app/data/backups -e TMPDIR=/app/data/backups openwa-api ./scripts/backup.sh && docker cp openwa-api:/app/data/backups/. /backups/openwa/
+# 0 */6 * * * docker exec -e BACKUP_DIR=/app/data/backups -e TMPDIR=/app/data/backups openwa-api ./scripts/backup.sh && docker cp openwa-api:/app/data/backups/. /backups/openwa/ && docker exec openwa-api sh -c 'rm -f /app/data/backups/openwa-backup-*.tar.gz'
 docker exec -e BACKUP_DIR=/app/data/backups -e TMPDIR=/app/data/backups openwa-api ./scripts/backup.sh
-docker cp openwa-api:/app/data/backups/. /backups/openwa/
+docker cp openwa-api:/app/data/backups/. /backups/openwa/ \
+  && docker exec openwa-api sh -c 'rm -f /app/data/backups/openwa-backup-*.tar.gz'
 
 # Bare metal or docker-compose.dev.yml, whose data is ./data in the checkout:
 # 0 */6 * * * cd /path/to/openwa && BACKUP_DIR=/backups/openwa ./scripts/backup.sh
 ```
 
-The archives stay in `/app/data/backups` on the volume as well, so prune them there too.
+Once an archive is copied off, the last command removes it from `/app/data/backups`, so archives do not pile up on the volume.
 
 The shipped script also covers `main.sqlite`, the selected data store, whatsapp-web.js state,
 `BAILEYS_AUTH_DIR` (default `./data/baileys`), media, plugin packages/state, and generated secrets. Apply
 retention/encryption to completed archives externally; see the [backup and restore runbooks](./11-operational-runbooks.md#runbook-database-backup).
+
+**Q: I lost the admin API key. How do I get back in?**
+
+> A: Keys are stored hashed, so the database cannot give it back. Try the key in `data/.api-key` (or `BOOTSTRAP_KEY_FILE`), or the `API_MASTER_KEY` value set when the key table was last seeded, which still works while that key is an active, unscoped ADMIN key. Failing that, use another unscoped ADMIN key to mint a replacement. With neither, stop the instance and write a new key's hash into the lost key's row in the main database, which keeps every other key working. The steps are in [Recovering a lost admin key](./04-security-design.md#recovering-a-lost-admin-key).
+
+**Q: The key from `data/.api-key` is refused with `Invalid API key`. What is wrong?**
+
+> A: A `401 Invalid API key` means the key's hash is not in the key table this instance reads. The usual
+> causes, in order: the pasted string is not the stored key (the file has no trailing newline, so a shell
+> prompt follows the key on the same line; copy only the key); another instance or database answers
+> than the one that generated it; or `API_KEY_PEPPER` was set or changed after the key was created, which
+> invalidates every key (see [Security](./04-security-design.md)).
 
 ### Webhook Questions
 
@@ -1431,6 +1471,7 @@ available_events:
   - session.reconnect_loop # Every 5th consecutive reconnect attempt (payload: sessionId, attempts, nextDelayMs)
   - session.restriction # WhatsApp restricted the account, or lifted it (payload: sessionId, active, kind, code, expiresAt)
   - presence.update # A subscribed chat's presence changed (Baileys only; the subscribe route answers 501 on whatsapp-web.js; payload: sessionId, chatId, participants, groupOnlineCount)
+  - event.response # A guest answered a WhatsApp event invitation (Baileys only; payload: sessionId, eventMessageId, chatId, responderId, response, responseMessageId, timestamp)
   - call.accepted # A ringing call was answered (Baileys only; payload: sessionId, callId, from, outcome, isVideo, isGroup, timestamp)
   - call.rejected # A ringing call was declined (Baileys only)
   - call.missed # A ringing call was never picked up (Baileys only)
@@ -1475,22 +1516,24 @@ A media message also carries `media: { mimetype, filename?, data?, omitted?, siz
 
 ### HTTP Error Codes
 
-| Code | Meaning             | Common Cause                                                                               | Solution                                          |
-| ---- | ------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------- |
-| 400  | Bad Request         | Invalid parameters, or the session is not started                                          | Check request body/params; start the session      |
-| 401  | Unauthorized        | Missing/invalid API key                                                                    | Add X-API-Key header                              |
-| 403  | Forbidden           | Insufficient permissions                                                                   | Check API key permissions                         |
-| 404  | Not Found           | Invalid session/endpoint                                                                   | Verify session exists                             |
-| 409  | Conflict            | Session name already exists, or the session is not ready (retryable)                       | Use a different session name, or wait for `ready` |
-| 413  | Payload Too Large   | File too large                                                                             | Reduce file size                                  |
-| 429  | Too Many Requests   | Rate limited                                                                               | Reduce request rate                               |
-| 500  | Internal Error      | Server error                                                                               | Check logs                                        |
-| 503  | Service Unavailable | The engine transport died during a read, or a media fetch through the session proxy failed | Retry; restart the session if it persists         |
+| Code | Meaning             | Common Cause                                                                                                                  | Solution                                                                                         |
+| ---- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| 400  | Bad Request         | Invalid parameters, or the session is not started                                                                             | Check request body/params; start the session                                                     |
+| 401  | Unauthorized        | Missing/invalid API key                                                                                                       | Add X-API-Key header                                                                             |
+| 403  | Forbidden           | Insufficient permissions                                                                                                      | Check API key permissions                                                                        |
+| 404  | Not Found           | Invalid session/endpoint                                                                                                      | Verify session exists                                                                            |
+| 409  | Conflict            | Session name already exists, the session is not ready (retryable), or an idempotent send is in progress or of unknown outcome | Use a different session name, wait for `ready`, or follow the `code` (docs/06, idempotent sends) |
+| 422  | Unprocessable       | An `Idempotency-Key` reused with another route or body                                                                        | Use a new key for a different send                                                               |
+| 413  | Payload Too Large   | File too large                                                                                                                | Reduce file size                                                                                 |
+| 429  | Too Many Requests   | Rate limited                                                                                                                  | Reduce request rate                                                                              |
+| 500  | Internal Error      | Server error                                                                                                                  | Check logs                                                                                       |
+| 503  | Service Unavailable | The engine transport died during a read, or a media fetch through the session proxy failed                                    | Retry; restart the session if it persists                                                        |
 
 ### Error Body Shape
 
 There are no machine-readable WhatsApp error codes. Errors use the NestJS default shape, so match on
-`statusCode` (above) and read `message` for the human-readable cause:
+`statusCode` (above) and read `message` for the human-readable cause. A few refusals also carry a stable
+`code` (see the error response section of docs/06):
 
 ```json
 {

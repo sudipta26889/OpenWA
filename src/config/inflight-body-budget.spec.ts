@@ -479,6 +479,26 @@ describe('stall reaper', () => {
     expect(budget.currentBytes()).toBe(0);
   });
 
+  it('reaps a body that stops after part of it arrived, long before the pace check would', () => {
+    // 10 MiB of a 20 MiB body lands in the first seconds and then nothing does. The pace the request
+    // timeout allows is still far below what has arrived, so only the stall rule can release it.
+    const budget = createInflightBodyBudget(100 * MB, { perClientShare: 1 });
+    const req = makeReq({ 'content-length': String(20 * MB) });
+    run(budget, req);
+    const socket = (req as unknown as { socket: { bytesRead: number } }).socket;
+
+    jest.advanceTimersByTime(1_000);
+    socket.bytesRead = 10 * MB;
+    jest.advanceTimersByTime(5_000);
+    expect(destroyMock(req)).not.toHaveBeenCalled();
+    expect(budget.currentBytes()).toBe(20 * MB);
+
+    // 15 s of silence since the poll that saw the last byte, plus one poll to notice it.
+    jest.advanceTimersByTime(25_000);
+    expect(destroyMock(req)).toHaveBeenCalledTimes(1);
+    expect(budget.currentBytes()).toBe(0);
+  });
+
   it('does not reap a connection that keeps making progress, and keeps its declared size', () => {
     const budget = createInflightBodyBudget(1000, { perClientShare: 1 });
     const req = makeReq({ 'content-length': '400' });

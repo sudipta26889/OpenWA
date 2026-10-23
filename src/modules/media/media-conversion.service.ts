@@ -40,10 +40,10 @@ export class MediaConversionService implements OnApplicationShutdown {
    */
   private binaryAvailable?: Promise<boolean>;
   /**
-   * Bounds concurrent ffmpeg processes (the rate limiter caps admission per second, not how many
-   * long-running processes stack up while each runs toward its timeout). Queue depth is a small
-   * multiple of the cap: each parked task holds its input buffer in heap, so anything beyond it
-   * answers 503 instead of accumulating.
+   * Bounds concurrent conversions, input load included (the rate limiter caps admission per second,
+   * not how many long-running processes stack up while each runs toward its timeout). Queue depth is
+   * a small multiple of the cap, so anything beyond it answers 503 instead of accumulating; a parked
+   * request holds only its own body, and at most the cap's worth of inputs sit in heap at once.
    */
   private readonly ffmpegGate: ConcurrencyLimiter;
 
@@ -97,16 +97,20 @@ export class MediaConversionService implements OnApplicationShutdown {
     outputMimetype: string,
   ): Promise<ConvertedMedia> {
     await this.assertAvailable();
-    const input = await this.resolveInput(sessionId, dto);
 
     try {
-      const output = await this.ffmpegGate.run(() =>
-        runFfmpeg(input, 'bin', outputExtension, encodeArgs, {
+      // The input is loaded inside the gate: a download of up to MEDIA_DOWNLOAD_MAX_BYTES, or a decoded
+      // base64 body, held for each request that had not yet reached a slot, would stack 50 MiB a request
+      // in heap while the gate answers 503 only after the downloads finished.
+      const { input, output } = await this.ffmpegGate.run(async () => {
+        const loaded = await this.resolveInput(sessionId, dto);
+        const converted = await runFfmpeg(loaded, 'bin', outputExtension, encodeArgs, {
           ffmpegPath: this.configService.get<string>('mediaConversion.ffmpegPath', 'ffmpeg'),
           timeoutMs: this.configService.get<number>('mediaConversion.timeoutMs', 60_000),
           maxOutputBytes: this.configService.get<number>('mediaConversion.maxOutputBytes', 50 * 1024 * 1024),
-        }),
-      );
+        });
+        return { input: loaded, output: converted };
+      });
       this.logger.log('Media converted', { inputBytes: input.length, outputBytes: output.length, outputMimetype });
       return { base64: output.toString('base64'), mimetype: outputMimetype, bytes: output.length };
     } catch (error) {

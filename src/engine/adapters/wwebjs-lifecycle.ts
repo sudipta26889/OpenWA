@@ -16,7 +16,7 @@ import { resolveWebVersionPin } from '../wa-web-version';
 import { resolveAuthTimeoutMs, resolveEngineInitTimeoutMs } from '../engine-init-timeout';
 import { killOrphanedChromiumProcesses, removeStaleSingletonFiles } from './chromium-profile-hygiene';
 import { isSupportedProxyUrl, buildProxyLaunchConfig } from './wwebjs-proxy';
-import { BACKPORT_MISSING_MESSAGE, isBackportMissing } from './wwebjs-backport-check';
+import { backportProblem } from './wwebjs-backport-check';
 import { unappliedPatches, unappliedPatchesMessage } from './engine-patch-status';
 import { type EvaluatablePage, reportMissingCallHook } from './wwebjs-call-hook-check';
 import { reportRunningWebBuild } from './wwebjs-running-build';
@@ -276,8 +276,9 @@ export class WwebjsLifecycle {
 
     // An install that skipped the message-id backport fails later with errors that name no cause
     // (#889) — say so here instead, while the operator is still looking at the startup logs.
-    if (isBackportMissing()) {
-      this.host.logger.error(BACKPORT_MISSING_MESSAGE);
+    const backportProblemText = backportProblem();
+    if (backportProblemText) {
+      this.host.logger.error(backportProblemText);
     }
 
     // The other whatsapp-web.js patchers fail the same way and were equally silent about it.

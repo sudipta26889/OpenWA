@@ -23,6 +23,24 @@ function client(transport: MockTransport): OpenWAClient {
 }
 
 describe('OpenWAClient', () => {
+  // A client that is logged, inspected or captured by an error tracker while a call is debugged must not
+  // write its bearer-equivalent key out.
+  it('does not show the API key when the client is printed or serialized', () => {
+    const secret = 'owa_k1_do_not_print';
+    const printed = new OpenWAClient({ baseUrl: 'http://localhost:2785', apiKey: secret });
+
+    // What a logger, util.inspect and an error tracker walk is the enumerable own properties.
+    const seen = new Set<unknown>();
+    const reachable = (value: unknown): boolean => {
+      if (typeof value === 'string') return value.includes(secret);
+      if (typeof value !== 'object' || value === null || seen.has(value)) return false;
+      seen.add(value);
+      return Object.values(value).some(reachable);
+    };
+    expect(reachable(printed)).toBe(false);
+    expect(Object.getOwnPropertyDescriptor(printed, 'config')?.enumerable).toBe(false);
+  });
+
   it('requires baseUrl and apiKey', () => {
     expect(() => new OpenWAClient({ baseUrl: '', apiKey: 'x' })).toThrow();
     expect(() => new OpenWAClient({ baseUrl: 'http://x', apiKey: '' })).toThrow();
@@ -416,6 +434,55 @@ describe('OpenWAClient', () => {
         () => new OpenWAClient({ baseUrl: 'http://localhost', apiKey: 'k', timeoutMs: timeoutMs as unknown as number }),
       ).toThrow(TypeError);
     }
+  });
+
+  it('trims a key read from a file, and refuses what fetch cannot send without repeating it', async () => {
+    const t = new MockTransport().on('GET', '/api/sessions', { body: [] });
+    const c = new OpenWAClient({ baseUrl: 'http://x', apiKey: ' owa_k1_secret\n', fetch: t.asFetch() });
+    await c.sessions.list();
+    expect(t.lastCall!.headers['x-api-key']).toBe('owa_k1_secret');
+
+    // An inner space is part of a passphrase key and is sent as it is.
+    const spaced = new OpenWAClient({ baseUrl: 'http://x', apiKey: 'correct horse battery', fetch: t.asFetch() });
+    await spaced.sessions.list();
+    expect(t.lastCall!.headers['x-api-key']).toBe('correct horse battery');
+
+    for (const bad of ['owa_k1_se\ncret', 'owa_k1_se\u0000cret', 'owa_k1_s\u2603cret']) {
+      let message = '';
+      try {
+        new OpenWAClient({ baseUrl: 'http://x', apiKey: bad });
+      } catch (error) {
+        message = String((error as Error).message);
+      }
+      expect(message).toContain('apiKey');
+      expect(message).not.toContain('cret');
+    }
+    expect(() => new OpenWAClient({ baseUrl: 'http://x', apiKey: '  \n' })).toThrow('apiKey is required');
+  });
+
+  it('refuses a default header value fetch cannot send, naming the header and not the value', () => {
+    for (const [name, value] of [
+      ['CF-Access-Client-Secret', 's3cret-token\nX-Injected: 1'],
+      ['X-Trace', 'a\u0000b'],
+      ['X-Name', 'snow\u2603'],
+    ]) {
+      let message = '';
+      try {
+        new OpenWAClient({ baseUrl: 'http://x', apiKey: 'k', defaultHeaders: { [name]: value } });
+      } catch (error) {
+        message = String((error as Error).message);
+      }
+      expect(message).toContain(`"${name}"`);
+      expect(message).not.toContain(value);
+    }
+    // A tab, printable ASCII and a Latin-1 character are sent as before, and a line break at either end of a
+    // value read from a file is what fetch trims.
+    expect(
+      () => new OpenWAClient({ baseUrl: 'http://x', apiKey: 'k', defaultHeaders: { 'X-Trace': 'a\tb caf\u00e9' } }),
+    ).not.toThrow();
+    expect(
+      () => new OpenWAClient({ baseUrl: 'http://x', apiKey: 'k', defaultHeaders: { 'X-Proxy-Token': 'tok\n' } }),
+    ).not.toThrow();
   });
 
   it('keeps X-API-Key winning over defaultHeaders', async () => {

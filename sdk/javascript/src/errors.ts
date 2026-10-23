@@ -95,7 +95,7 @@ export class OpenWAAuthError extends OpenWAApiError {}
 export class OpenWAForbiddenError extends OpenWAApiError {}
 /** 404 Not Found. */
 export class OpenWANotFoundError extends OpenWAApiError {}
-/** 409 Conflict — typically an {@link EngineNotReadyError} from the backend. */
+/** 409 Conflict: a conflicting state, typically a session that is not ready for the operation, or a keyed send that is pending or may already have been sent (see `code`). */
 export class OpenWAConflictError extends OpenWAApiError {}
 /**
  * 429 Too Many Requests: rate limited. The global rate limiter's 429 lifts when its window

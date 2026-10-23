@@ -1,4 +1,6 @@
 import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 
 // StorageService (imported transitively by the infra controllers) pulls in `archiver`
 // v8, which is ESM-only and cannot be parsed by ts-jest. The controller logic
@@ -22,6 +24,13 @@ jest.mock('fs', () => {
   };
 });
 
+// The save guard probes the storage root the way the boot does, which creates the directory. Keep a save
+// in a test from making one in the working tree; the cases that need the real probe ask for it.
+jest.mock('../../config/storage-root', () => {
+  const actual = jest.requireActual<typeof import('../../config/storage-root')>('../../config/storage-root');
+  return { ...actual, resolveStorageRoot: jest.fn((options: { configured?: string }) => options.configured ?? '') };
+});
+
 import { BadRequestException } from '@nestjs/common';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
@@ -29,6 +38,7 @@ import { InfraConfigController } from './infra-config.controller';
 import { SaveConfigDto } from './dto/save-config.dto';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { recordOsEnvKeys, recordPinnedEnvKeys } from '../../config/env-precedence';
+import { resolveStorageRoot } from '../../config/storage-root';
 
 // With no boot snapshot every process.env key counts as host-supplied, so a shell exporting the
 // CI Postgres or compose Redis settings would otherwise feed the save guard and the pin checks.
@@ -66,6 +76,120 @@ describe('InfraConfigController.saveConfig SSL reject-unauthorized', () => {
   it('omits DATABASE_SSL_REJECT_UNAUTHORIZED when SSL is disabled', () => {
     const env = writtenEnv({ database: { type: 'postgres', sslEnabled: false, password: 'unit-test-pw' } });
     expect(env).not.toContain('DATABASE_SSL_REJECT_UNAUTHORIZED');
+  });
+});
+
+// The saved file is loaded by the next boot, whose validation refuses these values and crash-loops the
+// instance, with the dashboard that could undo the save down.
+describe('InfraConfigController.saveConfig values the next boot refuses', () => {
+  const newController = () => new InfraConfigController({} as never, {} as never, {} as never);
+  const external = { type: 'postgres', builtIn: false, host: 'db', username: 'u', password: 'unit-test-pw' };
+
+  it.each([
+    ['a database port that is not a number', { database: { ...external, port: 'abc' } }],
+    ['a database port above 65535', { database: { ...external, port: '99999' } }],
+    ['a database port of zero', { database: { ...external, port: '0' } }],
+    ['a negative pool size', { database: { ...external, poolSize: -5 } }],
+    ['a fractional pool size', { database: { ...external, poolSize: 1.5 } }],
+    ['a redis port that is not a number', { redis: { enabled: true, host: 'cache', port: 'x' } }],
+  ])('refuses %s instead of writing it', (_label, config) => {
+    (fs.writeFileSync as jest.Mock).mockClear();
+
+    expect(() => newController().saveConfig(config as never)).toThrow(BadRequestException);
+    expect(fs.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it('writes a blank host and user as the defaults and trims a padded port', () => {
+    (fs.writeFileSync as jest.Mock).mockClear();
+
+    newController().saveConfig({
+      database: {
+        type: 'postgres',
+        builtIn: false,
+        host: '   ',
+        port: ' 5433 ',
+        username: '  ',
+        password: 'unit-test-pw',
+      },
+    } as never);
+
+    const content = ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>)[0][1];
+    expect(content).toContain('DATABASE_HOST=localhost');
+    expect(content).toContain('DATABASE_PORT=5433');
+    expect(content).toContain('DATABASE_USERNAME=postgres');
+  });
+});
+
+// The next boot refuses to start on a media root the app cannot create or write, before Nest builds, and
+// the dashboard that could undo the save is down with it.
+describe('InfraConfigController.saveConfig local storage path', () => {
+  const newController = () => new InfraConfigController({} as never, {} as never, {} as never);
+  const actual = jest.requireActual<typeof import('../../config/storage-root')>('../../config/storage-root');
+  const useRealProbe = () => (resolveStorageRoot as jest.Mock).mockImplementationOnce(actual.resolveStorageRoot);
+  // A parent that is a file, so the directory cannot be created whoever runs the test.
+  const unwritable = '/dev/null/openwa-media';
+  const localAt = (localPath: string) => ({ storage: { type: 'local', localPath } }) as never;
+
+  beforeEach(() => {
+    (fs.writeFileSync as jest.Mock).mockClear();
+    (resolveStorageRoot as jest.Mock).mockClear();
+  });
+
+  it('refuses a path the app cannot create, and writes nothing', () => {
+    useRealProbe();
+
+    expect(() => newController().saveConfig(localAt(unwritable))).toThrow(BadRequestException);
+    expect(fs.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it('names the submitted path, not where it resolves to', () => {
+    // Relative, under a regular file (this one), so its absolute form carries the working directory.
+    const relative = path.relative(process.cwd(), path.join(__filename, 'media'));
+    useRealProbe();
+
+    let message = '';
+    try {
+      newController().saveConfig(localAt(relative));
+    } catch (error) {
+      message = (error as Error).message;
+    }
+
+    expect(message).toContain(`storage path '${relative}'`);
+    expect(message).not.toContain(process.cwd());
+  });
+
+  it('saves a path the app can write', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'openwa-storage-'));
+    try {
+      useRealProbe();
+
+      newController().saveConfig(localAt(path.join(root, 'media')));
+
+      const content = ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>)[0][1];
+      expect(content).toContain(`STORAGE_LOCAL_PATH=${path.join(root, 'media')}`);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not judge a path that a value pinned by the host outranks', () => {
+    // With no boot snapshot recorded, every key in the environment counts as host-supplied.
+    process.env.STORAGE_LOCAL_PATH = '/srv/openwa/media';
+    try {
+      newController().saveConfig(localAt(unwritable));
+
+      expect(resolveStorageRoot).not.toHaveBeenCalled();
+      expect(fs.writeFileSync).toHaveBeenCalledTimes(1);
+    } finally {
+      delete process.env.STORAGE_LOCAL_PATH;
+    }
+  });
+
+  it('leaves a save that names no path alone', () => {
+    newController().saveConfig({ queue: { enabled: false } });
+
+    expect(resolveStorageRoot).not.toHaveBeenCalled();
+    expect(fs.writeFileSync).toHaveBeenCalledTimes(1);
   });
 });
 

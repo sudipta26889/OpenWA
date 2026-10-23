@@ -1,5 +1,7 @@
 # OpenWA Go SDK
 
+This document describes `main`. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name are unreleased additions after SDK 0.5.1 and require the corresponding server changes after OpenWA 0.24.0.
+
 Idiomatic Go client for the [OpenWA](https://github.com/rmyndharis/OpenWA) WhatsApp
 API Gateway. Stdlib-only (no dependencies), context-first, with typed errors and
 an injectable transport pipeline.
@@ -12,17 +14,6 @@ go get github.com/rmyndharis/OpenWA/sdk/go
 ```
 
 Requires Go 1.22+.
-
-This README describes `main`. The v0.5.0 release lacks, among other additions,
-`Sessions.GetProxy`, `Sessions.UpdateProxy`, `Messages.ClickButton`,
-`VerifyWebhookSignature`, the `WebhookDelivery` type, the `ListSessionsQuery.Name`
-filter, the `After` and `InlineMedia` fields of `ListMessagesQuery`, the
-`Archived`, `Pinned`, `Muted` and `MuteExpiration` fields of `ChatSummary`, the
-`Order` and `Product` fields of `ChatHistoryMessage`, the `APIError` fields
-`Code`, `RetryAfter` and `Header`, the refusal of empty and dot ids and the
-refusal of a `Do` path that does not begin with `/`; they ship with the next SDK
-release. See
-[the SDK overview](../README.md#coverage).
 
 ## Quick start
 
@@ -53,7 +44,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Link the account before sending: scan Sessions.QRCode or use Sessions.RequestPairingCode,
+	// Link the account before sending: scan Sessions.QRCode (or use Sessions.RequestPairingCode for a number with no linked session),
 	// then wait for status "ready". An unlinked session answers the send with 409.
 	res, err := client.Messages.SendText(ctx, session.ID, openwa.SendTextRequest{
 		ChatID: "628123456789@c.us",
@@ -105,7 +96,10 @@ func main() {
 res, err := client.Messages.SendText(ctx, sessionID, req)
 switch {
 case errors.Is(err, openwa.ErrConflict):
-	// 409 — engine not ready; retry once the session is "ready".
+	// 409 — a conflicting state, typically a session that is not "ready" yet:
+	// retry once it is. A keyed send can also answer 409 for a pending or
+	// uncertain outcome; APIError.Code tells them apart ("Send idempotency"
+	// below says what to do).
 case errors.Is(err, openwa.ErrNotFound):
 	// 404 — unknown session/resource.
 case err != nil:
@@ -264,10 +258,10 @@ subdirectory rather than at the repository root:
 
 ```bash
 # Correct — `sdk/go/` prefix, matching `module github.com/rmyndharis/OpenWA/sdk/go`
-git tag sdk/go/v0.5.0 && git push origin sdk/go/v0.5.0
+git tag sdk/go/v0.5.1 && git push origin sdk/go/v0.5.1
 ```
 
-A bare `v0.5.0` tag is the _app_ version and does nothing for this module.
+A bare `v0.5.1` tag is the _app_ version and does nothing for this module.
 Without a prefixed tag, `go get` resolves a pseudo-version
 (`v0.0.0-<date>-<commit>`) — usable, but callers cannot pin a release.
 
@@ -283,3 +277,16 @@ Cutting a release:
 > take it back, and the only remedy is to publish a higher version (and, if the
 > bad one must be discouraged, a `retract` directive in `go.mod`). Tag a commit
 > that is already green on `main`.
+
+## Send idempotency
+
+The example below requires the unreleased SDK changes on `main`; SDK 0.5.1 does not expose this per-send key argument. The server must also include the send idempotency changes after OpenWA 0.24.0.
+
+Supply a unique caller-owned key for one logical send and reuse it when retrying that same call. Keys contain 1-255 visible ASCII characters; unrelated calls must use different keys. The SDK forwards the key without changing its retry policy or generating one automatically. On the twelve routes below `net/http` may still send a keyed request once more after a dropped keep-alive connection; the gateway deduplicates it, so the call returns the first answer or a `409` `IDEMPOTENCY_KEY_IN_PROGRESS` to retry later with the same key.
+
+```go
+ctx := openwa.WithIdempotencyKey(context.Background(), "order-123")
+_, err := client.Messages.SendText(ctx, sessionID, openwa.SendTextRequest{ChatID: "628123@c.us", Text: "Hello"})
+```
+
+The gateway supports text, image, video, audio, document, sticker, location, contact, template, poll, reply and forward sends. Completed calls replay their response; a 409 with the error `code` `IDEMPOTENCY_KEY_IN_PROGRESS` means the first request is still running, so retry with the same key later; a 409 `IDEMPOTENCY_OUTCOME_UNKNOWN` means the message may have been sent, so check the chat and, if it did not arrive, send again with a new key (the `code` tells them apart from the 409 for a session that is not connected). A changed request with the same key returns 422. The gateway retains keys for 24 hours. Bulk, product and button operations have no such guarantee. Omit the key to preserve existing behavior.

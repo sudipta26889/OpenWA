@@ -70,6 +70,37 @@ describe('MediaConversionService', () => {
   });
   afterEach(() => jest.restoreAllMocks());
 
+  describe('input load', () => {
+    // A download resolved before the gate was a 50 MiB buffer for every request that had not reached a
+    // slot, held until the gate answered 503: peak memory was the number of requests, not the cap.
+    it('downloads at most as many inputs at once as it converts', async () => {
+      let downloading = 0;
+      let peak = 0;
+      jest.spyOn(loadRemoteMedia, 'loadRemoteMediaBuffer').mockImplementation(async () => {
+        downloading++;
+        peak = Math.max(peak, downloading);
+        await new Promise(resolve => setTimeout(resolve, 15));
+        downloading--;
+        return { data: Buffer.from('input'), mimetype: 'audio/mpeg' };
+      });
+      runFfmpeg.mockImplementation(async () => {
+        await new Promise(resolve => setTimeout(resolve, 15));
+        return Buffer.from('converted-bytes');
+      });
+      const service = makeService(config({ 'mediaConversion.concurrency': 2 }));
+
+      const outcomes = await Promise.allSettled(
+        Array.from({ length: 30 }, () => service.convertToVoice(SESSION, { url: 'https://media.example/a.mp3' })),
+      );
+
+      expect(peak).toBeLessThanOrEqual(2);
+      expect(outcomes.filter(o => o.status === 'fulfilled')).toHaveLength(10);
+      const refused = outcomes.filter((o): o is PromiseRejectedResult => o.status === 'rejected');
+      expect(refused).toHaveLength(20);
+      expect(refused.every(o => o.reason instanceof ServiceUnavailableException)).toBe(true);
+    });
+  });
+
   describe('availability', () => {
     it('refuses with 503 when conversion is switched off, without probing for the binary', async () => {
       const service = makeService(config({ 'mediaConversion.enabled': false }));

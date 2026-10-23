@@ -162,7 +162,8 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
       inject: [ConfigService],
       // The postgres branch runs its boot migrations under a cross-replica advisory lock inside
       // this factory (see pg-boot-migrations.ts) instead of TypeORM's unsynchronized built-in
-      // migrationsRun; the sqlite branches keep the library's default construction + initialize.
+      // migrationsRun; SQLite with synchronize is initialized there too, to deduplicate terminal webhook
+      // failures before the schema sync, and other sqlite options keep the library's default path.
       dataSourceFactory: createBootDataSource,
       useFactory: (configService: ConfigService) => {
         const dbType = configService.get<'sqlite' | 'postgres'>('dataDatabase.type', 'sqlite');

@@ -1,13 +1,79 @@
-import { resolveNonNegativeIntEnv } from '../../config/configuration';
-import { redisConnectionOptions, type RedisConnectionOptions } from '../../config/redis-options';
+import type { Queue } from 'bullmq';
+import { MAX_TIMER_MS, resolveNonNegativeIntEnv } from '../../config/configuration';
+import {
+  DEFAULT_REDIS_CONNECT_TIMEOUT_MS,
+  redisConnectionOptions,
+  type RedisConnectionOptions,
+} from '../../config/redis-options';
+
+/** Upper bound for one producer command once connected. Same bound as the throttler's Redis client. */
+export const QUEUE_COMMAND_TIMEOUT_MS = 2000;
 
 /**
  * BullMQ connection for the shared producer (`BullModule.forRootAsync` in queue.module.ts): the common
- * Redis fields plus `enableOfflineQueue: false`, so `queue.add()` fails fast when Redis is unreachable
- * and the dispatch path can fall back to direct delivery instead of buffering forever.
+ * Redis fields plus `enableOfflineQueue: false`, so once connected, `queue.add()` fails fast when Redis
+ * drops and the dispatch path can fall back to direct delivery instead of buffering forever. Before the
+ * first connect that option never applies: see producerReady.
+ *
+ * `commandTimeout` covers the other failure: a Redis that stays connected and stops answering (a
+ * network partition, a frozen process). Nothing is rejected then, so without a deadline the add of a
+ * delivery or a job lookup never settles, the dispatch slot or the ingress request holding it never
+ * frees, and the direct-delivery fallback never runs. The Worker connection below must not inherit it:
+ * its blocking commands wait on Redis by design.
  */
-export function queueConnectionOptions(): RedisConnectionOptions & { enableOfflineQueue: false } {
-  return { ...redisConnectionOptions(), enableOfflineQueue: false };
+export function queueConnectionOptions(): RedisConnectionOptions & {
+  enableOfflineQueue: false;
+  commandTimeout: number;
+} {
+  return { ...redisConnectionOptions(), enableOfflineQueue: false, commandTimeout: QUEUE_COMMAND_TIMEOUT_MS };
+}
+
+/**
+ * How long producerReady waits for a producer queue's first connect: REDIS_CONNECT_TIMEOUT_MS, or the
+ * default when it is 0 (see producerReady), capped at MAX_TIMER_MS. Above that a Node timer fires after
+ * 1 ms, which would bypass a healthy Redis at boot. Node truncates ioredis's socket connect timeout to
+ * the same ceiling.
+ */
+export function producerConnectWaitMs(): number {
+  return Math.min(redisConnectionOptions().connectTimeout || DEFAULT_REDIS_CONNECT_TIMEOUT_MS, MAX_TIMER_MS);
+}
+
+/** Per producer queue: whether its first connect has landed, and the shared wait for it. */
+const firstConnects = new WeakMap<object, { connected: boolean; wait: Promise<void> }>();
+
+/**
+ * Resolve once a producer queue has connected; reject if its first connect has not landed within
+ * REDIS_CONNECT_TIMEOUT_MS of the first call. Until that connect, BullMQ holds every queue call without
+ * sending a command, and its default retry strategy never gives up, so with Redis unreachable since
+ * boot a call never settles. Await this before each producer call so the caller's fallback runs
+ * instead. The wait is opened once per queue and shared: calls inside that window wait for its end,
+ * later calls reject at once until Redis connects (each call subscribing to BullMQ's pending connect
+ * would hold memory until it lands), and any call after a connect resolves at once. A setting of 0
+ * (no socket connect timeout in ioredis) still opens a window of the default: rejecting at once would
+ * bypass a healthy queue during startup, and waiting forever would bring the hang back. The window's
+ * timer is unref'd, so a wait still open at shutdown never holds the process alive.
+ */
+export async function producerReady(queue: Pick<Queue, 'waitUntilReady'>): Promise<void> {
+  let first = firstConnects.get(queue);
+  if (!first) {
+    const timeoutMs = producerConnectWaitMs();
+    const ready = queue.waitUntilReady();
+    let timer: NodeJS.Timeout | undefined;
+    const wait = Promise.race([
+      ready,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`Redis has not connected within ${timeoutMs}ms`)), timeoutMs);
+        timer.unref();
+      }),
+    ]).finally(() => clearTimeout(timer));
+    const entry = { connected: false, wait };
+    ready.then(
+      () => (entry.connected = true),
+      () => undefined,
+    );
+    firstConnects.set(queue, (first = entry));
+  }
+  if (!first.connected) await first.wait;
 }
 
 /**

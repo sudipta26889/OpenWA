@@ -3,6 +3,7 @@ import { HttpAdapterHost } from '@nestjs/core';
 import { ToolRegistryService } from '../../core/agent-tools/tool-registry.service';
 import { AuthService } from '../auth/auth.service';
 import { AuditService } from '../audit/audit.service';
+import { ChatScopeService } from '../auth/chat-scope.service';
 import { OAuthService } from '../oauth/oauth.service';
 import { KeyRateLimiter, readRateLimitConfig, readIpRateLimitConfig } from './mcp-rate-limit';
 import { mountMcpServer, type McpOAuthBridge } from './mcp.server';
@@ -24,6 +25,7 @@ export class McpModule implements NestModule {
     private readonly httpAdapterHost: HttpAdapterHost,
     // AuditModule is @Global(), so AuditService is injectable here without an explicit import.
     private readonly auditService: AuditService,
+    private readonly chatScope: ChatScopeService,
     // Present only when OAUTH_ENABLED loads the (global) OAuthModule; undefined otherwise.
     @Optional() private readonly oauthService?: OAuthService,
   ) {}
@@ -67,6 +69,7 @@ export class McpModule implements NestModule {
       ipRateLimiter,
       { basePath, serverInfo, oauth },
       this.auditService,
+      this.chatScope,
     );
   }
 }

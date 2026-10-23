@@ -9,16 +9,16 @@
 > default** and **purely additive**: when disabled, none of its code (or the MCP SDK)
 > is loaded and every REST route behaves exactly as before.
 
-| Component                                    | Status         | Location                                             |
-| -------------------------------------------- | -------------- | ---------------------------------------------------- |
-| **Tool registry (`ToolDescriptor`)**         | ✅ Implemented | `src/core/agent-tools/tool-descriptor.ts`            |
-| **Tool invoker (auth → validate → service)** | ✅ Implemented | `src/core/agent-tools/tool-invoker.ts`               |
-| **Registry service**                         | ✅ Implemented | `src/core/agent-tools/tool-registry.service.ts`      |
-| **Curated tool tables (51 tools)**           | ✅ Implemented | `src/core/agent-tools/tools/*.tools.ts`              |
-| **MCP transport adapter**                    | ✅ Implemented | `src/modules/mcp/mcp.server.ts`                      |
-| **Opt-in module gate**                       | ✅ Implemented | `src/modules/mcp/mcp.module.ts`, `src/app.module.ts` |
-| **Per-key rate limiter**                     | ✅ Implemented | `src/modules/mcp/mcp-rate-limit.ts`                  |
-| **Result shaping (smart/json)**              | ✅ Implemented | `src/modules/mcp/tool-result.ts`                     |
+| Component                                                                 | Status         | Location                                             |
+| ------------------------------------------------------------------------- | -------------- | ---------------------------------------------------- |
+| **Tool registry (`ToolDescriptor`)**                                      | ✅ Implemented | `src/core/agent-tools/tool-descriptor.ts`            |
+| **Tool invoker (auth → chat gate → validate → chat arguments → service)** | ✅ Implemented | `src/core/agent-tools/tool-invoker.ts`               |
+| **Registry service**                                                      | ✅ Implemented | `src/core/agent-tools/tool-registry.service.ts`      |
+| **Curated tool tables (51 tools)**                                        | ✅ Implemented | `src/core/agent-tools/tools/*.tools.ts`              |
+| **MCP transport adapter**                                                 | ✅ Implemented | `src/modules/mcp/mcp.server.ts`                      |
+| **Opt-in module gate**                                                    | ✅ Implemented | `src/modules/mcp/mcp.module.ts`, `src/app.module.ts` |
+| **Per-key rate limiter**                                                  | ✅ Implemented | `src/modules/mcp/mcp-rate-limit.ts`                  |
+| **Result shaping (smart/json)**                                           | ✅ Implemented | `src/modules/mcp/tool-result.ts`                     |
 
 | Capability                        | Status         | Notes                                                                 |
 | --------------------------------- | -------------- | --------------------------------------------------------------------- |
@@ -86,7 +86,7 @@ flowchart LR
     Client[MCP client] -->|POST /mcp| Adapter
     subgraph Core["src/core/agent-tools (SDK-free)"]
         Registry[ToolRegistryService<br/>51 ToolDescriptors]
-        Invoker[invokeTool<br/>auth → validate → handler]
+        Invoker[invokeTool<br/>auth → chat gate → validate → chat arguments → handler]
     end
     subgraph Adapter["src/modules/mcp (SDK, opt-in)"]
         Server[StreamableHTTP transport]
@@ -105,17 +105,22 @@ otherwise refuses, gets an HTTP error with a JSON-RPC body (`401` carries
 `WWW-Authenticate: Bearer`) and an `API_KEY_AUTH_FAILED` audit row (a missing or unknown
 key's row is capped at 10 per client IP a minute, a budget shared with REST and the queue
 dashboard), and no MCP method runs.
-Past the gate, a tool call flows through four steps, in this order:
+Past the gate, a tool call flows through five steps, in this order:
 
 1. **Key extraction.** The adapter reads the API key from the `X-API-Key` header or
    `Authorization: Bearer …`.
 2. **Authentication.** `invokeTool` calls `AuthService.validateApiKey()` — the _same_
    method the REST `ApiKeyGuard` uses — which enforces validity, expiry, the per-session
    `allowedSessions` scope, and the IP allow-list (fail-closed). Then `hasPermission()`
-   enforces the tool's required role. Auth runs **before** the handler.
+   enforces the tool's required role. A key restricted to selected chats may then run only
+   a tool that carries a chat scope (`403` otherwise). Auth runs **before** the handler.
 3. **Validation.** The tool's Zod input schema validates the arguments (a failure maps to
-   a `400`-style error), exactly bounding what reaches the service.
-4. **Execution.** The handler calls the existing service method and shapes the result
+   a `400`-style error), exactly bounding what reaches the service. A NUL character in the
+   input is refused the same way.
+4. **Chat arguments.** For a chat-restricted key, each chat argument of the tool, read from
+   the parsed values, must name a chat inside the key's allowlist, and a `quotedMessageId`
+   is refused unless the tool allows one (`403`).
+5. **Execution.** The handler calls the existing service method and shapes the result
    through the same response DTO the REST controller uses (so no field is exposed over MCP
    that REST hides).
 
@@ -201,10 +206,7 @@ only when an agent genuinely needs to send messages / mutate state.
 - **Do not expose `/mcp` to the public internet** without a fronting authentication proxy.
   The static API key is appropriate for a self-hosted, locally/network-reached deployment;
   public exposure should wait for OAuth 2.1 support (planned).
-- **Chat-restricted keys are refused.** A key carrying `allowedChats` gets an `isError` tool
-  result naming `ForbiddenException` ("API key is restricted to selected chats") on every tool
-  call, the same default deny REST applies to routes with no chat dimension. Use a session-scoped
-  key for MCP instead.
+- **Chat-restricted keys use the REST chat fence.** Message, contact, presence, label membership, and group detail/settings tools authorize their chat arguments against `allowedChats`, including persisted phone/LID aliases. Forwarding requires both chats to be allowed. Message listing requires an explicit chat; chat, contact, group, and label chat lists filter the complete result before pagination. Ordinary send quotes are refused; `MessageReply` resolves its quote inside the authorized chat. Account-wide tools without a chat fence remain refused, including session discovery/statistics, webhook management, and group creation/invites. `SessionFindOne` remains available within `allowedSessions`. Rejections return an `isError` tool result with `ForbiddenException`; role and session restrictions still apply.
 - **IP-restricted keys are refused.** The `/mcp` gate cannot check the client address, so a key
   with `allowedIps` gets `403` on every request. Use a key without an IP allow-list for MCP.
 
@@ -227,6 +229,7 @@ Keep the blast radius small:
 - Leave `MCP_READONLY` at its default unless the agent must write.
 - Give a read-only agent a `VIEWER` key, and scope every MCP key to the sessions it needs
   (`allowedSessions`).
+- Set `allowedChats` when the client should read or send only selected conversations.
 - When write tools are on, have the MCP client ask a human to confirm each write call.
 
 ## 24.6 Enabling & Client Setup

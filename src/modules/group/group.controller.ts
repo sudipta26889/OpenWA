@@ -108,11 +108,19 @@ export class GroupController {
     return this.groupService.getGroupJoinInfo(sessionId, code);
   }
 
+  // Chat-fenced on `:groupId`: a key restricted to selected chats reads (and rewrites, below) the
+  // settings of a group inside its allowlist and is refused on any other. The roster this route
+  // returns is member-visible data the key can already largely infer from the group's own messages.
+  @ChatScoped('fenced')
   @Get(':groupId')
   @ApiOperation({ summary: 'Get detailed group info' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'groupId', description: 'Group ID (e.g., 120363xxx@g.us)' })
   @ApiResponse({ status: 200, description: 'Group details with participants', type: GroupInfoDto })
+  @ApiResponse({
+    status: 403,
+    description: 'The API key is restricted to selected chats and this group is outside its allowlist.',
+  })
   @ApiResponse({
     status: 503,
     description:
@@ -148,12 +156,17 @@ export class GroupController {
     return { success: true, groupId };
   }
 
+  @ChatScoped('fenced')
   @Get(':groupId/settings')
   @ApiOperation({ summary: 'Get group settings (announce / locked / ephemeral timer)' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'groupId', description: 'Group ID' })
   @ApiResponse({ status: 200, description: 'Group settings', type: GroupSettingsResponseDto })
   @ApiResponse({ status: 404, description: 'Group not found' })
+  @ApiResponse({
+    status: 403,
+    description: 'The API key is restricted to selected chats and this group is outside its allowlist.',
+  })
   @ApiResponse({
     status: 503,
     description: 'WhatsApp did not answer within the request budget — nothing could be read.' + THROTTLED_503,
@@ -164,6 +177,7 @@ export class GroupController {
     return this.groupService.getGroupSettings(sessionId, groupId);
   }
 
+  @ChatScoped('fenced')
   @Put(':groupId/settings')
   @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Update group settings (announce / locked / ephemeral timer)' })
@@ -529,8 +543,9 @@ export class GroupController {
   @ApiResponse({
     status: 400,
     description:
-      'The id does not name a group, the session is not active, neither url nor base64 was supplied, or ' +
-      'the url answers non-2xx, times out or cannot be reached',
+      'The id does not name a group, the session is not active, neither url nor base64 was supplied, ' +
+      'the url answers non-2xx, times out or cannot be reached, or the image cannot be read (Baileys ' +
+      'refuses an SVG)',
   })
   @ApiResponse({ status: 403, description: 'The engine refused the change — admin rights required' })
   @ApiResponse({

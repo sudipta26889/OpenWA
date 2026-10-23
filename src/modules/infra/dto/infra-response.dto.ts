@@ -505,7 +505,8 @@ export class InfraImportDataResponseDto {
     type: [String],
     description:
       'Why the restore was rolled back (per-row failures, a failed session ownership restore, chat-state re-key ' +
-      'or restored-row cleanup, or a backup with no rows). Non-empty only when `imported` is false; non-fatal ' +
+      'or restored-row cleanup, a failed trim of the send idempotency claims, or a backup with no rows). Non-empty ' +
+      'only when `imported` is false; non-fatal ' +
       'messages are in `notices`.',
     example: [],
   })

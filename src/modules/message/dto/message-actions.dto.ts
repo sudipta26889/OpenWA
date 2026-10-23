@@ -15,6 +15,7 @@ import {
 } from 'class-validator';
 import { ToStrictBoolean, ToStrictNumber } from '../../../common/utils/strict-boolean';
 import {
+  CHAT_ID_MAX_LENGTH,
   MENTIONS_DESCRIPTION,
   MENTIONS_MAX,
   MENTION_WID_MAX_LENGTH,
@@ -39,9 +40,10 @@ export const CONTACT_NUMBER_MAX_LENGTH = 30;
 export const REACTION_EMOJI_MAX_LENGTH = 32;
 
 export class SendLocationDto {
-  @ApiProperty({ description: 'Chat ID (e.g. 628123456789@c.us)' })
+  @ApiProperty({ description: 'Chat ID (e.g. 628123456789@c.us)', maxLength: CHAT_ID_MAX_LENGTH })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiProperty({ example: -6.2088 })
@@ -74,9 +76,10 @@ export class SendLocationDto {
 }
 
 export class SendContactDto {
-  @ApiProperty()
+  @ApiProperty({ maxLength: CHAT_ID_MAX_LENGTH })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiProperty({ maxLength: CONTACT_NAME_MAX_LENGTH })
@@ -99,9 +102,10 @@ export class SendContactDto {
 }
 
 export class SendPollDto {
-  @ApiProperty({ description: 'Chat ID (e.g. 628123456789@c.us or 1203630000@g.us)' })
+  @ApiProperty({ description: 'Chat ID (e.g. 628123456789@c.us or 1203630000@g.us)', maxLength: CHAT_ID_MAX_LENGTH })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiProperty({ description: 'Poll question / title', maxLength: 255, example: 'Where should we meet?' })
@@ -145,9 +149,10 @@ export class SendPollDto {
 }
 
 export class ReplyMessageDto {
-  @ApiProperty()
+  @ApiProperty({ maxLength: CHAT_ID_MAX_LENGTH })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiProperty()
@@ -179,14 +184,16 @@ export class ReplyMessageDto {
 }
 
 export class ForwardMessageDto {
-  @ApiProperty()
+  @ApiProperty({ maxLength: CHAT_ID_MAX_LENGTH })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   fromChatId!: string;
 
-  @ApiProperty()
+  @ApiProperty({ maxLength: CHAT_ID_MAX_LENGTH })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   toChatId!: string;
 
   @ApiProperty()
@@ -196,9 +203,10 @@ export class ForwardMessageDto {
 }
 
 export class ReactMessageDto {
-  @ApiProperty()
+  @ApiProperty({ maxLength: CHAT_ID_MAX_LENGTH })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiProperty()
@@ -217,9 +225,10 @@ export class ReactMessageDto {
 }
 
 export class DeleteMessageDto {
-  @ApiProperty()
+  @ApiProperty({ maxLength: CHAT_ID_MAX_LENGTH })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiProperty()
@@ -246,9 +255,10 @@ export class DeleteMessageDto {
 export const PIN_DURATIONS_SECONDS = [86400, 604800, 2592000] as const;
 
 export class PinMessageDto {
-  @ApiProperty()
+  @ApiProperty({ maxLength: CHAT_ID_MAX_LENGTH })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiProperty()
@@ -274,9 +284,10 @@ export class PinMessageDto {
 export const POLL_VOTE_MAX_OPTIONS = 12;
 
 export class VotePollDto {
-  @ApiProperty()
+  @ApiProperty({ maxLength: CHAT_ID_MAX_LENGTH })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiProperty({ description: 'The poll creation message to vote on.' })
@@ -298,9 +309,10 @@ export class VotePollDto {
 }
 
 export class ClickButtonDto {
-  @ApiProperty()
+  @ApiProperty({ maxLength: CHAT_ID_MAX_LENGTH })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiProperty({ description: 'WhatsApp id of the business prompt message that offered the buttons.' })
@@ -332,9 +344,10 @@ export class ClickButtonDto {
 }
 
 export class StarMessageDto {
-  @ApiProperty()
+  @ApiProperty({ maxLength: CHAT_ID_MAX_LENGTH })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiProperty()
@@ -351,9 +364,10 @@ export class StarMessageDto {
 }
 
 export class UnpinMessageDto {
-  @ApiProperty()
+  @ApiProperty({ maxLength: CHAT_ID_MAX_LENGTH })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiProperty()
@@ -363,9 +377,10 @@ export class UnpinMessageDto {
 }
 
 export class EditMessageDto {
-  @ApiProperty()
+  @ApiProperty({ maxLength: CHAT_ID_MAX_LENGTH })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiProperty()

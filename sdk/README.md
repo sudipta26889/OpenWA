@@ -1,5 +1,7 @@
 # OpenWA SDKs
 
+This document describes `main`. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name are unreleased additions after SDK 0.5.1 and require the corresponding server changes after OpenWA 0.24.0.
+
 Official client libraries for [OpenWA](https://github.com/rmyndharis/OpenWA), the
 open-source WhatsApp API Gateway. OpenWA is an independent project, not
 affiliated with or endorsed by WhatsApp or Meta.
@@ -30,7 +32,7 @@ All five SDKs expose the same fluent resource surface:
 | `messages`  | list, sendText, sendImage/Video/Audio/Document/Sticker, sendLocation, sendContact, sendTemplate, sendPoll, reply, clickButton, forward, react, delete, editMessage, history, reactions, media, pin, unpin, star, votePoll, sendBulk, batchStatus, cancelBatch                              |
 | `contacts`  | list, get, check, profilePicture, profilePictures, phone, upsert, delete, block, unblock, listBlocked                                                                                                                                                                                      |
 | `groups`    | list, get, create, joinGroup, joinInfo, add/remove/promote/demoteParticipants, setSubject, setDescription, get/updateGroupSettings, leave, getPicture, setPicture, deletePicture, inviteCode, revokeInviteCode, getMembershipRequests, approveMembershipRequests, rejectMembershipRequests |
-| `webhooks`  | list, listAll, deliveryFailures, get, create, update, delete, test                                                                                                                                                                                                                         |
+| `webhooks`  | list, listAll, deliveryFailures, redriveDeliveryFailures, get, create, update, delete, test                                                                                                                                                                                                |
 | `chats`     | list, markRead, markUnread, archive, pin, mute, clearMessages, delete, sendState, subscribePresence, getPresence                                                                                                                                                                           |
 | `labels`    | list, get, chats, forChat, upsert, delete, addToChat, removeFromChat _(WhatsApp Business)_                                                                                                                                                                                                 |
 | `channels`  | list, get, messages, create, delete, mute, subscribe, unsubscribe, demoteAdmin, transferOwnership _(Newsletters)_                                                                                                                                                                          |
@@ -43,31 +45,6 @@ All five SDKs expose the same fluent resource surface:
 | `media`     | conversionStatus, convertVoice _(OPERATOR)_, convertVideo _(OPERATOR)_                                                                                                                                                                                                                     |
 | `health`    | check, live, ready                                                                                                                                                                                                                                                                         |
 | `auth`      | validate (`client.auth()`; `client.Auth.Validate` in Go)                                                                                                                                                                                                                                   |
-
-The table describes `main`. The 0.5.0 registry builds do not include
-`sessions.getProxy`, `sessions.updateProxy` or `messages.clickButton`
-(`get_proxy`, `update_proxy` and `click_button` in Python; `GetProxy`,
-`UpdateProxy` and `ClickButton` in Go); they ship with the next SDK release.
-The webhook signature helpers (`verifyWebhookSignature`,
-`verify_webhook_signature`, `VerifyWebhookSignature`, `WebhookSignature.verify`,
-`WebhookSignature::verify`), the `WebhookDelivery` types and the API error code,
-retry-delay and headers accessors are not in 0.5.0 either; they also ship with
-the next SDK release.
-Nor is the Java fallback to `UNKNOWN`: 0.5.0 decodes a response enum value it
-does not recognise to `null` (`MessageType` and `ChatKind` included), and
-`SessionStatus`, `DeliveryStatus` and the other response enums that lack an
-`unknown` wire value have no `UNKNOWN` constant there.
-The refusal of an empty, `.` or `..` id (and, in the JavaScript, Go and Java
-raw-request methods, of a `.` or `..` path segment), the refusal by all five
-raw-request methods of a path that does not begin with `/`, the PHP
-`sessions->create()` fix that sends an empty `config` as `{}`, the PHP
-`allowInsecureHttp` option (0.5.0 always raises an `E_USER_WARNING` for a
-non-local `http://` `baseUrl`) and the `null` return of PHP `catalog->info()`
-and `catalog->product()` for a missing catalog or product (0.5.0 throws a
-`TypeError`) are not in 0.5.0 either; they ship with the next SDK release.
-Nor is the `name` filter on `sessions.list` (`ListSessionsQuery.Name` in Go,
-the `name` field of `ListSessionsQuery` in Java, JavaScript and Python); it
-ships with the next SDK release.
 
 > ⚠️ Endpoints requiring an `OPERATOR`-level API key are noted in the inline
 > docs. Deliberately **not** exposed, matching `docs/18-sdk-design.md` exactly:
@@ -111,7 +88,7 @@ const client = new OpenWAClient({
 
 const session = await client.sessions.create({ name: 'my-session' });
 await client.sessions.start(session.id);
-// Link the account before sending: scan sessions.getQrCode or use sessions.requestPairingCode,
+// Link the account before sending: scan sessions.getQrCode (or use sessions.requestPairingCode for a number with no linked session),
 // then wait for status 'ready'. An unlinked session answers the send with 409.
 const result = await client.messages.sendText(session.id, {
   chatId: '628123456789@c.us',
@@ -128,7 +105,7 @@ try {
   await client.messages.sendText(/* … */);
 } catch (e) {
   if (e instanceof OpenWAConflictError) {
-    /* engine not ready (409) */
+    /* a conflicting state (409): typically a session not ready, or a keyed send pending or unconfirmed */
   }
 }
 ```
@@ -152,7 +129,7 @@ client = OpenWAClient(
 
 session = client.sessions.create({"name": "my-session"})
 client.sessions.start(session["id"])
-# Link the account before sending: scan sessions.get_qr_code or use sessions.request_pairing_code,
+# Link the account before sending: scan sessions.get_qr_code (or use sessions.request_pairing_code for a number with no linked session),
 # then wait for status "ready". An unlinked session answers the send with 409.
 result = client.messages.send_text(session["id"], {
     "chatId": "628123456789@c.us",
@@ -181,7 +158,7 @@ $client = new Client([
 
 $session = $client->sessions->create(['name' => 'my-session']);
 $client->sessions->start($session['id']);
-// Link the account before sending: scan sessions->getQrCode or use sessions->requestPairingCode,
+// Link the account before sending: scan sessions->getQrCode (or use sessions->requestPairingCode for a number with no linked session),
 // then wait for status 'ready'. An unlinked session answers the send with 409.
 $result = $client->messages->sendText($session['id'], [
     'chatId' => '628123456789@c.us',
@@ -199,7 +176,7 @@ handler is a `MockHandler` — no global state, no network.
 <dependency>
   <groupId>com.rmyndharis</groupId>
   <artifactId>openwa</artifactId>
-  <version>0.5.0</version>
+  <version>0.5.1</version>
 </dependency>
 ```
 
@@ -214,7 +191,7 @@ OpenWAClient client = new OpenWAClient("http://localhost:2785", "owa_k1_…");
 
 SessionResponse session = client.sessions.create(CreateSessionRequest.builder().name("my-session").build());
 client.sessions.start(session.id());
-// Link the account before sending: scan sessions.getQrCode or use sessions.requestPairingCode,
+// Link the account before sending: scan sessions.getQrCode (or use sessions.requestPairingCode for a number with no linked session),
 // then wait for status READY. An unlinked session answers the send with 409.
 MessageResponse result = client.messages.sendText(session.id(),
     SendTextRequest.builder()
@@ -257,7 +234,7 @@ if err != nil {
 if _, err := client.Sessions.Start(ctx, session.ID); err != nil {
     log.Fatal(err)
 }
-// Link the account before sending: scan Sessions.QRCode or use Sessions.RequestPairingCode,
+// Link the account before sending: scan Sessions.QRCode (or use Sessions.RequestPairingCode for a number with no linked session),
 // then wait for status "ready". An unlinked session answers the send with 409.
 res, err := client.Messages.SendText(ctx, session.ID, openwa.SendTextRequest{
     ChatID: "628123456789@c.us",
@@ -297,9 +274,13 @@ testing, retry, tracing, or metrics. See [`go/README.md`](go/README.md).
   `WebhookDelivery`.
 - **Redirects are never followed.** A `3xx` surfaces to the caller rather than
   being followed, so the API key is never re-sent to a redirect target.
-- **Default per-request timeout** is 30s (configurable). Path segments (chat /
-  message ids) are percent-encoded; a base-URL path prefix (e.g. behind a proxy
-  at `/v1`) is preserved.
+- **Default timeout** is 30s (configurable). `0` turns it off in the JavaScript,
+  Python and PHP clients; the Go client reads `0` as the 30s default and the Java
+  builder refuses it. The JavaScript, PHP, Go and Java clients bound the whole call,
+  response body included. The Python client's is per network operation
+  (connect, read, write, pool), so a response that keeps trickling bytes is not
+  cut off. Path segments (chat / message ids) are percent-encoded; a base-URL path
+  prefix (e.g. behind a proxy at `/v1`) is preserved.
 
 ## Development
 

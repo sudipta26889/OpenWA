@@ -97,6 +97,23 @@ export class BaileysMessageStoreService implements BaileysMessageStore {
   }
 
   /**
+   * Delete a stored message while `shouldRemove` accepts the copy held when the delete runs: a copy
+   * written or rewritten since the caller looked is judged as it is now. An id the store does not hold
+   * stays absent. Queued behind any put() or update() of the same id already called.
+   */
+  remove(sessionId: string, messageId: string, shouldRemove: (stored: WAMessage) => boolean): Promise<void> {
+    if (!messageId) {
+      return Promise.resolve();
+    }
+    return this.track(sessionId, messageId, async () => {
+      const stored = await this.readStored(sessionId, messageId);
+      if (stored && shouldRemove(stored)) {
+        await this.repo.delete({ sessionId, waMessageId: messageId });
+      }
+    });
+  }
+
+  /**
    * Queue `work` on the id's write chain and register it as the id's in-flight write before returning,
    * so a read issued any time after put() or update() is called waits for it. `work` is called inside a
    * promise chain, so one that throws before returning its promise still settles the write.

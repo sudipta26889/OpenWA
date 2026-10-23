@@ -39,8 +39,8 @@ func isIdempotent(method string) bool { return idempotentMethods[method] }
 // The rest of the retryable set (500/502/504) can be returned AFTER the gateway
 // has already sent the WhatsApp message — a 504 from a reverse proxy is the
 // textbook case — so replaying a POST on those would duplicate the send. The
-// SDK has no idempotency key to deduplicate with, so it declines the retry
-// rather than risk a second message.
+// SDK declines the retry rather than risk a second message, with or without an
+// idempotency key from WithIdempotencyKey: it does not widen the policy for one.
 var backpressureStatuses = map[int]bool{
 	http.StatusTooManyRequests:    true, // 429
 	http.StatusServiceUnavailable: true, // 503
@@ -61,7 +61,7 @@ func retryableForMethod(method string, status int) bool {
 // RetryableStatuses are retried; a non-retryable response is returned as-is.
 //
 // Non-idempotent requests (POST — every send endpoint) are retried
-// conservatively, because the SDK has no idempotency key to deduplicate with:
+// conservatively, with or without an idempotency key from WithIdempotencyKey:
 // never after a network error, and on a retryable status only for 429 and 503,
 // which usually mean the server declined the request before acting on it. A
 // 500/502/504 may arrive after the gateway already sent the message, so a POST

@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gson.Gson;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -95,4 +96,15 @@ class HttpTest {
     }
 
     private record Query(String chatId, Integer limit, String cursor) {}
+
+    @Test
+    void requestToStringShowsNeitherTheApiKeyNorTheBody() {
+        // A logging transport prints the request it is handed.
+        HttpRequestData req = new HttpRequestData(HttpMethod.POST, "https://h/api/x",
+            Map.of("X-API-Key", "owa_k1_secret"), "{\"text\":\"private words\"}", Duration.ofSeconds(5));
+        String text = req.toString();
+        assertFalse(text.contains("owa_k1_secret"), text);
+        assertFalse(text.contains("private words"), text);
+        assertTrue(text.contains("POST https://h/api/x") || text.contains("https://h/api/x"), text);
+    }
 }

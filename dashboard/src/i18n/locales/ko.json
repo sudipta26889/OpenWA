@@ -95,6 +95,7 @@
     "loadingMessages": "메시지 불러오는 중...",
     "loadingOlderMessages": "이전 메시지 불러오는 중...",
     "loadOlderMessagesError": "이전 메시지를 불러오지 못했습니다. 위로 스크롤하여 다시 시도하세요.",
+    "loadOlderMessagesRetryHint": "위로 스크롤하여 다시 시도하세요.",
     "noMessagesInChat": "아직 메시지가 없습니다. 첫 메시지를 보내 대화를 시작하세요!",
     "downloadDocument": "문서 다운로드",
     "actions": {
@@ -529,6 +530,7 @@
       "session.reconnect_loop": "세션 재연결이 계속 실패할 때",
       "session.restriction": "WhatsApp이 계정을 제한하거나 제한을 해제했을 때",
       "presence.update": "구독한 채팅이 온라인이 되거나 입력 중이거나 오프라인이 되었을 때",
+      "event.response": "게스트가 WhatsApp 이벤트 초대에 응답했을 때 (참석, 불참, 미정)",
       "group.join": "참여자가 그룹에 참여하거나 추가되었을 때",
       "group.leave": "참여자가 그룹을 나가거나 내보내졌을 때",
       "group.update": "그룹 이름, 설명 또는 설정이 바뀌었을 때",
@@ -701,8 +703,9 @@
     },
     "chats": {
       "label": "채팅 접근 (선택)",
-      "hint": "한 줄에 채팅 하나: @g.us로 끝나는 그룹 ID, @c.us 또는 @lid로 끝나는 연락처 ID, 또는 전화번호. 모든 채팅을 허용하려면 비워 두세요. 채팅이 제한된 키는 해당 키에 열린 경로만 사용할 수 있으며, 이벤트 WebSocket과 MCP는 이를 거부합니다.",
-      "invalid": "채팅 ID 또는 전화번호가 아닙니다: {{value}}"
+      "hint": "한 줄에 채팅 하나: @g.us로 끝나는 그룹 ID, @c.us 또는 @lid로 끝나는 연락처 ID, 또는 전화번호. 모든 채팅을 허용하려면 비워 두세요. 채팅이 제한된 키는 해당 키에 열린 경로만 사용할 수 있으며, 이벤트 WebSocket과 MCP를 통한 접근도 이 채팅으로 제한됩니다.",
+      "invalid": "채팅 ID 또는 전화번호가 아닙니다: {{value}}",
+      "tooMany": "채팅이 너무 많습니다({{count}}개). 키 하나에는 최대 {{max}}개까지 나열할 수 있습니다."
     },
     "expiry": {
       "label": "만료 시각 (선택)",

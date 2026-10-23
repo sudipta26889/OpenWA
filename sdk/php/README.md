@@ -1,5 +1,7 @@
 # rmyndharis/openwa
 
+This document describes `main`. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name are unreleased additions after SDK 0.5.1 and require the corresponding server changes after OpenWA 0.24.0.
+
 Official PHP SDK for [OpenWA](https://github.com/rmyndharis/OpenWA), the open-source WhatsApp API Gateway. OpenWA is an independent project, not affiliated with or endorsed by WhatsApp or Meta.
 
 A synchronous client built on [Guzzle](https://docs.guzzlephp.org/), PSR-4 autoloaded.
@@ -11,16 +13,6 @@ composer require rmyndharis/openwa
 ```
 
 Requires PHP 8.1+ and Guzzle 7. The namespace is `OpenWA\`.
-
-This README describes `main`. The 0.5.0 release lacks `sessions->getProxy`,
-`sessions->updateProxy`, `messages->clickButton`, `WebhookSignature::verify`, the
-`getErrorCode()`, `getRetryAfterSeconds()` and `getHeaders()` exception methods, the refusal of an
-empty, `.` or `..` id, the refusal of a `request()` path that does not begin with `/`, the
-`sessions->create()` fix that sends an empty `config` as `{}`, the
-`allowInsecureHttp` option (0.5.0 always raises an `E_USER_WARNING` for a non-local `http://`
-`baseUrl`) and the `null` return of `catalog->info()` and `catalog->product()` for a missing catalog
-or product (0.5.0 throws a `TypeError`); they
-ship with the next SDK release. See [the SDK overview](../README.md#coverage).
 
 ## Usage
 
@@ -40,7 +32,7 @@ $client = new Client([
 $session = $client->sessions->create(['name' => 'my-session']);
 $client->sessions->start($session['id']);
 
-// Link the account before sending: scan sessions->getQrCode or use sessions->requestPairingCode,
+// Link the account before sending: scan sessions->getQrCode (or use sessions->requestPairingCode for a number with no linked session),
 // then wait for status 'ready'. An unlinked session answers the send with 409.
 $result = $client->messages->sendText($session['id'], [
     'chatId' => '628123456789@c.us',
@@ -147,7 +139,7 @@ Cutting a release:
 1. If the minor line changes, update `extra.branch-alias.dev-main` in
    `composer.json` (e.g. `0.1.x-dev` → `0.2.x-dev`) and land it on `main`. The
    release workflow refuses to publish when the alias does not match the tag.
-2. Tag that commit `php-sdk-v<version>` (e.g. `php-sdk-v0.5.0`) and push the
+2. Tag that commit `php-sdk-v<version>` (e.g. `php-sdk-v0.5.1`) and push the
    tag. The SDK has its own version line — the monorepo's `v*` tags are the app
    version and never trigger an SDK release.
 3. The workflow runs the test suite, then tags the mirror `<version>` (no `v`
@@ -167,3 +159,15 @@ exactly like one that worked.
 ## License
 
 MIT
+
+## Send idempotency
+
+The example below requires the unreleased SDK changes on `main`; SDK 0.5.1 does not expose this per-send key argument. The server must also include the send idempotency changes after OpenWA 0.24.0.
+
+Supply a unique caller-owned key for one logical send and reuse it when retrying that same call. Keys contain 1-255 visible ASCII characters; unrelated calls must use different keys. The SDK forwards the key without changing its retry policy or generating one automatically.
+
+```php
+$client->messages->sendText($sessionId, ['chatId' => '628123@c.us', 'text' => 'Hello'], 'order-123');
+```
+
+The gateway supports text, image, video, audio, document, sticker, location, contact, template, poll, reply and forward sends. Completed calls replay their response; a 409 whose `getErrorCode()` is `IDEMPOTENCY_KEY_IN_PROGRESS` means the first request is still running, so retry with the same key later; a 409 `IDEMPOTENCY_OUTCOME_UNKNOWN` means the message may have been sent, so check the chat and, if it did not arrive, send again with a new key (`getErrorCode()` tells them apart from the 409 for a session that is not connected). A changed request with the same key returns 422. The gateway retains keys for 24 hours. Bulk, product and button operations have no such guarantee. Omit the key to preserve existing behavior.

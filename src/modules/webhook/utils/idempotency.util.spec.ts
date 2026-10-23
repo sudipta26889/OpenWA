@@ -288,6 +288,18 @@ describe('Idempotency Utils', () => {
       expect(generateIdempotencyKey('presence.update', other, at)).not.toBe(a);
     });
 
+    it('keys event.response on the session + RSVP id (unique per answer, no occurrence salt needed)', () => {
+      const at = '2026-07-20T00:00:00.000Z';
+      const data = { sessionId: 'A', eventMessageId: 'EVT1', responseMessageId: 'RSVP1', response: 'going' };
+      const key = generateIdempotencyKey('event.response', data, at);
+      expect(key).toBe('rsvp_A_RSVP1');
+      expect(generateIdempotencyKey('event.response', data, '2026-07-20T01:00:00.000Z')).toBe(key);
+      // A changed answer is a new RSVP with a new id, so it is never deduped against the first.
+      const changed = { ...data, responseMessageId: 'RSVP2', response: 'not_going' };
+      expect(generateIdempotencyKey('event.response', changed, at)).not.toBe(key);
+      expect(generateIdempotencyKey('event.response', { ...data, sessionId: 'B' }, at)).not.toBe(key);
+    });
+
     it('keys call.received on the session + call id (unique per call, no occurrence salt needed)', () => {
       const at = '2026-07-20T00:00:00.000Z';
       const data = { sessionId: 'A', callId: 'CALL1', from: '628111@c.us', timestamp: 1782000000 };

@@ -2,14 +2,20 @@ import { IsString, IsOptional, IsInt, Min, IsNotEmpty, MaxLength } from 'class-v
 import { Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { MESSAGE_TEXT_MAX_LENGTH } from '../../message/dto/send-message.dto';
+import { CHAT_ID_MAX_LENGTH } from '../../message/dto/send-message.dto';
 
 /** WhatsApp catalog product ids are numeric strings of about 16-20 digits; this leaves wide headroom. */
 export const PRODUCT_ID_MAX_LENGTH = 255;
 
 export class SendProductDto {
-  @ApiProperty({ description: 'Chat to send the product card to (@c.us or @g.us).', example: '628123456789@c.us' })
+  @ApiProperty({
+    maxLength: CHAT_ID_MAX_LENGTH,
+    description: 'Chat to send the product card to (@c.us or @g.us).',
+    example: '628123456789@c.us',
+  })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiProperty({ description: 'Catalog product id to send.', example: 'product-42', maxLength: PRODUCT_ID_MAX_LENGTH })

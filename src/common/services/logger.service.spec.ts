@@ -77,6 +77,41 @@ describe('LoggerService', () => {
       expect(output.userId).toBe('u1');
     });
 
+    it.each([
+      'passwd',
+      'secret',
+      'token',
+      'accessToken',
+      'authorization',
+      'credentials',
+      'apiPepper',
+      'privateKey',
+      'private-key',
+      'api-key',
+      'api_key',
+    ])('redacts the value under the key %s', key => {
+      logger.log('auth', { [key]: 'value-1', visible: 'v' });
+
+      const output = getLogOutput(consoleSpy) as unknown as Record<string, unknown>;
+      expect(output[key]).toBe('[REDACTED]');
+      expect(output.visible).toBe('v');
+    });
+
+    it('redacts secret-named keys inside arrays of objects', () => {
+      logger.log('cfg', {
+        instances: [
+          { name: 'a', secret: 's1' },
+          { name: 'b', token: 't1' },
+        ],
+      });
+
+      const output = getLogOutput(consoleSpy) as unknown as { instances: Array<Record<string, string>> };
+      expect(output.instances).toEqual([
+        { name: 'a', secret: '[REDACTED]' },
+        { name: 'b', token: '[REDACTED]' },
+      ]);
+    });
+
     it('redacts secret-named keys nested inside the metadata', () => {
       logger.log('cfg', { config: { redisPassword: 'p', host: 'h' } });
 

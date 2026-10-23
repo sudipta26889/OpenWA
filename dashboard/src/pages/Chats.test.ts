@@ -1074,6 +1074,37 @@ test('a reconnect refetch that settles after the page was left sends no mark-as-
   );
 });
 
+async function leaveWithPendingRead(loggedOut: boolean): Promise<number> {
+  const { screen, fireEvent, within } = rtl;
+  resetFetchCalls();
+  const { container, unmount } = renderChats();
+  await screen.findByText('Main (15551234567)');
+  fireEvent.click(await screen.findByText('Alice'));
+  await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
+  // Opening the chat queued its read behind the quiet window; the page goes away inside it.
+  assert.ok(
+    !findFetchCall('POST', `/api/sessions/${SESSION.id}/chats/read`),
+    'the read went out before the page was left',
+  );
+  // Logout removes the key before the authenticated tree unmounts.
+  if (loggedOut) window.sessionStorage.removeItem('openwa_api_key');
+  try {
+    unmount();
+    await new Promise(resolve => setTimeout(resolve, 1_000));
+  } finally {
+    window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  }
+  return countFetchCalls('POST', `/api/sessions/${SESSION.id}/chats/read`);
+}
+
+test('leaving the page sends the pending mark-as-read', async () => {
+  assert.equal(await leaveWithPendingRead(false), 1, 'the pending mark-as-read was dropped');
+});
+
+test('logging out sends no pending mark-as-read without a key', async () => {
+  assert.equal(await leaveWithPendingRead(true), 0, 'a keyless mark-as-read went out after logout');
+});
+
 test('a reconnect refetch overtaken by a newer list still marks the open chat read', async () => {
   const { screen, fireEvent, within, act, waitFor } = rtl;
   const { container } = renderChats();
@@ -1172,6 +1203,51 @@ test("a reconnect refetch that settles after a session switch leaves the new ses
     await flush();
     assert.ok(screen.queryByLabelText('3 unread messages'), "session 1's refetch cleared session 2's unread badge");
   } finally {
+    twoSessions = false;
+  }
+});
+
+test('switching session with a chat open marks only the chats opened on the new session read', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  twoSessions = true;
+  // Session 2 lists Alice too (a contact both accounts share). The stub folds session 2's routes onto
+  // session 1's, so its mark-as-read bodies are collected before that.
+  chatsResponder = sessionId =>
+    Promise.resolve(
+      jsonResponse(sessionId === SESSION.id ? [CHAT] : [{ ...CHAT, lastMessage: 'alice on two' }, CHAT_2]),
+    );
+  const readsOnOne: unknown[] = [];
+  const readsOnTwo: unknown[] = [];
+  const stub = globalThis.fetch;
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input).endsWith(`/api/sessions/${SESSION.id}/chats/read`))
+      readsOnOne.push(JSON.parse(String(init?.body)));
+    if (String(input).endsWith(`/api/sessions/${SESSION_2.id}/chats/read`))
+      readsOnTwo.push(JSON.parse(String(init?.body)));
+    return stub(input, init);
+  }) as typeof fetch;
+  try {
+    const { container, unmount } = renderChats();
+    await screen.findByText('Main (15551234567)');
+    fireEvent.click(await screen.findByText('Alice'));
+    await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
+
+    fireEvent.change(container.querySelector('select.session-selector') as HTMLSelectElement, {
+      target: { value: SESSION_2.id },
+    });
+    await screen.findByText('alice on two');
+    fireEvent.click(await screen.findByText('Carol'));
+    await waitFor(() => assert.ok(container.querySelector('.room-messages')));
+
+    // Unmounting flushes the reads still queued for session 2, so none can be missed by a timer.
+    unmount();
+    await flush();
+    await flush();
+    assert.deepEqual(readsOnTwo, [{ chatId: CHAT_2.id }]);
+    // The read queued for the session that was left still reaches that session.
+    assert.deepEqual(readsOnOne, [{ chatId: CHAT.id }]);
+  } finally {
+    globalThis.fetch = stub;
     twoSessions = false;
   }
 });
@@ -1875,6 +1951,46 @@ test('a message deleted for everyone in a chat never opened refetches the chat l
   await waitFor(() => assert.equal(countFetchCalls('GET', `/api/sessions/${SESSION.id}/chats`), 1));
 });
 
+test('a delayed poll echo cannot restore a revoked message or its sidebar preview', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  const room = container.querySelector('.room-messages') as HTMLElement;
+  await within(room).findByText('hello from alice');
+  const id = OMITTED_MEDIA_MESSAGE_2.waMessageId as string;
+  revoke(CHAT.id, id);
+  const sidebar = container.querySelector('.chats-sidebar') as HTMLElement;
+  await waitFor(() => assert.ok(!within(sidebar).queryByText('hello from alice')));
+  resetFetchCalls();
+  lastSocket()!.receive('message', {
+    type: 'event',
+    timestamp: new Date().toISOString(),
+    payload: {
+      event: 'message.received',
+      sessionId: SESSION.id,
+      data: {
+        id,
+        chatId: CHAT.id,
+        from: CHAT.id,
+        to: 'me',
+        body: 'withdrawn question',
+        type: 'poll',
+        fromMe: false,
+        timestamp: 1_700_003_000,
+        poll: { name: 'withdrawn question', options: ['private choice'], allowMultipleAnswers: false },
+      },
+    },
+  });
+  await flush();
+  assert.ok(!within(container).queryByText('withdrawn question'));
+  assert.ok(!within(room).queryByText('private choice'));
+  assert.equal(countFetchCalls('POST', `/api/sessions/${SESSION.id}/chats/read`), 0);
+  const cached = queryClient!.getQueryData<{ pages: Array<{ db: ChatMessage[] }> }>(['messages', SESSION.id, CHAT.id]);
+  const row = cached!.pages.flatMap(page => page.db).find(m => m.waMessageId === id)!;
+  assert.equal(row.type, 'revoked');
+  assert.equal(row.metadata, undefined);
+});
+
 // A global-search hit in the third session, on Alice's chat.
 const THIRD_SESSION_HIT: SearchHit = {
   messageId: 'db-9',
@@ -2334,24 +2450,20 @@ test('two media downloads in flight do not clobber each other', async () => {
 
 /** Modelled heights, so a commit that changes the thread's contents changes its scrollHeight. */
 const BUBBLE_PX = 30;
-const OLDER_SPINNER_PX = 46;
 
 /**
  * Give the thread container a scrollable geometry. jsdom lays nothing out, so every offset reads 0
  * and the page would never see a thread it can scroll.
  *
- * `scrollHeight` is a getter over the live DOM rather than a constant: the older-page spinner is an
- * in-flow child of this container, so it grows the thread on its own commit, one commit BEFORE the
- * page lands. A constant cannot tell those two commits apart, and the scroll-restore test below
- * turns entirely on the difference.
+ * `scrollHeight` is a getter over the live DOM rather than a constant, so a commit that adds or
+ * removes bubbles changes it. Only bubbles are modelled: whether the older-page indicator takes room
+ * in the thread is the stylesheet's, and ChatThread.test.ts pins it there.
  */
 function makeScrollable(thread: HTMLElement, scrollTop: number): void {
   Object.defineProperty(thread, 'clientHeight', { value: 600, configurable: true });
   Object.defineProperty(thread, 'scrollHeight', {
     configurable: true,
-    get: () =>
-      thread.querySelectorAll('.message-bubble').length * BUBBLE_PX +
-      (thread.querySelector('.messages-loading-older') ? OLDER_SPINNER_PX : 0),
+    get: () => thread.querySelectorAll('.message-bubble').length * BUBBLE_PX,
   });
   let top = scrollTop;
   Object.defineProperty(thread, 'scrollTop', {
@@ -2425,6 +2537,7 @@ test('a failed older-page fetch does not blank an already-loaded thread', async 
     const inline = thread.querySelector('.messages-loading-older');
     assert.ok(inline, 'expected an inline failure indicator');
     assert.match(inline!.textContent ?? '', /couldn.t load older messages/i);
+    assert.ok(inline!.classList.contains('failed'), 'the failure is styled to stay at the top of the thread');
   });
 });
 
@@ -2477,17 +2590,13 @@ test('the reading position is held across the commit that lands an older page', 
   fireEvent.scroll(thread);
 
   await waitFor(() => assert.ok(thread.querySelector('.messages-loading-older')));
-  assert.equal(thread.scrollHeight, before + OLDER_SPINNER_PX);
 
   releaseOlderPage();
   await within(thread).findByText('paged message 0');
   await waitFor(() => assert.equal(thread.querySelector('.messages-loading-older') === null, true));
 
   // The thread grew upward by the new bubbles, so the row the user was reading has to move down by
-  // exactly that much. The regression this locks out: measuring the growth on the first commit that
-  // changed scrollHeight caught the older-page SPINNER entering the flow, one commit early, and
-  // spent the correction on its ~46px — leaving the real prepend uncorrected and the view thrown a
-  // full page backwards.
+  // exactly that much.
   assert.equal(thread.scrollHeight - before, PAGED_OLDEST.length * BUBBLE_PX);
   assert.equal(thread.scrollTop, PAGED_OLDEST.length * BUBBLE_PX);
 });
@@ -2690,4 +2799,35 @@ test('a message sent while the first page is still loading survives the page lan
   const thread = container.querySelector('.room-messages') as HTMLElement;
   await within(thread).findByText('hello from alice');
   await waitFor(() => assert.equal(within(thread).queryAllByText('sent while loading').length, 1));
+});
+
+function receiveEvent(event: string, data: Record<string, unknown>): void {
+  const socket = lastSocket();
+  assert.ok(socket, 'expected the page to have opened a socket');
+  socket.receive('message', {
+    type: 'event',
+    timestamp: new Date(1_700_003_000_000).toISOString(),
+    payload: { event, sessionId: SESSION.id, data },
+  });
+}
+
+test('an edit arriving after the newest message was deleted for everyone does not refill the sidebar preview', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  const room = container.querySelector('.room-messages') as HTMLElement;
+  await within(room).findByText('hello from alice');
+  const sidebar = container.querySelector('.chats-sidebar') as HTMLElement;
+  const id = OMITTED_MEDIA_MESSAGE_2.waMessageId as string;
+
+  revoke(CHAT.id, id);
+  await waitFor(() => assert.ok(!within(sidebar).queryByText('hello from alice')));
+  receiveEvent('message.edited', { messageId: id, chatId: CHAT.id, body: 'late edit', timestamp: 1_700_003_001 });
+  await flush();
+
+  assert.ok(
+    !within(sidebar).queryByText('late edit'),
+    'the edit of a deleted message came back as the sidebar preview',
+  );
+  assert.ok(!within(room).queryByText('late edit'), 'the edit of a deleted message came back into the thread');
 });

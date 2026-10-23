@@ -41,6 +41,15 @@ export const CUSTOM_PREVIEW_DESCRIPTION_MAX_LENGTH = 1024;
 // (src/core/agent-tools/tools/message.tools.ts) so MCP and REST enforce the same limit.
 export const MESSAGE_TEXT_MAX_LENGTH = 4096;
 
+/**
+ * Caps for the ids a caller chooses: a chat id and a bulk batch id. Both end up in a btree index
+ * (the message chat indexes, UNIQUE(sessionId, batchId)), and PostgreSQL refuses an index entry past
+ * about 2.7 KB with an error the client sees as a 500, where SQLite takes any length. A WhatsApp JID is
+ * well under 100 characters, so 255 leaves room for every real id and matches the idempotency key cap.
+ */
+export const CHAT_ID_MAX_LENGTH = 255;
+export const BATCH_ID_MAX_LENGTH = 255;
+
 // The cap on a prompt choice's id. It must equal BUTTON_TEXT_MAX_LENGTH in the Baileys message
 // mapper, which refuses to offer any inbound choice whose id is longer, so an id past this bound
 // can never name a choice that exists. Validating it against the text cap instead accepted such a
@@ -91,9 +100,11 @@ export class SendTextMessageDto {
   @ApiProperty({
     description: 'WhatsApp chat ID (phone@c.us for individual, groupId@g.us for groups)',
     example: '628123456789@c.us',
+    maxLength: CHAT_ID_MAX_LENGTH,
   })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiProperty({
@@ -190,9 +201,11 @@ export class SendMediaMessageDto {
   @ApiProperty({
     description: 'WhatsApp chat ID',
     example: '628123456789@c.us',
+    maxLength: CHAT_ID_MAX_LENGTH,
   })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiPropertyOptional({
@@ -343,14 +356,11 @@ export class MessageResponseDto {
   @ApiProperty({
     description:
       'The message id, assigned when the gateway accepts the message for sending. A 201 here means the ' +
-      'message was handed to the WhatsApp client — it does NOT confirm delivery. On Baileys a message to a ' +
-      'number that is not on WhatsApp still returns 201 with a valid messageId (whatsapp-web.js answers ' +
-      '400); whether it later delivers, stalls, or is reported as an error ' +
-      'reaches you asynchronously, if at all. To confirm a number is on WhatsApp before ' +
-      'sending, use GET /api/sessions/{sessionId}/contacts/check/{number}; track real delivery via the ' +
-      'message `status` field (sent → delivered → read, or failed if WhatsApp reports an error for it). ' +
-      'A message resting at `sent` is not diagnostic on its own: a registered recipient whose device has ' +
-      'not come online since the send stays at `sent` too.',
+      'message was handed to the WhatsApp session; it does not confirm delivery. Baileys checks phone ' +
+      'destinations without a LID mapping and rejects a number reported as unregistered with 400. An ' +
+      'unanswered lookup returns 503 before sending. Known LIDs skip the number check. Track delivery ' +
+      'through the message status (sent, delivered, read, or failed). A message resting at sent can ' +
+      'also belong to a registered recipient whose device is offline.',
     example: 'true_628123456789@c.us_3EB0123456789',
   })
   messageId!: string;

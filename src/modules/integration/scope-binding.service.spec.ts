@@ -105,6 +105,68 @@ describe('ScopeBindingService.onApplicationBootstrap reconciliation', () => {
     expect(setPluginSessions).toHaveBeenCalledWith('chatwoot', ['sess-1']);
   });
 
+  // With "*" set by the operator and no wildcard instance, "*" is all that keeps the plugin active for the
+  // sessions of its concrete instances. Retiring it has to leave those sessions bound, as the wildcard
+  // teardown does, or every enabled instance but the one just provisioned stops receiving hooks.
+  describe('retiring "*" while other concrete instances are enabled', () => {
+    const instance = (instanceId: string, sessionScope: string, enabled = true) => ({
+      pluginId: 'chatwoot',
+      instanceId,
+      sessionScope,
+      enabled,
+    });
+
+    it('keeps their sessions bound when another concrete instance is provisioned', async () => {
+      const { loader, audit, sessions, setPluginSessions } = build(true, ['*']);
+      const instances = {
+        list: jest.fn().mockResolvedValue([instance('a', 'sess-1'), instance('b', 'sess-2'), instance('c', 'sess-3')]),
+      } as unknown as PluginInstanceService;
+
+      await new ScopeBindingService(instances, loader, audit, sessions).applyScopeBinding(
+        'chatwoot',
+        'sess-3',
+        {},
+        true,
+      );
+
+      expect(sessionsWritten(setPluginSessions)).toEqual(new Set(['sess-1', 'sess-2', 'sess-3']));
+    });
+
+    it('keeps their sessions bound when one concrete instance is disabled', async () => {
+      const { loader, audit, sessions, setPluginSessions } = build(true, ['*']);
+      const instances = {
+        list: jest.fn().mockResolvedValue([instance('a', 'sess-1'), instance('b', 'sess-2', false)]),
+      } as unknown as PluginInstanceService;
+
+      await new ScopeBindingService(instances, loader, audit, sessions).applyScopeBinding(
+        'chatwoot',
+        'sess-2',
+        {},
+        false,
+      );
+
+      expect(sessionsWritten(setPluginSessions)).toEqual(new Set(['sess-1']));
+    });
+
+    it('leaves an explicit session list alone: there is no "*" to retire', async () => {
+      // The operator removed sess-2 from the plugin's sessions on purpose; provisioning sess-3 must not
+      // bring it back.
+      const { loader, audit, sessions, setPluginSessions } = build(true, ['sess-1']);
+      const instances = {
+        list: jest.fn().mockResolvedValue([instance('a', 'sess-1'), instance('b', 'sess-2'), instance('c', 'sess-3')]),
+      } as unknown as PluginInstanceService;
+
+      await new ScopeBindingService(instances, loader, audit, sessions).applyScopeBinding(
+        'chatwoot',
+        'sess-3',
+        {},
+        true,
+      );
+
+      expect(sessionsWritten(setPluginSessions)).toEqual(new Set(['sess-1', 'sess-3']));
+    });
+  });
+
   it('restores an enabled wildcard/null-scope instance as base config + ["*"]', async () => {
     const { loader, audit, sessions, updatePluginConfig, setPluginSessions } = build();
     const instances = {

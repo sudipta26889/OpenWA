@@ -771,6 +771,12 @@ Re-using a version is safe precisely because nothing was published under it. A v
 publish before a defect was found must not be re-tagged — never move or reuse an already-pushed tag;
 supersede it with a new release instead (e.g. `v0.10.3` → `v0.10.4`).
 
+A gate that failed outside the image (a Trivy database download, a QEMU timeout) is recovered with
+**Re-run failed jobs**: the staging image of that run is kept when the build itself succeeded, and the
+re-run promotes it only after the gate passes. When a run is abandoned and the version re-tagged, its
+`smoke-<run_id>` tag stays in the registry; delete that package version once the new release is out,
+after confirming it carries no release tag.
+
 Two failure classes are worth anticipating because they depend on the outside world rather than on
 the change being released:
 

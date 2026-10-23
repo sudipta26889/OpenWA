@@ -135,3 +135,20 @@ test('a readiness check in flight at unmount does not schedule another one', { t
 
   assert.equal(calls.filter(c => c === 'GET /api/health/ready').length, 1, 'the poll re-armed after unmount');
 });
+
+test('the containers the restart could not start or stop are listed with the answer', async () => {
+  restartAnswer = () =>
+    Promise.resolve(
+      jsonResponse({
+        message: 'restarting',
+        restarting: true,
+        estimatedTime: 5,
+        orchestration: { errors: ['postgres: port in use'] },
+        removal: { errors: ['minio: stop timed out'] },
+      }),
+    );
+  const { result } = rtl.renderHook(() => useRestartFlow());
+  rtl.act(() => void result.current.start());
+  await rtl.waitFor(() => assert.equal(result.current.restartStatus, 'waiting'));
+  assert.deepEqual(result.current.restartWarnings, ['postgres: port in use', 'minio: stop timed out']);
+});

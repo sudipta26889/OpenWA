@@ -42,6 +42,7 @@ import {
   apiKeyPatch,
   canScopeSessions,
   invalidChatEntry,
+  ALLOWED_CHATS_MAX,
   invalidIpEntry,
   isExpired,
   normalizeChatScope,
@@ -66,19 +67,28 @@ function isSignedInKey(apiKey: ApiKey): boolean {
 // The first IP or chat line the gateway would refuse, so the form can name it instead of the bare
 // "Bad Request" a production gateway answers with. On an edit, a list left as stored is not sent (see
 // apiKeyPatch), so an entry saved before the gateway checked it does not block an unrelated change.
+interface LimitErrors {
+  ip: string | null;
+  chat: string | null;
+  /** How many chats were listed, when that is more than the gateway takes. */
+  chatCount: number | null;
+}
+
 function limitErrors(
   role: string,
   ips: string,
   chats: string,
   stored?: Pick<ApiKey, 'allowedIps' | 'allowedChats'>,
-): { ip: string | null; chat: string | null } {
+): LimitErrors {
   const ipList = parseScopeList(ips);
   const chatList = normalizeChatScope(chats);
   const unchanged = (list: string[], storedList: string[] | undefined) =>
     !!stored && sameSessionScope(list, storedList ?? []);
+  const checksChats = canScopeSessions(role) && !unchanged(chatList, stored?.allowedChats);
   return {
     ip: unchanged(ipList, stored?.allowedIps) ? null : invalidIpEntry(ipList),
-    chat: !canScopeSessions(role) || unchanged(chatList, stored?.allowedChats) ? null : invalidChatEntry(chatList),
+    chat: checksChats ? invalidChatEntry(chatList) : null,
+    chatCount: checksChats && chatList.length > ALLOWED_CHATS_MAX ? chatList.length : null,
   };
 }
 
@@ -108,7 +118,7 @@ function KeyLimitFields({
   ips: string;
   chats: string;
   expires: string;
-  errors: { ip: string | null; chat: string | null };
+  errors: LimitErrors;
   onChange: (patch: { ips?: string; chats?: string; expires?: string }) => void;
   disabled?: boolean;
   expiresRef: RefObject<HTMLInputElement | null>;
@@ -148,6 +158,11 @@ function KeyLimitFields({
           {errors.chat !== null && (
             <span className="key-field-hint error" role="alert">
               {t('apiKeys.chats.invalid', { value: errors.chat })}
+            </span>
+          )}
+          {errors.chatCount !== null && (
+            <span className="key-field-hint error" role="alert">
+              {t('apiKeys.chats.tooMany', { count: errors.chatCount, max: ALLOWED_CHATS_MAX })}
             </span>
           )}
           <span className="key-field-hint">{t('apiKeys.chats.hint')}</span>
@@ -319,8 +334,14 @@ export function ApiKeys() {
   const nameLength = [...newKey.name].length;
   const nameTooLong = nameLength > 100;
   const canCreate =
-    !createMutation.isPending && !nameTooShort && !nameTooLong && newErrors.ip === null && newErrors.chat === null;
-  const canSave = !updateMutation.isPending && editErrors?.ip === null && editErrors.chat === null;
+    !createMutation.isPending &&
+    !nameTooShort &&
+    !nameTooLong &&
+    newErrors.ip === null &&
+    newErrors.chat === null &&
+    newErrors.chatCount === null;
+  const canSave =
+    !updateMutation.isPending && editErrors?.ip === null && editErrors.chat === null && editErrors.chatCount === null;
 
   const handleRevoke = async (id: string) => {
     try {
@@ -679,7 +700,7 @@ export function ApiKeys() {
             ips={editDraft.ips}
             chats={editDraft.chats}
             expires={editDraft.expires}
-            errors={editErrors ?? { ip: null, chat: null }}
+            errors={editErrors ?? { ip: null, chat: null, chatCount: null }}
             onChange={patch => setEditDraft(prev => (prev ? { ...prev, ...patch } : prev))}
             disabled={updateMutation.isPending}
             expiresRef={editExpiresRef}
@@ -780,6 +801,11 @@ export function ApiKeys() {
               }
               values={{ name: confirmAction.name }}
               components={{ strong: <strong /> }}
+              // The key's name is free text. Without escaping, a name carrying markup became elements of the
+              // message: a styled tag handed React a string for `style`, which throws and took the whole page
+              // down. Escaped on interpolation and unescaped for display, it stays the text it was typed as.
+              tOptions={{ interpolation: { escapeValue: true } }}
+              shouldUnescape
             />
           </p>
         </Modal>

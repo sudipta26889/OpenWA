@@ -64,20 +64,21 @@ jobs:
           echo "Tag $TAG matches package.json $PKG_VERSION"
 
       - name: Security audit
-        # Matches ci.yml's advisory rules exactly, including its per-advisory allowlist. The release
-        # gate must not be laxer than the PR gate, or a HIGH advisory blocked on every PR would still
-        # sail through at tag time, and it must not excuse fewer advisories either, or a tag fails on
-        # something main has already accepted. The one difference is an audit that could not run:
-        # PR CI skips it with a warning, while a release refuses to publish with no advisory checked.
-        # A re-run clears a transient npm outage.
+        # Matches ci.yml's advisory rules exactly, including its per-advisory allowlist. For the trees
+        # the image ships, the release gate must not be laxer than the PR gate, or a HIGH advisory
+        # blocked on every PR would still sail through at tag time, and it must not excuse fewer
+        # advisories either, or a tag fails on something main has already accepted. The one
+        # difference is an audit that could not run: PR CI skips it with a warning, while a release
+        # refuses to publish with no advisory checked. A re-run clears a transient npm outage.
         env:
           CHECK_AUDIT_REQUIRED: '1'
         run: npm run check:audit
 
-      # Second tree, same rule. The dashboard's runtime deps are bundled into dashboard/dist and the
+      # The dashboard tree, same rule. Its runtime deps are bundled into dashboard/dist and the
       # published image serves them to every operator's browser, so the tag path must scan them for
-      # the same reason ci.yml's audit job now does — otherwise this gate is laxer than the PR gate
-      # for exactly the dependencies that reach a user.
+      # the same reason ci.yml's audit job does, or this gate is laxer than the PR gate for exactly
+      # the dependencies that reach a user. The third tree, sdk/javascript, is not audited here: the
+      # image does not ship it, and js-sdk-release.yml audits it before publishing the SDK.
       - name: Install dashboard dependencies
         run: cd dashboard && npm ci
 
@@ -228,18 +229,20 @@ jobs:
       # STORED body_ts tsvector), the boot-migration advisory lock (two concurrent migrators on one
       # database), that a paged message list has a total order, that the data entities can build
       # their own schema (raw SQL the ORM passes through verbatim, such as a partial index predicate,
-      # only case-folds on a real server), and that the UTC pin holds across a backup round trip, a
-      # retention window and a local-midnight count. All five self-skip unless DATABASE_TYPE=postgres,
-      # so they are a no-op in the default test job and only execute here against the postgres:16
-      # service. TZ is deliberately not UTC, for the reason ci.yml states.
-      - name: Postgres specs (FTS provider + boot-migration lock + list ordering + entity synchronize + UTC pin)
+      # only case-folds on a real server), that the UTC pin holds across a backup round trip, a
+      # retention window and a local-midnight count, that webhook failure recovery and media metadata
+      # updates hold on the real server, that a send idempotency key is claimed by a unique-violation
+      # insert, and that a replace-all import runs. All eight self-skip unless DATABASE_TYPE=postgres, so
+      # they are a no-op in the default test job and only execute here against the postgres:16 service.
+      # TZ is deliberately not UTC, for the reason ci.yml states.
+      - name: Postgres specs (FTS + migrations + ordering + schema + UTC + recovery + idempotency + import)
         # --runInBand: same reason the CI job passes it — both specs issue DDL against the one
         # shared service database, and jest's default file-parallelism races their catalog writes
         # (the first v0.19.0 tag failed this step on `relation "messages" already exists` over a
         # tree CI had passed minutes earlier). The lock spec's own two-migrator race is in-file
         # (Promise.all) and unaffected by runInBand. The synchronize spec additionally CREATEs and
         # DROPs a scratch database of its own, which is only safe serialized.
-        run: npx jest --runInBand src/database/migrations/__tests__/1782400000000-AddMessagesFts.pg.spec.ts src/database/migrations/__tests__/pg-boot-migrations.pg.spec.ts src/modules/message/message-list-ordering.pg.spec.ts src/database/migrations/__tests__/pg-entity-synchronize.pg.spec.ts src/database/postgres-utc.pg.spec.ts
+        run: npx jest --runInBand src/database/migrations/__tests__/1782400000000-AddMessagesFts.pg.spec.ts src/database/migrations/__tests__/pg-boot-migrations.pg.spec.ts src/modules/message/message-list-ordering.pg.spec.ts src/database/migrations/__tests__/pg-entity-synchronize.pg.spec.ts src/database/postgres-utc.pg.spec.ts src/modules/webhook/webhook-recovery.pg.spec.ts src/modules/message/idempotency/send-idempotency.service.pg.spec.ts src/modules/infra/infra-data.import.pg.spec.ts
         env:
           TZ: Asia/Jakarta
           DATABASE_TYPE: postgres
@@ -415,9 +418,11 @@ jobs:
 
       - name: Extract release notes from CHANGELOG
         id: changelog
+        env:
+          # Through the environment, not interpolated into the script: the value comes from the tag name.
+          VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
           # Extract the section for this version from CHANGELOG.md
-          VERSION="${{ steps.version.outputs.VERSION }}"
           NOTES=$(awk "/^## \[${VERSION}\]/{flag=1; next} /^## \[/{flag=0} flag" CHANGELOG.md)
           if [ -z "$NOTES" ]; then
             NOTES="Release v${VERSION}"
@@ -818,14 +823,16 @@ jobs:
   # with it: v0.10.5 published a GitHub Release while `latest`, `0.10` and `0.10.5` all vanished
   # from the registry, so `docker pull` failed for everyone until they were restored.
   #
-  # This lives in its own `if: always()` job — not inside promote — because the failure path is
-  # exactly when cleanup matters most: when boot-smoke or image-scan fails, promote is skipped and
-  # the staging tag would otherwise leak. On the happy path the release tags share the staging
-  # version, so the step below does not run at all (the deliberate retention documented above): the
-  # package-versions API is eventually consistent, and a read that does not list the new release
-  # tags yet would count the staging tag alone and delete the version just published. The same
-  # holds for a promote that failed after re-pointing some tags, so the step runs only when promote
-  # never ran, which is the one case where the staging tag is alone and gets removed.
+  # This lives in its own `if: always()` job — not inside promote — because the docker job can fail
+  # after pushing the staging tag, which would otherwise leak. On the happy path the release tags
+  # share the staging version, so the step below does not run at all (the deliberate retention
+  # documented above): the package-versions API is eventually consistent, and a read that does not
+  # list the new release tags yet would count the staging tag alone and delete the version just
+  # published. The same holds for a promote that failed after re-pointing some tags, so the step runs
+  # only when promote never ran. It also keeps the tag when the docker job succeeded and a gate
+  # (boot-smoke or image-scan) failed: "Re-run failed jobs" pulls that tag again, and with it deleted
+  # a flaky scan could only be recovered by rebuilding everything. That leaves one stray tag behind
+  # when the release is abandoned instead.
   cleanup-staging:
     name: Clean up the staging tag
     runs-on: ubuntu-latest
@@ -838,8 +845,9 @@ jobs:
       - name: Remove the staging tag (only when it is alone on its version)
         # Only when promote never ran: once it has started re-pointing tags, the version can carry
         # release tags that a stale read does not list yet. A failed or cancelled promote leaves the
-        # stray staging tag behind, the same retention as the happy path.
-        if: needs.promote.result == 'skipped'
+        # stray staging tag behind, the same retention as the happy path. And only when the docker job
+        # did not succeed: a gate that failed on top of a good staging image is re-run against it.
+        if: needs.promote.result == 'skipped' && needs.docker.result != 'success'
         # Best-effort: a failed tidy-up must not turn an otherwise successful release red.
         continue-on-error: true
         env:

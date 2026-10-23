@@ -18,7 +18,7 @@
 //	if _, err := client.Sessions.Start(ctx, session.ID); err != nil {
 //	    log.Fatal(err)
 //	}
-//	// Link the account before sending: scan Sessions.QRCode or use Sessions.RequestPairingCode,
+//	// Link the account before sending: scan Sessions.QRCode (or use Sessions.RequestPairingCode for a number with no linked session),
 //	// then wait for status "ready". An unlinked session answers the send with 409.
 //	res, err := client.Messages.SendText(ctx, session.ID, openwa.SendTextRequest{
 //	    ChatID: "628123456789@c.us",
@@ -88,8 +88,16 @@ func New(baseURL, apiKey string, opts ...Option) (*Client, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		return nil, errors.New("openwa: baseURL is required")
 	}
-	if strings.TrimSpace(apiKey) == "" {
+	// A key read from a secret file usually ends in a newline: trimmed, as the other clients do. A control
+	// character left inside is refused here, by the key's name and without repeating it.
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
 		return nil, errors.New("openwa: apiKey is required")
+	}
+	for _, r := range apiKey {
+		if r < 0x20 || r == 0x7f {
+			return nil, errors.New("openwa: apiKey contains a control character; check for a stray newline")
+		}
 	}
 
 	cfg := &config{
@@ -237,6 +245,32 @@ func (c *Client) call(ctx context.Context, method, path string, query url.Values
 	return nil
 }
 
+type idempotencyContextKey struct{}
+
+// WithIdempotencyKey supplies a caller-owned key for one logical send. Reuse
+// this context for its retries and choose another key for an unrelated send.
+// Only the gateway's documented idempotent send routes interpret the header,
+// and the SDK sends it on those routes only.
+func WithIdempotencyKey(ctx context.Context, key string) context.Context {
+	return context.WithValue(ctx, idempotencyContextKey{}, key)
+}
+
+// idempotentSendSegments are the message routes that interpret Idempotency-Key. net/http sends a
+// request that carries the header again after a dropped connection, which is only safe where the
+// gateway deduplicates, so the header goes nowhere else.
+var idempotentSendSegments = map[string]bool{
+	"send-text": true, "send-image": true, "send-video": true, "send-audio": true,
+	"send-document": true, "send-sticker": true, "send-location": true, "send-contact": true,
+	"send-template": true, "send-poll": true, "reply": true, "forward": true,
+}
+
+// isIdempotentSendPath reports whether path is /api/sessions/{id}/messages/{segment} for one of them.
+func isIdempotentSendPath(path string) bool {
+	parts := strings.Split(path, "/")
+	return len(parts) == 6 && parts[1] == "api" && parts[2] == "sessions" && parts[4] == "messages" &&
+		idempotentSendSegments[parts[5]]
+}
+
 // doRaw performs the request and returns the response body and Content-Type.
 // Any non-2xx status (including an unfollowed 3xx) is an error.
 //
@@ -271,6 +305,15 @@ func (c *Client) doRaw(ctx context.Context, method, path string, query url.Value
 	req, err := http.NewRequestWithContext(ctx, method, rawURL, reader)
 	if err != nil {
 		return nil, "", fmt.Errorf("openwa: building request: %w", err)
+	}
+	// Read through the request: NewRequestWithContext has just refused a nil ctx, which ctx.Value would panic on.
+	if key, hasKey := req.Context().Value(idempotencyContextKey{}).(string); hasKey {
+		if len(key) < 1 || len(key) > 255 || strings.IndexFunc(key, func(r rune) bool { return r < 0x21 || r > 0x7e }) >= 0 {
+			return nil, "", errors.New("openwa: idempotency key must contain 1-255 visible ASCII characters")
+		}
+		if req.Method == http.MethodPost && isIdempotentSendPath(path) {
+			req.Header.Set("Idempotency-Key", key)
+		}
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")

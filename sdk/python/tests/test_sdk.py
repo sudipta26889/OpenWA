@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from typing import get_args, get_type_hints
 
@@ -18,6 +19,15 @@ from openwa.types import (
     AuthValidateResponse,
     BatchCancelResponse,
     HealthReadyResponse,
+    ForwardMessageRequest,
+    ReplyMessageRequest,
+    SendAudioRequest,
+    SendContactRequest,
+    SendLocationRequest,
+    SendMediaRequest,
+    SendPollRequest,
+    SendTemplateRequest,
+    SendTextRequest,
     WebhookDelivery,
     WebhookDeliveryEvent,
     WebhookEvent,
@@ -143,11 +153,17 @@ class TestClientCore:
         assert "name=my-bot" in backend.last_call.url
 
     def test_query_params_skip_none(self):
-        backend = MockBackend().on("GET", "/messages", body=[])
-        make_client(backend).messages.list("s1", {"chatId": "a@c.us", "limit": 10})
+        backend = MockBackend().on("GET", "/messages", body={"messages": [], "total": 0, "unknownTimestampTotal": 2})
+        result = make_client(backend).messages.list("s1", {
+            "chatId": "a@c.us", "limit": 10, "since": 1789855200000.5, "until": 1789941600000,
+            "direction": "incoming", "orderBy": "timestamp", "type": "image", "messageId": "M1",
+        })
         url = backend.last_call.url
         assert "chatId=a%40c.us" in url
         assert "limit=10" in url
+        for field in ("since=1789855200000.5", "until=1789941600000", "direction=incoming", "orderBy=timestamp", "type=image", "messageId=M1"):
+            assert field in url
+        assert result["unknownTimestampTotal"] == 2
 
     def test_build_url_escapes_a_literal_percent_in_a_query_value(self):
         # httpx before 0.27.1 sent "%41" unescaped, so the gateway decoded it to "A".
@@ -239,6 +255,98 @@ class TestClientCore:
         plain = fail(500, text="oops")
         assert plain.code is None and plain.retry_after_seconds is None
 
+    def test_an_error_with_no_body_names_the_status_text_not_none(self):
+        # A proxy in front of the gateway answers 502 and 504 with nothing.
+        transport = httpx.MockTransport(lambda _: httpx.Response(502, content=b""))
+        client = OpenWAClient(base_url="https://x", api_key="k", transport=transport)
+        with pytest.raises(OpenWAApiError) as caught:
+            client.health.live()
+        assert "Bad Gateway" in str(caught.value)
+        assert "None" not in str(caught.value)
+
+    def test_an_httpx_timeout_or_a_tuple_is_taken_as_given(self):
+        # The published 0.5.1 handed `timeout` straight to httpx, which takes both.
+        per_operation = httpx.Timeout(10.0, connect=2.0)
+        client = OpenWAClient(base_url="https://x", api_key="k", timeout=per_operation)
+        assert client._http._client.timeout == per_operation
+        client = OpenWAClient(base_url="https://x", api_key="k", timeout=(1.0, 2.0, 3.0, 4.0))
+        assert client._http._client.timeout == httpx.Timeout(connect=1.0, read=2.0, write=3.0, pool=4.0)
+        for bad in [(1.0, 2.0), (1.0, 2.0, 3.0, -1.0), (1.0, "2", 3.0, 4.0)]:
+            with pytest.raises(ValueError, match="timeout tuple"):
+                OpenWAClient(base_url="https://x", api_key="k", timeout=bad)  # type: ignore[arg-type]
+        # 0 and infinity mean no limit for that operation, as they do for the scalar: left as they are,
+        # httpx fails the first connect or read, or raises OverflowError, instead of the call.
+        client = OpenWAClient(base_url="https://x", api_key="k", timeout=(5, 0, 5, math.inf))
+        assert client._http._client.timeout == httpx.Timeout(connect=5.0, read=None, write=5.0, pool=None)
+
+    def test_the_api_key_loses_a_trailing_newline_and_an_illegal_one_is_refused_without_being_quoted(self):
+        client = OpenWAClient(base_url="https://x", api_key="owa_k1_secret\n")
+        assert client._http._client.headers["X-API-Key"] == "owa_k1_secret"
+        for bad in ["owa_k1_se\tcret", "owa_k1_se\x00cret", "owa_k1_sécret", "owa_k1_se\ncret"]:
+            with pytest.raises(ValueError, match="api_key") as raised:
+                OpenWAClient(base_url="https://x", api_key=bad)
+            assert bad not in str(raised.value)
+        with pytest.raises(ValueError, match="required"):
+            OpenWAClient(base_url="https://x", api_key="  \n")
+
+    def test_a_key_with_an_inner_space_is_accepted_as_the_gateway_and_other_clients_take_it(self):
+        client = OpenWAClient(base_url="https://x", api_key="correct horse battery staple correct horse\n")
+        assert client._http._client.headers["X-API-Key"] == "correct horse battery staple correct horse"
+
+    def test_a_default_header_the_stack_would_refuse_is_refused_without_quoting_its_value(self):
+        for name, value in [
+            ("CF-Access-Client-Secret", "s3cret-token\n"),
+            ("X-Trace", "caf\u00e9"),
+            ("X-Trace", "a\x00b"),
+        ]:
+            with pytest.raises(ValueError, match=name) as raised:
+                OpenWAClient(base_url="https://x", api_key="k", default_headers={name: value})
+            assert value.strip() not in str(raised.value)
+        with pytest.raises(ValueError, match="header name"):
+            OpenWAClient(base_url="https://x", api_key="k", default_headers={"X Bad": "v"})
+        # A tab and plain printable ASCII are fine.
+        client = OpenWAClient(base_url="https://x", api_key="k", default_headers={"X-Trace": "a\tb c"})
+        assert client._http._client.headers["X-Trace"] == "a\tb c"
+
+    def test_a_default_header_value_is_trimmed_of_the_spaces_the_stack_would_refuse_at_its_ends(self):
+        client = OpenWAClient(
+            base_url="https://x", api_key="k", default_headers={"X-Proxy-Cred": "  token \t", "X-Other": "\tv"}
+        )
+        assert client._http._client.headers["X-Proxy-Cred"] == "token"
+        assert client._http._client.headers["X-Other"] == "v"
+
+    def test_default_headers_take_every_shape_httpx_takes_and_refuse_the_rest_by_name(self):
+        pairs = OpenWAClient(
+            base_url="https://x", api_key="k", default_headers=[("X-Trace", "abc"), ("X-Two", "2")]  # type: ignore[arg-type]
+        )
+        assert pairs._http._client.headers["X-Trace"] == "abc"
+        assert pairs._http._client.headers["X-Two"] == "2"
+        raw = OpenWAClient(base_url="https://x", api_key="k", default_headers={b"X-Trace": b"abc"})  # type: ignore[dict-item]
+        assert raw._http._client.headers["X-Trace"] == "abc"
+        with pytest.raises(ValueError, match="X-Trace") as raised:
+            OpenWAClient(base_url="https://x", api_key="k", default_headers={"X-Trace": b"s3cret\n"})  # type: ignore[dict-item]
+        assert "s3cret" not in str(raised.value)
+        # An httpx.Headers keeps a repeated name as separate lines, and so does the client.
+        repeated = OpenWAClient(
+            base_url="https://x",
+            api_key="k",
+            default_headers=httpx.Headers([("Cookie", "a=1"), ("Cookie", "b=2")]),
+        )
+        assert repeated._http._client.headers.get_list("Cookie") == ["a=1", "b=2"]
+        for bad in (42, ["X-Trace"], [("X-Trace", "a", "b")]):
+            with pytest.raises(ValueError, match="default_headers"):
+                OpenWAClient(base_url="https://x", api_key="k", default_headers=bad)  # type: ignore[arg-type]
+
+    def test_timeout_zero_none_and_inf_mean_none_and_a_bad_value_raises(self):
+        for none in (0, None, float("inf")):
+            client = OpenWAClient(base_url="https://x", api_key="k", timeout=none)
+            assert client._http._client.timeout == httpx.Timeout(None)
+        client = OpenWAClient(base_url="https://x", api_key="k", timeout=2.5)
+        assert client._http._client.timeout == httpx.Timeout(2.5)
+        for bad in (-1, float("nan"), "30", True):
+            with pytest.raises(ValueError, match="timeout"):
+                OpenWAClient(base_url="https://x", api_key="k", timeout=bad)  # type: ignore[arg-type]
+
     def test_maps_503_to_service_unavailable(self):
         # The gateway answers 503 when the engine never confirmed an operation: a transport failure,
         # which is worth retrying, as a 429 is. It used to fall through to the base class while the
@@ -260,6 +368,82 @@ class TestClientCore:
 
 
 class TestMessages:
+    @pytest.mark.parametrize("key", [None, "!", "~", "a", "a" * 255])
+    def test_send_methods_forward_keys_without_changing_json(self, key: str | None) -> None:
+        backend = MockBackend().on("POST", "/messages/", body={"messageId": "m", "timestamp": 1})
+        client = make_client(backend)
+        text: SendTextRequest = {"chatId": "a@c.us", "text": "hello", "quotedMessageId": "q"}
+        media: SendMediaRequest = {"chatId": "a@c.us", "url": "https://media/image", "caption": "image"}
+        audio: SendAudioRequest = {"chatId": "a@c.us", "url": "https://media/audio", "ptt": True}
+        location: SendLocationRequest = {"chatId": "a@c.us", "latitude": -6.2, "longitude": 106.8}
+        contact: SendContactRequest = {"chatId": "a@c.us", "contactName": "A", "contactNumber": "628"}
+        template: SendTemplateRequest = {"chatId": "a@c.us", "templateId": "t", "vars": {}}
+        poll: SendPollRequest = {"chatId": "a@c.us", "name": "Q", "options": ["A", "B"]}
+        reply: ReplyMessageRequest = {"chatId": "a@c.us", "quotedMessageId": "q", "text": "reply"}
+        forward: ForwardMessageRequest = {"fromChatId": "a@c.us", "toChatId": "b@c.us", "messageId": "m"}
+
+        client.messages.send_text("s", text, idempotency_key=key)
+        client.messages.send_image("s", media, idempotency_key=key)
+        client.messages.send_video("s", media, idempotency_key=key)
+        client.messages.send_audio("s", audio, idempotency_key=key)
+        client.messages.send_document("s", media, idempotency_key=key)
+        client.messages.send_sticker("s", media, idempotency_key=key)
+        client.messages.send_location("s", location, idempotency_key=key)
+        client.messages.send_contact("s", contact, idempotency_key=key)
+        client.messages.send_template("s", template, idempotency_key=key)
+        client.messages.send_poll("s", poll, idempotency_key=key)
+        client.messages.reply("s", reply, idempotency_key=key)
+        client.messages.forward("s", forward, idempotency_key=key)
+
+        expected = [
+            ("send-text", text), ("send-image", media), ("send-video", media), ("send-audio", audio),
+            ("send-document", media), ("send-sticker", media), ("send-location", location),
+            ("send-contact", contact), ("send-template", template), ("send-poll", poll),
+            ("reply", reply), ("forward", forward),
+        ]
+        assert len(backend.calls) == len(expected)
+        for call, (segment, body) in zip(backend.calls, expected):
+            assert call.method == "POST"
+            assert call.url == f"http://localhost:2785/api/sessions/s/messages/{segment}"
+            assert call.body == body
+            if key is None:
+                assert "idempotency-key" not in call.headers
+            else:
+                assert call.headers["idempotency-key"] == key
+
+    def test_send_keys_stay_local_to_each_request(self) -> None:
+        backend = MockBackend().on("POST", "/send-text", body={"messageId": "m", "timestamp": 1})
+        client = make_client(backend)
+        body: SendTextRequest = {"chatId": "a@c.us", "text": "hello"}
+        client.messages.send_text("s", body, idempotency_key="first-key")
+        client.messages.send_text("s", body, idempotency_key="second-key")
+        client.messages.send_text("s", body)
+        assert [call.headers.get("idempotency-key") for call in backend.calls] == ["first-key", "second-key", None]
+        assert all(call.body == body for call in backend.calls)
+
+    def test_send_key_overrides_default_header_without_changing_defaults(self) -> None:
+        backend = MockBackend().on("POST", "/send-text", body={"messageId": "m", "timestamp": 1})
+        defaults = {"iDeMpOtEnCy-KeY": "default-key", "X-Trace": "trace"}
+        client = OpenWAClient(
+            base_url="http://localhost:2785", api_key="owa_k1_test",
+            default_headers=defaults, transport=backend.as_transport(),
+        )
+        body: SendTextRequest = {"chatId": "a@c.us", "text": "hello"}
+        client.messages.send_text("s", body, idempotency_key="request-key")
+        assert backend.last_call.headers["idempotency-key"] == "request-key"
+        assert backend.last_call.headers["x-trace"] == "trace"
+        client.messages.send_text("s", body)
+        assert backend.last_call.headers["idempotency-key"] == "default-key"
+        assert defaults == {"iDeMpOtEnCy-KeY": "default-key", "X-Trace": "trace"}
+
+    @pytest.mark.parametrize("key", ["", " ", "contains space", "key\n", "\u00e9", "a\x7fb", "a" * 256])
+    def test_invalid_send_keys_are_refused_before_transport(self, key: str) -> None:
+        backend = MockBackend()
+        client = make_client(backend)
+        with pytest.raises(ValueError, match="1-255 visible ASCII"):
+            client.messages.send_text("s", {"chatId": "a@c.us", "text": "hello"}, idempotency_key=key)
+        assert backend.calls == []
+
     def test_send_text_uses_send_text_path(self):
         backend = MockBackend().on("POST", "/send-text", body={"messageId": "m1", "timestamp": 1})
         make_client(backend).messages.send_text("s1", {"chatId": "a@c.us", "text": "hi"})
@@ -734,6 +918,25 @@ class TestWebhooks:
         make_client(backend).webhooks.create("s", {"url": "u", "events": ["message.received"], "filters": filters})
         assert backend.last_call.body == {"url": "u", "events": ["message.received"], "filters": filters}
 
+    def test_redrive_delivery_failures_posts_the_filter_or_an_empty_body(self):
+        result = {"redriven": 1, "delivered": 1, "enqueued": 0, "failed": 0, "skipped": 0, "remaining": 0}
+        backend = MockBackend().on("POST", "/api/webhooks/delivery-failures/redrive", body=result)
+        client = make_client(backend)
+        assert client.webhooks.redrive_delivery_failures({"sessionId": "s", "limit": 10}) == result
+        assert backend.last_call.method == "POST"
+        # The mock route is a substring match, so the full URL is what pins the path suffix.
+        assert backend.last_call.url == "http://localhost:2785/api/webhooks/delivery-failures/redrive"
+        assert backend.last_call.body == {"sessionId": "s", "limit": 10}
+        client.webhooks.redrive_delivery_failures()
+        assert backend.last_call.body == {}
+
+    def test_redrive_delivery_failures_keeps_an_explicit_empty_ids_list(self):
+        # The gateway reads ids: [] as "replay nothing" and an omitted ids as "replay up to 100 rows".
+        result = {"redriven": 0, "delivered": 0, "enqueued": 0, "failed": 0, "skipped": 0, "remaining": 3}
+        backend = MockBackend().on("POST", "/api/webhooks/delivery-failures/redrive", body=result)
+        make_client(backend).webhooks.redrive_delivery_failures({"ids": []})
+        assert backend.last_call.body == {"ids": []}
+
 
 class TestStatus:
     def test_send_image_video_forward_nested_media_body(self):
@@ -802,6 +1005,14 @@ class TestStatus:
 
 
 class TestChatsAndHealth:
+    def test_chats_preserve_optional_last_message_type(self):
+        backend = MockBackend().on("GET", "/chats", body=[
+            {"id": "photo@c.us", "lastMessageType": "image"}, {"id": "empty@c.us"},
+        ])
+        chats = make_client(backend).chats.list("s")
+        assert chats[0]["lastMessageType"] == "image"
+        assert "lastMessageType" not in chats[1]
+
     def test_chats(self):
         backend = MockBackend()
         backend.on("GET", "/chats", body=[])

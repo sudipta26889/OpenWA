@@ -233,17 +233,22 @@ export class SessionEngineEventWiring {
         }
         host.handleEngineReady(id, engine, phone, pushName);
       },
-      onMessage: (message): void => host.messages.handleInboundMessage(id, engine, message),
-      onHistoryMessages: (messages): void => {
+      // PostgreSQL only: holds each inbound message from arrival until its row is written.
+      ...(host.messages.holdsInbound
+        ? { admitInbound: arrival => host.messages.admitInbound(id, engine, arrival) }
+        : {}),
+      onMessage: (message, ticket) => host.messages.handleInboundMessage(id, engine, message, ticket),
+      onHistoryMessages: messages => {
         if (!host.isLiveEngine(id, engine)) return;
         // Persist for the chat view only; no dispatch (these predate the live session).
-        void host.messages
+        return host.messages
           .persistHistoryMessages(id, engine, messages)
           .catch(err => this.logger.error(`Failed to persist history messages for ${id}`, String(err)));
       },
-      onMessageCreate: (message): void => host.messages.handleOwnSendEcho(id, engine, message),
-      onMessageAck: (messageId, status): void => host.messages.handleMessageAck(id, engine, messageId, status),
-      onMessageRevoked: (message): void => host.messages.handleMessageRevoked(id, engine, message),
+      onMessageCreate: (message, ticket): void => host.messages.handleOwnSendEcho(id, engine, message, ticket),
+      onMessageAck: (messageId, status, chatId): void =>
+        host.messages.handleMessageAck(id, engine, messageId, status, chatId),
+      onMessageRevoked: (message, actor): void => host.messages.handleMessageRevoked(id, engine, message, actor),
       onMessageReaction: (event): void => {
         if (!host.isLiveEngine(id, engine)) return;
         if (!event.messageId) {
@@ -277,6 +282,18 @@ export class SessionEngineEventWiring {
         });
 
         host.messages.applyMessageEditQueued(id, message);
+      },
+      onEventResponse: (event): void => {
+        if (!host.isLiveEngine(id, engine)) return;
+        this.logger.debug(`Event response: ${event.response} to ${event.eventMessageId}`, {
+          sessionId: id,
+          chatId: event.chatId,
+          eventMessageId: event.eventMessageId,
+          action: 'event_response',
+        });
+        const payload = { sessionId: id, ...event };
+        host.eventsGateway.emitEventResponse(id, payload);
+        void host.webhookService.dispatch(id, 'event.response', payload);
       },
       onGroupEvent: (event): void => {
         if (!host.isLiveEngine(id, engine)) return;

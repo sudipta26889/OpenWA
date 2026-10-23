@@ -69,6 +69,7 @@ describe('BaileysPlugin.createEngine (opaque config)', () => {
       getMessage: jest.fn(),
       getMessages: jest.fn(),
       update: jest.fn(),
+      remove: jest.fn(),
       clearSession: jest.fn(),
     };
     const plugin = new BaileysPlugin(store);

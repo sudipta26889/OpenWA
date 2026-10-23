@@ -66,6 +66,33 @@ func TestNewValidation(t *testing.T) {
 	}
 }
 
+func TestNewTrimsTheKeyAndRefusesAControlCharacterWithoutRepeatingIt(t *testing.T) {
+	rt := &recordTransport{status: 200, body: `{"valid":true}`}
+	c, err := New("https://x", " owa_k1_test\n", WithTransport(rt))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := c.Auth.Validate(context.Background()); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got := rt.lastReq.Header.Get("X-API-Key"); got != "owa_k1_test" {
+		t.Fatalf("X-API-Key = %q, want the trimmed key", got)
+	}
+	// An inner space is part of a passphrase key.
+	if _, err := New("https://x", "correct horse battery"); err != nil {
+		t.Fatalf("a key with an inner space: %v", err)
+	}
+	for _, bad := range []string{"owa_k1_se\ncret", "owa_k1_se\x00cret", "owa_k1_se\x7fcret"} {
+		_, err := New("https://x", bad)
+		if err == nil {
+			t.Fatalf("expected an error for %q", bad)
+		}
+		if strings.Contains(err.Error(), "cret") {
+			t.Fatalf("the error repeats the key: %v", err)
+		}
+	}
+}
+
 func TestSendTextHitsCorrectPath(t *testing.T) {
 	rt := &recordTransport{status: 200, body: `{"messageId":"m1","timestamp":123}`}
 	c := newTestClient(t, rt)
@@ -175,12 +202,14 @@ func TestListSessionsQueryName(t *testing.T) {
 }
 
 func TestQueryEncoding(t *testing.T) {
-	rt := &recordTransport{status: 200, body: `{"messages":[],"total":0}`}
+	rt := &recordTransport{status: 200, body: `{"messages":[],"total":0,"unknownTimestampTotal":2}`}
 	c := newTestClient(t, rt)
 
-	_, err := c.Messages.List(context.Background(), "s1", &ListMessagesQuery{
+	page, err := c.Messages.List(context.Background(), "s1", &ListMessagesQuery{
 		ChatID: Ptr("628@c.us"),
 		Limit:  Ptr(10),
+		Since:  Ptr(1789855200000.5), Until: Ptr(1789941600000.0),
+		Direction: Ptr("incoming"), OrderBy: Ptr("timestamp"), Type: Ptr("image"), MessageID: Ptr("M1"),
 	})
 	if err != nil {
 		t.Fatalf("List: %v", err)
@@ -191,6 +220,14 @@ func TestQueryEncoding(t *testing.T) {
 	}
 	if _, ok := q["offset"]; ok {
 		t.Fatal("nil offset should not appear in query")
+	}
+	for key, expected := range map[string]string{"since": "1789855200000.5", "until": "1789941600000", "direction": "incoming", "orderBy": "timestamp", "type": "image", "messageId": "M1"} {
+		if q.Get(key) != expected {
+			t.Fatalf("%s = %q, want %q", key, q.Get(key), expected)
+		}
+	}
+	if page.UnknownTimestampTotal == nil || *page.UnknownTimestampTotal != 2 {
+		t.Fatalf("unknown time count = %v", page.UnknownTimestampTotal)
 	}
 }
 
@@ -1181,6 +1218,7 @@ func TestWebhookEventWireValues(t *testing.T) {
 		EventSessionReconnectLoop: "session.reconnect_loop",
 		EventSessionRestriction:   "session.restriction",
 		EventPresenceUpdate:       "presence.update",
+		EventEventResponse:        "event.response",
 		EventCallAccepted:         "call.accepted",
 		EventCallRejected:         "call.rejected",
 		EventCallMissed:           "call.missed",
@@ -1746,5 +1784,143 @@ func TestDoPathWithQueryAppendsQueryValues(t *testing.T) {
 	}
 	if got := rt.lastReq.URL.RawQuery; got != "limit=5&name=x" {
 		t.Errorf("query = %q, want %q", got, "limit=5&name=x")
+	}
+}
+
+func TestSendIdempotencyKey(t *testing.T) {
+	rt := &recordTransport{status: 200, body: `{"messageId":"m","timestamp":1}`}
+	c := newTestClient(t, rt, WithHeader("idempotency-key", "default"))
+	for _, segment := range []string{"send-text", "send-image", "send-video", "send-audio", "send-document", "send-sticker", "send-location", "send-contact", "send-template", "send-poll", "reply", "forward"} {
+		ctx := WithIdempotencyKey(context.Background(), segment)
+		if _, err := c.Messages.send(ctx, "s", segment, map[string]string{"chatId": "x"}); err != nil {
+			t.Fatal(err)
+		}
+		if got := rt.lastReq.Header.Values("Idempotency-Key"); len(got) != 1 || got[0] != segment {
+			t.Fatalf("%s: %v", segment, got)
+		}
+		if string(rt.lastRaw) != `{"chatId":"x"}` {
+			t.Fatalf("body changed: %s", rt.lastRaw)
+		}
+	}
+	if _, err := c.Messages.SendText(context.Background(), "s", SendTextRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.lastReq.Header.Get("Idempotency-Key"); got != "default" {
+		t.Fatalf("default mutated: %s", got)
+	}
+	for _, key := range []string{"", "a b", "a\n", "é", strings.Repeat("x", 256)} {
+		rt.lastReq = nil
+		if _, err := c.Messages.SendText(WithIdempotencyKey(context.Background(), key), "s", SendTextRequest{}); err == nil {
+			t.Fatalf("accepted %q", key)
+		}
+		if rt.lastReq != nil {
+			t.Fatalf("transport called for %q", key)
+		}
+	}
+}
+
+// The key is checked against the gateway's own rule: 1 to 255 characters, each a visible ASCII one
+// from '!' to '~'. A boundary moved by one refuses keys the gateway takes, or sends one it refuses.
+func TestIdempotencyKeyBoundaries(t *testing.T) {
+	rt := &recordTransport{status: 200, body: `{"messageId":"m","timestamp":1}`}
+	c := newTestClient(t, rt)
+	for _, tc := range []struct {
+		name   string
+		key    string
+		accept bool
+	}{
+		{"first visible character", "!", true},
+		{"last visible character", "~", true},
+		{"one character", "x", true},
+		{"longest key", strings.Repeat("x", 255), true},
+		{"one too long", strings.Repeat("x", 256), false},
+		{"empty", "", false},
+		{"space", " ", false},
+		{"delete", "a\x7fb", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt.lastReq = nil
+			_, err := c.Messages.SendText(WithIdempotencyKey(context.Background(), tc.key), "s", SendTextRequest{})
+			if tc.accept {
+				if err != nil {
+					t.Fatalf("refused %q: %v", tc.key, err)
+				}
+				if got := rt.lastReq.Header.Get("Idempotency-Key"); got != tc.key {
+					t.Fatalf("header = %q, want %q", got, tc.key)
+				}
+				return
+			}
+			if err == nil || rt.lastReq != nil {
+				t.Fatalf("accepted %q (err %v, sent %v)", tc.key, err, rt.lastReq != nil)
+			}
+		})
+	}
+}
+
+// A nil context is the caller's mistake, and net/http names it as an error. The idempotency lookup must
+// not turn it into a panic that takes the calling program down.
+func TestNilContextReturnsAnErrorInsteadOfPanicking(t *testing.T) {
+	rt := &recordTransport{status: 200, body: `{}`}
+	c := newTestClient(t, rt)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("a nil context panicked: %v", r)
+		}
+	}()
+	//nolint:staticcheck // the nil context is the point of the test
+	if _, err := c.Messages.SendText(nil, "s", SendTextRequest{}); err == nil {
+		t.Fatal("a nil context was accepted")
+	}
+	if rt.lastReq != nil {
+		t.Fatal("a request was sent with a nil context")
+	}
+}
+
+func TestRedrivePreservesAnEmptyIDsFilter(t *testing.T) {
+	rt := &recordTransport{status: 200, body: `{}`}
+	c := newTestClient(t, rt)
+	var zero []string
+	empty := []string{}
+	selected := []string{"f1"}
+	for _, tc := range []struct {
+		name string
+		ids  *[]string
+		want string
+	}{
+		{"omitted", nil, `{}`},
+		{"nil slice", &zero, `{"ids":[]}`},
+		{"empty slice", &empty, `{"ids":[]}`},
+		{"selected rows", &selected, `{"ids":["f1"]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &RedriveWebhookDeliveriesRequest{IDs: tc.ids}
+			if _, err := c.Webhooks.RedriveDeliveryFailures(context.Background(), body); err != nil {
+				t.Fatal(err)
+			}
+			if string(rt.lastRaw) != tc.want {
+				t.Fatalf("body = %s, want %s", rt.lastRaw, tc.want)
+			}
+			if body.IDs != tc.ids || zero != nil {
+				t.Fatal("request IDs mutated")
+			}
+		})
+	}
+}
+
+func TestRetryKeepsIdempotencyKey(t *testing.T) {
+	var keys []string
+	rt := RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		keys = append(keys, req.Header.Get("Idempotency-Key"))
+		return &http.Response{StatusCode: 503, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: req}, nil
+	})
+	c := newTestClient(t, rt, WithRetry(RetryPolicy{MaxRetries: 2, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond, RetryableStatuses: []int{503}}))
+	_, _ = c.Messages.SendText(WithIdempotencyKey(context.Background(), "stable"), "s", SendTextRequest{})
+	if len(keys) != 3 {
+		t.Fatalf("attempts: %v", keys)
+	}
+	for _, key := range keys {
+		if key != "stable" {
+			t.Fatalf("keys: %v", keys)
+		}
 	}
 }

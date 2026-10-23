@@ -1,6 +1,6 @@
 import type { WAMessage, WAMessageKey, WASocket } from '@whiskeysockets/baileys';
 import { ChatSummary, Contact, MediaInput } from '../interfaces/whatsapp-engine.interface';
-import { resolveMediaBuffer } from './baileys-messaging';
+import { assertReadableImage, resolveMediaBuffer } from './baileys-messaging';
 import { type createLogger } from '../../common/services/logger.service';
 import { BAILEYS_QUERY_BUDGET_MS, withQueryDeadline } from './baileys-query-deadline';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
@@ -209,6 +209,7 @@ export class BaileysContacts {
     // updateProfilePicture takes a WAMediaUpload; resolveMediaBuffer covers Buffer | base64 | URL,
     // the same conversion the media sends use.
     const { data } = await resolveMediaBuffer(media, this.host.sessionProxyUrl());
+    await assertReadableImage(data);
     await this.confirmed(this.sock().updateProfilePicture(selfJid, data), 'the profile picture change');
   }
 

@@ -187,6 +187,7 @@ export interface IncomingMessage {
   backgroundColor?: string;
   /** Styling of a text status/story: the WhatsApp font index. Only set by engines that expose it. */
   font?: number;
+  poll?: PollDetails;
   media?: {
     mimetype: string;
     filename?: string;
@@ -388,6 +389,13 @@ export interface LocationInput extends Quotable {
   address?: string;
 }
 
+/** Poll choices as received from the engine, without vote counts. */
+export interface PollDetails {
+  name: string;
+  options: string[];
+  allowMultipleAnswers: boolean;
+}
+
 export interface PollInput extends Quotable {
   /** Poll question / title. */
   name: string;
@@ -553,6 +561,8 @@ export interface ChatSummary {
   unreadCount: number;
   timestamp: number;
   lastMessage?: string;
+  /** Engine-neutral type of the last message, when available. */
+  lastMessageType?: MessageType;
   /** Archived state, as set via `POST /sessions/{sessionId}/chats/archive`. */
   archived: boolean;
   /** Pinned state, as set via `POST /sessions/{sessionId}/chats/pin`. */
@@ -638,6 +648,38 @@ export interface EditedMessage {
   /** WIDs mentioned by the edited message's latest content. */
   mentionedIds?: string[];
   /** Unix seconds when the edit occurred (not the original message creation time). */
+  timestamp: number;
+}
+
+/** A guest's answer to a WhatsApp event invitation (the "Going" / "Not going" / "Maybe" buttons). */
+export type EventResponseKind = 'going' | 'not_going' | 'maybe' | 'unknown';
+
+/**
+ * One RSVP to a WhatsApp event (the calendar-style event created from the attach menu). WhatsApp
+ * encrypts each RSVP with a key derived from the event creation message's `messageSecret`, so an
+ * engine can only report the answers to events whose creation message it holds. A guest who changes
+ * their answer produces a new RSVP; the one with the latest `timestamp` per `responderId` is the
+ * current state.
+ */
+export interface EventResponseEvent {
+  /** Id of the event creation message the RSVP answers. */
+  eventMessageId: string;
+  /** Neutral id of the chat the event was posted in. */
+  chatId: string;
+  /** Neutral id of the guest who answered (the account itself when it answered from its phone). */
+  responderId: string;
+  /** The responder's saved name and profile name, when the session knows either. */
+  contact?: { name?: string; pushName?: string };
+  /** True when the account itself answered (from its phone). */
+  fromMe: boolean;
+  response: EventResponseKind;
+  /** Extra guests the responder said they are bringing; absent when WhatsApp sent none. */
+  extraGuestCount?: number;
+  /** The event's name, when the creation message is available to read it from. */
+  eventName?: string;
+  /** Id of the RSVP message itself; unique per answer, so a changed answer has a new one. */
+  responseMessageId: string;
+  /** Unix seconds the guest answered (sender clock). */
   timestamp: number;
 }
 
@@ -786,23 +828,107 @@ export interface CallOutcomeEvent {
   timestamp: number;
 }
 
+/**
+ * A message's place in its session from the moment it arrives until its row is written (see
+ * `EngineEventCallbacks.admitInbound`). The engine hands it back with the message it emits.
+ */
+export interface InboundTicket {
+  /**
+   * Room for one downloaded payload: true once granted, false when the message asked for none, or
+   * when no room came free in time (the media then goes out with the omitted marker, undownloaded).
+   * Call it right before the download, never earlier: the grant is held until the row is written.
+   */
+  reserve: () => boolean | Promise<boolean>;
+  /** Keep the room until `p` settles too: work on the payload that may outlive the emit. */
+  holdUntil: (p: Promise<unknown>) => void;
+  /** The message will not be emitted: release its turn and its room. A no-op after the emit. */
+  drop: () => void;
+  /**
+   * Whether the session recorded a delete for everyone of this message while holding it, so emitting
+   * it stores the row cleared and announces nothing. False for a revoke the session never saw.
+   */
+  readonly revoked: boolean;
+}
+
+/**
+ * What the session made of a message handed to `EngineEventCallbacks.onMessage`, for an engine that
+ * keeps its own copy of messages keyed by id. An engine that keeps none ignores it.
+ */
+export interface InboundOutcome {
+  /**
+   * The session already holds a different message under this id (another chat, another side of the
+   * conversation, or another author), so the delivery was dropped as a duplicate. The engine's copy
+   * under that id is this delivery's, not the message the session holds, and must not stand in for it.
+   * Left out for a delivery that landed and for one the session cannot prove is another message.
+   */
+  conflict?: boolean;
+}
+
+/**
+ * The session's answer to `onMessage`, for an engine that wants to know what became of the message.
+ * Wrapped rather than a bare promise: most engines ignore it, and a promise nobody awaits reads as a
+ * mistake wherever a callback is called.
+ */
+export interface InboundReceipt {
+  /** Settles once the message's row is settled, with what became of it; never rejects. */
+  settled: Promise<InboundOutcome | undefined>;
+}
+
 export interface EngineEventCallbacks {
   onQRCode?: (qr: string) => void;
   onReady?: (phone: string, pushName: string) => void;
-  onMessage?: (message: IncomingMessage) => void;
+  /**
+   * Set only where a downloaded payload outlives the emit (PostgreSQL writes asynchronously). The
+   * engine calls it synchronously as each live message arrives, in arrival order, and passes the
+   * ticket to the emit, or drops it when the message is not emitted. `needsRoom` says whether the
+   * message will download media; `status` marks a status post. Undefined when the engine is stale.
+   */
+  admitInbound?: (arrival: {
+    id: string;
+    chatId: string;
+    needsRoom: boolean;
+    status: boolean;
+    /** Whether the account itself sent it. Left out where the engine cannot say before it maps the message. */
+    fromMe?: boolean;
+    /** The neutral id of the sender behind a group, status or list message, as `IncomingMessage.author`. */
+    author?: string;
+  }) => InboundTicket | undefined;
+  /**
+   * Fired for each received message. The session may answer with a receipt for what it makes of the
+   * message once its row is settled (see {@link InboundReceipt}); the engine never holds the message back
+   * for it. A change aimed at that message waits for the receipt only when it reads as foreign to the
+   * copy the engine holds under its id; one from that copy's own chat and author is not delayed. A receipt
+   * that fails, or is still unsettled after minutes, is let go of. No receipt comes for a message the
+   * session skips as ephemeral, nor for one the engine does not emit because its sender deleted it while
+   * it was processed and nothing holds it from its arrival (SQLite): the engine's copy of such a message
+   * that reuses another message's id is not reported as a conflict, and stays.
+   */
+  onMessage?: (message: IncomingMessage, ticket?: InboundTicket) => void | InboundReceipt;
   /**
    * Fired for messages the account itself created (outgoing) — including sends composed on a
    * linked phone, which the `message`/`onMessage` event never delivers. Used to emit `message.sent`.
    */
-  onMessageCreate?: (message: IncomingMessage) => void;
+  onMessageCreate?: (message: IncomingMessage, ticket?: InboundTicket) => void;
   /**
    * Fired when the delivery status of an outgoing message advances. The adapter maps its native
    * delivery signal to the neutral `DeliveryStatus`, so consumers never see engine-specific codes.
+   * `chatId` is the conversation the acked message belongs to, canonicalized the same way the
+   * inbound mappers canonicalize `IncomingMessage.chatId`; undefined when the engine's update
+   * carries no chat, and the emitted payload then omits the field rather than guess.
    */
-  onMessageAck?: (messageId: string, status: DeliveryStatus) => void;
-  onMessageRevoked?: (message: RevokedMessage) => void;
+  onMessageAck?: (messageId: string, status: DeliveryStatus, chatId?: string) => void;
+  /**
+   * `actor.fromMe` says whether the account itself made the revoke (from its phone). Only an engine that
+   * receives the raw protocol message can say; whatsapp-web.js leaves it out.
+   */
+  onMessageRevoked?: (message: RevokedMessage, actor?: { fromMe: boolean }) => void;
   onMessageReaction?: (event: ReactionEvent) => void;
   onMessageEdited?: (message: EditedMessage) => void;
+  /**
+   * Fired for each RSVP to a WhatsApp event (consumers emit `event.response`). Baileys only: it
+   * decrypts the RSVP itself from the stored event creation message. whatsapp-web.js never fires it.
+   */
+  onEventResponse?: (event: EventResponseEvent) => void;
   /**
    * Fired on group membership changes (join/leave), group metadata updates
    * (subject/description/announce/locked), and pending join requests. The `kind` selects the
@@ -818,8 +944,9 @@ export interface EngineEventCallbacks {
   /**
    * Bulk historical messages from an engine's initial sync (e.g. Baileys `messaging-history.set`).
    * They predate the live session, so consumers persist them for the chat view but must not dispatch.
+   * An async consumer may return stored revocations to keep previews cleared across resyncs.
    */
-  onHistoryMessages?: (messages: IncomingMessage[]) => void;
+  onHistoryMessages?: (messages: IncomingMessage[]) => void | Promise<IncomingMessage[] | void>;
   onDisconnected?: (reason: string) => void;
   /**
    * Fired each time the engine schedules an INTERNAL reconnect attempt: a drop it retries on its own

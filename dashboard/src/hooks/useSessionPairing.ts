@@ -89,7 +89,17 @@ export function useSessionPairing({ sessions, sessionsRef, reloadSessions }: Use
         // is ready. Only stop polling if the session itself has failed. 'authenticating' is included so
         // the modal (and the pairing-code panel mounted in it) survives the brief post-link handshake
         // instead of being torn down mid-pairing — it closes on the real 'ready'/'failed' transition.
-        const updated = await sessionApi.get(sessionId).catch(() => null);
+        let updated: Session | null = null;
+        try {
+          updated = await sessionApi.get(sessionId);
+        } catch (error) {
+          // A status read that got no answer (the network, a proxy dropping it, a gateway restart) or a
+          // refusal for rate or a server fault says nothing about the session: keep the modal, and a
+          // half-typed phone number with it, for the next poll. Only a refusal that names the session
+          // (404, 403) lets it close.
+          const status = (error as { status?: number }).status;
+          if (status === undefined || status === 429 || status >= 500) return;
+        }
         const stillInitializing = updated && ['initializing', 'qr_ready', 'authenticating'].includes(updated.status);
         if (!stillInitializing) {
           setQrData(cur => (cur?.sessionId === sessionId ? null : cur));

@@ -20,7 +20,7 @@ class TestableLoader extends PluginLoaderService {
   readonly hosts: FakeHost[] = [];
   capturedOnHookSubscribe?: (event: string, priority?: number) => void;
   capturedOnLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void;
-  capturedOnWorkerExit?: (code: number, intentional: boolean) => void;
+  capturedOnWorkerExit?: (code: number, intentional: boolean, reason?: string) => void;
   capturedOnUnresponsive?: () => void;
   protected createSandboxHost(
     _capDispatcher?: (verb: string, args: unknown[]) => Promise<unknown>,
@@ -29,7 +29,7 @@ class TestableLoader extends PluginLoaderService {
     onLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void,
     _runWithHookGuard?: (inFlightEvents: string[], run: () => Promise<unknown>) => Promise<unknown>,
     _onSearchProviderRegister?: () => void,
-    onWorkerExit?: (code: number, intentional: boolean) => void,
+    onWorkerExit?: (code: number, intentional: boolean, reason?: string) => void,
     onUnresponsive?: () => void,
   ): PluginWorkerHost {
     this.capturedOnHookSubscribe = onHookSubscribe;
@@ -124,6 +124,46 @@ describe('PluginLoaderService — sandbox tier routing', () => {
     expect(pluginOf(loader).status).toBe(PluginStatus.DISABLED);
     // the host must be dropped so a misbehaving plugin can't leak its worker thread
     expect((loader as unknown as { sandboxHosts: Map<string, unknown> }).sandboxHosts.has('p1')).toBe(false);
+  });
+
+  it('runs the worker onDisable and terminate once when shutdown overlaps a disable in flight', async () => {
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    await loader.enablePlugin('p1');
+    const host = loader.hosts[0];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => (release = resolve));
+    host.runLifecycle.mockClear().mockReturnValueOnce(gate);
+
+    const disabling = loader.disablePlugin('p1');
+    const destroying = loader.onModuleDestroy();
+    release();
+    await disabling;
+    await destroying;
+
+    expect(host.runLifecycle).toHaveBeenCalledTimes(1);
+    expect(host.runLifecycle).toHaveBeenCalledWith('onDisable', expect.any(Number));
+    expect(host.terminate).toHaveBeenCalledTimes(1);
+    expect(pluginOf(loader).status).toBe(PluginStatus.DISABLED);
+  });
+
+  it('tears down the second worker when a re-enabled plugin is disabled again', async () => {
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+
+    await loader.enablePlugin('p1');
+    await loader.disablePlugin('p1');
+    await loader.enablePlugin('p1');
+    await loader.disablePlugin('p1');
+
+    // Each enable starts its own worker and each disable has to end that one. A disable that joined the
+    // settled teardown of the first cycle would report success and leave the second worker running.
+    expect(loader.hosts).toHaveLength(2);
+    for (const host of loader.hosts) {
+      expect(host.runLifecycle).toHaveBeenCalledWith('onDisable', expect.any(Number));
+      expect(host.terminate).toHaveBeenCalledTimes(1);
+    }
+    expect(pluginOf(loader).status).toBe(PluginStatus.DISABLED);
   });
 
   it('dedups duplicate hook-subscribe from the worker so a flood cannot grow the host registry', async () => {
@@ -230,6 +270,19 @@ describe('PluginLoaderService — sandbox tier routing', () => {
       healthy: false,
       message: 'plugin is not running (status disabled)',
     });
+  });
+
+  it('shows why a sandboxed worker died when it reported a reason before exiting', async () => {
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    await loader.enablePlugin('p1');
+    jest
+      .spyOn((loader as unknown as { logger: { warn: jest.Mock } }).logger, 'warn')
+      .mockImplementation(() => undefined);
+
+    loader.capturedOnWorkerExit!(1, false, 'boom: relay answered 500');
+
+    expect(pluginOf(loader).error).toBe('worker exited unexpectedly (code 1): boom: relay answered 500');
   });
 
   it('enables a built-in plugin in-process (no sandbox worker spawned)', async () => {

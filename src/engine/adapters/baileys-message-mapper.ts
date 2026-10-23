@@ -1,11 +1,19 @@
-import { DeliveryStatus, IncomingMessage, MessageType } from '../interfaces/whatsapp-engine.interface';
+import type { proto } from '@whiskeysockets/baileys';
+import {
+  DeliveryStatus,
+  EventResponseKind,
+  IncomingMessage,
+  MessageType,
+} from '../interfaces/whatsapp-engine.interface';
 import { chatKind } from '../identity/wa-id';
 
 /**
  * Content types that change or annotate another message and carry nothing of their own: a poll vote,
  * an in-chat pin, a keep-in-chat toggle, an album header (its photos arrive as their own messages), an
- * encrypted reaction, an event RSVP, an encrypted edit (an event edit) and an encrypted comment. Mapped,
- * they would surface as a bodyless `unknown` message, so the live and history paths drop them instead.
+ * encrypted reaction, an event RSVP, an encrypted edit and an encrypted comment. Mapped, they would
+ * surface as a bodyless `unknown` message, so the live and history paths drop them instead. The live
+ * path first reads an encrypted edit or reaction it holds the secret for (baileys-secret-payload.ts),
+ * and drops only what it cannot read.
  */
 export const BAILEYS_NON_CONTENT_TYPES: ReadonlySet<string> = new Set([
   'pollUpdateMessage',
@@ -17,6 +25,23 @@ export const BAILEYS_NON_CONTENT_TYPES: ReadonlySet<string> = new Set([
   'secretEncryptedMessage',
   'encCommentMessage',
 ]);
+
+/**
+ * Map Baileys' `EventResponseMessage.EventResponseType` (UNKNOWN=0, GOING=1, NOT_GOING=2, MAYBE=3)
+ * to the neutral RSVP kind. Matched by number so the mapper needs no runtime proto import.
+ */
+export function mapBaileysEventResponseType(type: number | null | undefined): EventResponseKind {
+  switch (type) {
+    case 1:
+      return 'going';
+    case 2:
+      return 'not_going';
+    case 3:
+      return 'maybe';
+    default:
+      return 'unknown';
+  }
+}
 
 /**
  * Map a Baileys message content-type token (from `getContentType`) to the engine-neutral
@@ -912,6 +937,17 @@ export function mapBaileysStatus(status: number | null | undefined): DeliverySta
   }
 }
 
+/** Extract native poll versions from content already normalized by Baileys. */
+export function extractBaileysPoll(content: proto.IMessage): IncomingMessage['poll'] {
+  const poll = content.pollCreationMessage ?? content.pollCreationMessageV2 ?? content.pollCreationMessageV3;
+  if (!poll) return undefined;
+  const options = (poll.options ?? [])
+    .map(option => option.optionName)
+    .filter((option): option is string => typeof option === 'string');
+  if (!options.length) return undefined;
+  return { name: poll.name ?? '', options, allowMultipleAnswers: poll.selectableOptionsCount !== 1 };
+}
+
 /**
  * The subset of a Baileys `WAMessage` the adapter reads (after proto extraction) to build the
  * base of an {@link IncomingMessage}. Declared explicitly so the neutral-shape logic is
@@ -942,6 +978,7 @@ export interface BaileysIncomingFields {
   /** Pre-extracted commerce ids. Populated by the adapter for `orderMessage` / `productMessage`. */
   order?: IncomingMessage['order'];
   product?: IncomingMessage['product'];
+  poll?: IncomingMessage['poll'];
   /** Pre-extracted button/list reply. Populated by the adapter when the user tapped a control. */
   button?: IncomingMessage['button'];
   /** Pre-extracted prompt choices. Populated by the adapter for business button/list prompts. */
@@ -982,6 +1019,15 @@ export function storedKeyInChat(
   const raw = key.remoteJid ?? '';
   const want = neutral(chatId);
   return neutral(raw) === want || neutral(baileysChatJid(raw, key.participant, key.fromMe === true)) === want;
+}
+
+/**
+ * The participant a live key names, or undefined when it names none. Baileys passes every live key
+ * through cleanMessage, which writes jidNormalizedUser(participant) back, and that is '' for the absent
+ * participant of a 1:1 chat. `??` keeps the empty string, which then reads as a sender that is nobody.
+ */
+export function keyParticipant(key: { participant?: string | null }): string | undefined {
+  return key.participant ? key.participant : undefined;
 }
 
 /**
@@ -1030,7 +1076,7 @@ export function buildIncomingMessageFromBaileys(
   }
 
   // The lid check uses the RAW sender (participant in a group, else the chat JID) before normalization.
-  const senderJid = fields.participant ?? rawChatId;
+  const senderJid = fields.participant ? fields.participant : rawChatId;
   if (senderJid.endsWith('@lid')) {
     incoming.isLidSender = true;
   }
@@ -1050,6 +1096,8 @@ export function buildIncomingMessageFromBaileys(
   if (fields.media) {
     incoming.media = fields.media;
   }
+
+  if (fields.poll) incoming.poll = fields.poll;
 
   if (fields.location) {
     incoming.location = fields.location;

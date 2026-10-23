@@ -56,7 +56,8 @@ from disk is user-installed and sandboxed.
   still working through a backlog of dispatches reads the ping late, but every result it returns counts
   as an answer. A worker whose event loop is blocked answers nothing for 5 s, so the host terminates it
   and sets the plugin to `ERROR` (no automatic restart, the same as a crash); the operator re-enables it
-  once fixed.
+  once fixed. At graceful shutdown every plugin's `onDisable` shares one 10 s cap, and a worker still
+  running at the cap dies with the process.
 - **Memory-kind boundary.** The heap cap bounds the V8 heap only. `Buffer`/`ArrayBuffer` allocations
   are native memory outside `maxOldGenerationSizeMb`, and worker threads share the host's address
   space, so a plugin that accumulates Buffers grows host RSS until the container's memory limit
@@ -83,8 +84,8 @@ process can do to the host; it does not confine a plugin away from anything that
   first instruction, with no capabilities added (the chart's `podSecurityContext`). The rest of the
   confinement comes from the bundled `docker-compose.yml`, not from the image: `read_only: true`
   rootfs with a tmpfs `/tmp`, `no-new-privileges`, and `cap_drop: ALL` with a minimal re-add
-  (`CHOWN`/`DAC_OVERRIDE`/`FOWNER`/`SETGID`/`SETUID`) that only the root entrypoint uses — once `gosu`
-  setuids, the Node process keeps no effective capabilities. A plain `docker run` of the image gets
+  (`CHOWN`/`DAC_OVERRIDE`/`FOWNER`/`KILL`/`SETGID`/`SETUID`) that only the root entrypoint and init use —
+  once `gosu` setuids, the Node process keeps no effective capabilities. A plain `docker run` of the image gets
   none of the compose-level settings, so replicate them yourself if you deploy that way.
 - **What a loaded plugin can still reach.** Everything the OpenWA process can, including:
   - the process environment through `/proc/self/environ` on Linux, with every secret the deployment

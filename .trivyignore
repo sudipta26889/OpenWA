@@ -27,8 +27,8 @@ CVE-2026-102278
 #
 # Same shape as the entries above: the only affected copy is the one bundled inside the npm CLI
 # (/usr/local/lib/node_modules/npm/node_modules/undici, 6.28.0 in npm 12.1.0). The application tree
-# is at the fix on its own: undici is a direct dependency at ^8.10.2, which package-lock.json
-# resolves to 8.10.2, so this ID-level ignore cannot hide an application-tree finding. Drop this
+# is at the fix on its own: undici is a direct dependency whose range starts at or above the fixed
+# 8.10.2, so this ID-level ignore cannot hide an application-tree finding. Drop this
 # entry once npm ships a bundle with undici >= 6.28.1.
 CVE-2026-19534
 
@@ -38,12 +38,13 @@ CVE-2026-19534
 # Chrome for Testing publishes linux-arm64 builds only from 153 on, and the image has not moved arm64 to
 # one. Those are dpkg packages, so the scan sees them and a fixable HIGH/CRITICAL fails it.
 # `ignore-unfixed` still hides every chromium CVE Debian has not fixed yet, so a passing arm64 scan
-# does not mean the browser has no open advisories. Measured on 2026-09-15 against
-# ghcr.io/rmyndharis/openwa:main (arm64, the release flags minus `ignore-unfixed`): `chromium`,
-# `chromium-common` and `chromium-sandbox` each carry 2 CRITICAL and 15 HIGH advisories in state
-# "affected", i.e. Debian has published no fix. That exposure is accepted for the release: the
-# alternative is moving arm64 off the Debian package to Chrome for Testing, which publishes
-# linux-arm64 builds from 153 on. Re-measure with
+# does not mean the browser has no open advisories. Measured on 2026-10-14 against an arm64 build
+# of the release tree (the release flags minus `ignore-unfixed`): `chromium`, `chromium-common` and
+# `chromium-sandbox` each carry 1 HIGH advisory in state "affected", i.e. Debian has published no
+# fix (2026-09-15 measured 2 CRITICAL and 15 HIGH each, before bookworm-security shipped newer
+# builds). That exposure is accepted for the release: the alternative is moving arm64 off the
+# Debian package to Chrome for Testing, which publishes linux-arm64 builds from 153 on. Re-measure
+# with
 # `trivy image --severity CRITICAL,HIGH --platform linux/arm64 ghcr.io/rmyndharis/openwa:<tag>`
 # when deciding whether the number still fits. The eleven chromium CVEs this file used to accept
 # (between CVE-2026-76033 and CVE-2026-76047) were fixed in 151.0.7922.169, and bookworm-security has

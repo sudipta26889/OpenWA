@@ -11,7 +11,7 @@ import {
 } from '../interfaces/whatsapp-engine.interface';
 import { mapBaileysGroup, mapBaileysGroupInfo } from './baileys-group-mapper';
 import { GroupNotFoundError } from '../../common/errors/group-not-found.error';
-import { resolveMediaBuffer } from './baileys-messaging';
+import { assertReadableImage, resolveMediaBuffer } from './baileys-messaging';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { EngineThrottledError } from '../../common/errors/engine-throttled.error';
@@ -484,6 +484,7 @@ export class BaileysGroups {
     this.host.ensureReady();
     // Same socket call as the own-account picture, addressed at the group JID.
     const { data } = await resolveMediaBuffer(media, this.host.sessionProxyUrl());
+    await assertReadableImage(data);
     await this.pictureWrite(groupId, 'Setting the group picture', () =>
       this.confirmed(this.sock().updateProfilePicture(groupId, data), 'the group picture change'),
     );

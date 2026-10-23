@@ -1,5 +1,7 @@
 import { DataSource } from 'typeorm';
 import { PluginInstance } from './entities/plugin-instance.entity';
+import { ConversationMapping } from './entities/conversation-mapping.entity';
+import { ConversationMappingService } from './conversation-mapping.service';
 import { PluginInstanceService, InstanceExistsError } from './plugin-instance.service';
 import { AddIntegrationFabric1781900000000 } from '../../database/migrations/1781900000000-AddIntegrationFabric';
 import type { PluginConfigSchema } from '../../core/plugins/plugin.interfaces';
@@ -118,7 +120,12 @@ describe('PluginInstanceService provisioning', () => {
   let ds: DataSource;
   let service: PluginInstanceService;
   beforeEach(async () => {
-    ds = new DataSource({ type: 'better-sqlite3', database: ':memory:', entities: [PluginInstance], migrations: [] });
+    ds = new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [PluginInstance, ConversationMapping],
+      migrations: [],
+    });
     await ds.initialize();
     const runner = ds.createQueryRunner();
     await new AddIntegrationFabric1781900000000().up(runner);
@@ -149,6 +156,36 @@ describe('PluginInstanceService provisioning', () => {
     const rotated = await service.regenerateSecret('chatwoot', 'acct1');
     expect(rotated?.secret).toMatch(/^[0-9a-f]{64}$/);
     expect(rotated?.secret).not.toBe(created.secret);
+  });
+
+  it('releases the takeover a deleted instance held, so other plugins are no longer silenced on that chat', async () => {
+    const mappings = ds.getRepository(ConversationMapping);
+    const mapping = (pluginId: string, instanceId: string, chatId: string, handoverState: 'human' | 'closed') =>
+      mappings.save(
+        mappings.create({
+          sessionId: 'sess-1',
+          chatId,
+          pluginId,
+          instanceId,
+          providerConversationId: `${instanceId}-${chatId}`,
+          handoverState,
+        }),
+      );
+    await mapping('chatwoot', 'acct1', '1@c.us', 'human');
+    await mapping('chatwoot', 'acct1', '2@c.us', 'closed');
+    await mapping('chatwoot', 'acct2', '3@c.us', 'human');
+    const lookup = new ConversationMappingService(mappings);
+    expect(await lookup.findHandoverForChat('sess-1', '1@c.us')).toMatchObject({ handoverState: 'human' });
+
+    await service.create('chatwoot', 'acct1', {});
+    await service.remove('chatwoot', 'acct1');
+
+    expect(await lookup.findHandoverForChat('sess-1', '1@c.us')).toBeNull();
+    expect(await lookup.findHandoverForChat('sess-1', '2@c.us')).toBeNull();
+    // The rows stay, so the same instance provisioned again keeps its provider conversations; another
+    // instance's takeover is untouched.
+    expect((await mappings.findOneByOrFail({ chatId: '1@c.us' })).providerConversationId).toBe('acct1-1@c.us');
+    expect(await lookup.findHandoverForChat('sess-1', '3@c.us')).toMatchObject({ handoverState: 'human' });
   });
 
   it('update patches enabled/scope/config in one write; remove deletes', async () => {

@@ -1172,6 +1172,31 @@ describe('AuthService', () => {
       expect(bannerText()).toContain('(check dashboard for keys)');
     });
 
+    // /api/docs answers 404 whenever Swagger is off, which is the default under NODE_ENV=production.
+    it.each([
+      ['off by default in production', { NODE_ENV: 'production' }, false],
+      ['on in production when enabled', { NODE_ENV: 'production', ENABLE_SWAGGER: 'true' }, true],
+      ['on by default outside production', { NODE_ENV: 'development' }, true],
+      ['off outside production when disabled', { NODE_ENV: 'development', ENABLE_SWAGGER: 'false' }, false],
+    ])('boot prints the API docs URL only when it is served: %s', async (_label, env, served) => {
+      const saved = { NODE_ENV: process.env.NODE_ENV, ENABLE_SWAGGER: process.env.ENABLE_SWAGGER };
+      delete process.env.ENABLE_SWAGGER;
+      Object.assign(process.env, env);
+      try {
+        (repository.count as jest.Mock).mockResolvedValue(1);
+
+        await service.onModuleInit();
+
+        expect(bannerText()).toContain('Dashboard:');
+        expect(bannerText().includes('/api/docs')).toBe(served);
+      } finally {
+        for (const [name, value] of Object.entries(saved)) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+      }
+    });
+
     it('boot keeps a live bootstrap key: file untouched, banner shows the masked fingerprint', async () => {
       (repository.count as jest.Mock).mockResolvedValue(1);
       existsSpy.mockReturnValue(true);

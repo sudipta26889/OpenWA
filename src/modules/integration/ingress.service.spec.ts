@@ -592,6 +592,17 @@ describe('dedupOn: body (a provider that rotates its delivery id on retry)', () 
     expect((d.enqueue.mock.calls[0] as [unknown, string])[1]).toBe('d-1');
   });
 
+  it('falls back to the body hash when the dedup header is longer than 255 characters', async () => {
+    const d = deps();
+    await new IngressService(d).handle({ ...req, headers: { 'x-delivery': 'x'.repeat(256) }, rawBody: '{"n":1}' });
+    const id = (d.enqueue.mock.calls[0] as [unknown, string])[1];
+    expect(id).toMatch(/^[0-9a-f]{64}$/);
+    // The bound is inclusive: an id of exactly 255 characters is still the provider's.
+    const edge = deps();
+    await new IngressService(edge).handle({ ...req, headers: { 'x-delivery': 'y'.repeat(255) }, rawBody: '{"n":1}' });
+    expect((edge.enqueue.mock.calls[0] as [unknown, string])[1]).toBe('y'.repeat(255));
+  });
+
   // A header that is present but blank is no id at all. Taking it as one gave every delivery the
   // same empty key, so the dedup row admitted the first and dropped the rest while still answering
   // each provider with the route's success ack.

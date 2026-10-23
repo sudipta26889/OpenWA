@@ -1,5 +1,7 @@
 # rmyndharis-openwa
 
+This document describes `main`. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name are unreleased additions after SDK 0.5.1 and require the corresponding server changes after OpenWA 0.24.0.
+
 Official Python SDK for [OpenWA](https://github.com/rmyndharis/OpenWA), the open-source WhatsApp API Gateway. OpenWA is an independent project, not affiliated with or endorsed by WhatsApp or Meta.
 
 A synchronous client built on [httpx](https://www.python-httpx.org/), with bundled type hints (PEP 561).
@@ -11,16 +13,6 @@ pip install rmyndharis-openwa
 ```
 
 Requires Python 3.9+. The importable module is `openwa`.
-
-This README describes `main`. The 0.5.0 release lacks, among other additions, `sessions.get_proxy`,
-`sessions.update_proxy`, `messages.click_button`, `verify_webhook_signature`, the `WebhookDelivery`
-type, the `.code`, `.retry_after_seconds` and `.headers` error attributes, the `name` key of
-`ListSessionsQuery`, the `after` and `inlineMedia` keys of `ListMessagesQuery`, the `archived`,
-`pinned`, `muted` and `muteExpiration` keys of `ChatSummary`, the `order` and `product` keys of
-`ChatHistoryMessage`, the refusal of an empty, `.` or `..` id and the `ValueError` that
-`client.request` raises for a path that does not begin with `/` (0.5.0 resolves `api/health`
-against the base URL); they ship with the next SDK release. See
-[the SDK overview](../README.md#coverage).
 
 ## Usage
 
@@ -37,7 +29,7 @@ client = OpenWAClient(
 session = client.sessions.create({"name": "my-session"})
 client.sessions.start(session["id"])
 
-# Link the account before sending: scan sessions.get_qr_code or use sessions.request_pairing_code,
+# Link the account before sending: scan sessions.get_qr_code (or use sessions.request_pairing_code for a number with no linked session),
 # then wait for status "ready". An unlinked session answers the send with 409.
 result = client.messages.send_text(session["id"], {
     "chatId": "628123456789@c.us",
@@ -71,8 +63,11 @@ is configured the server returns 501.
 ```python
 res = client.search.search({"q": "invoice", "sessionId": session_id, "limit": 20})
 for hit in res["hits"]:
-    print(hit["snippet"], hit["score"])
+    print(hit["snippet"], hit.get("score"))
 ```
+
+`score` is provider-dependent and optional: the built-in provider on SQLite leaves it out for a key restricted
+to sessions or chats, so read it with `get`.
 
 ## Messaging
 
@@ -166,7 +161,7 @@ rejects the upload, so configure it first.
 Cutting a release:
 
 1. Bump `version` in `pyproject.toml` and land it on `main`.
-2. Tag that commit `py-sdk-v<version>` (e.g. `py-sdk-v0.5.0`) and push the tag.
+2. Tag that commit `py-sdk-v<version>` (e.g. `py-sdk-v0.5.1`) and push the tag.
    The SDK has its own version line — the monorepo's `v*` tags are the app
    version and never trigger an SDK publish.
 3. The workflow re-runs the test suite, builds the sdist and wheel, and
@@ -175,3 +170,15 @@ Cutting a release:
 ## License
 
 MIT
+
+## Send idempotency
+
+The example below requires the unreleased SDK changes on `main`; SDK 0.5.1 does not expose this per-send key argument. The server must also include the send idempotency changes after OpenWA 0.24.0.
+
+Supply a unique caller-owned key for one logical send and reuse it when retrying that same call. Keys contain 1-255 visible ASCII characters; unrelated calls must use different keys. The SDK forwards the key without changing its retry policy or generating one automatically.
+
+```python
+client.messages.send_text(session_id, {"chatId": "628123@c.us", "text": "Hello"}, idempotency_key="order-123")
+```
+
+The gateway supports text, image, video, audio, document, sticker, location, contact, template, poll, reply and forward sends. Completed calls replay their response; a 409 with the error `code` `IDEMPOTENCY_KEY_IN_PROGRESS` means the first request is still running, so retry with the same key later; a 409 `IDEMPOTENCY_OUTCOME_UNKNOWN` means the message may have been sent, so check the chat and, if it did not arrive, send again with a new key (the `code` tells them apart from the 409 for a session that is not connected). A changed request with the same key returns 422. The gateway retains keys for 24 hours. Bulk, product and button operations have no such guarantee. Omit the key to preserve existing behavior.

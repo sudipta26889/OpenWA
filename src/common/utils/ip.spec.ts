@@ -132,4 +132,12 @@ describe('resolveClientIp', () => {
   it('skips a trusted hop that carries a port', () => {
     expect(resolveClientIp(req('10.0.0.2', '198.51.100.20, 10.0.0.9:8080'), ['10.0.0.0/8'])).toBe('198.51.100.20');
   });
+
+  it('walks X-Forwarded-For from the right, so an address the client wrote on the left is never chosen', () => {
+    // The client sent `203.0.113.99`; the trusted proxy appended the address it actually saw.
+    expect(resolveClientIp(req('10.0.0.2', '203.0.113.99, 198.51.100.7'), ['10.0.0.0/8'])).toBe('198.51.100.7');
+    expect(resolveClientIp(req('10.0.0.2', '203.0.113.99, 198.51.100.7, 10.0.0.9'), ['10.0.0.0/8'])).toBe(
+      '198.51.100.7',
+    );
+  });
 });

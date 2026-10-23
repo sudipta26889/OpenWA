@@ -221,7 +221,7 @@ interface MyPluginConfig {
 
 export default class MyAwesomePlugin implements IPlugin {
   async onLoad(ctx: PluginContext): Promise<void> {
-    ctx.logger.log('Plugin loaded', { version: ctx.manifest.version });
+    ctx.logger.log('Plugin loaded', { pluginId: ctx.pluginId });
 
     // Register a hook handler. Handlers receive a HookContext and return a HookResult.
     ctx.registerHook('message:received', async hookCtx => {
@@ -277,13 +277,13 @@ export interface IPlugin {
 
 export interface PluginContext {
   pluginId: string;
-  manifest: PluginManifest;
+  manifest: PluginManifest; // in-process (built-in) context only; a sandboxed plugin has none
 
   // Effective config for the firing session (per-session override merged over the base). A getter,
   // so it reflects live config edits; outside a hook it returns the base config.
   config: Record<string, unknown>;
 
-  hookManager: HookManager;
+  hookManager: HookManager; // in-process (built-in) context only; a sandboxed plugin registers through registerHook
   logger: PluginLogger; // log / debug / warn / error
   storage: PluginStorage; // get / set / delete / list — requires 'storage:use', scoped to this plugin
 
@@ -526,9 +526,15 @@ The gateway still stores and emits each chat's messages in arrival order: the `m
 `message:sent` chains run concurrently, but the row insert, the websocket event, `message:persisted` and
 the start of webhook dispatch wait for every earlier message of the same chat. A slow handler therefore
 delays that chat's later messages, by at most its 5 s hook timeout (`SANDBOX_HOOK_TIMEOUT_MS`) for a
-sandboxed plugin. Webhook dispatch itself is not ordered: its queue jobs and HTTP deliveries run
-concurrently, so a receiver that needs order should sort by the message's `data.timestamp`. That value is
-whole seconds from WhatsApp, so messages sent within the same second cannot be put back in order.
+sandboxed plugin. On PostgreSQL a chat's `message:received` and `message:sent` chains also start in
+arrival order, for the messages the engine admitted: inbound messages, sends composed on the phone and
+every whatsapp-web.js echo. The echo of a Baileys API send is not admitted, so its `message:sent` chain
+starts at once while its row and events still follow arrival order. A handler registered in-process that never settles also holds the media slots of its
+message, so once `INBOUND_MEDIA_CONCURRENCY` slots are stuck the session's media arrives with the omitted
+marker (see [12 - Troubleshooting & FAQ](./12-troubleshooting-faq.md)). Webhook dispatch itself is not
+ordered: its queue jobs and HTTP deliveries run concurrently, so a receiver that needs order should sort
+by the message's `data.timestamp`. That value is whole seconds from WhatsApp, so messages sent within the
+same second cannot be put back in order.
 
 ## 19.6 Plugin Loader
 
@@ -579,13 +585,24 @@ double-enable, and engines must match the configured active engine):
 
 **Disable / unload / uninstall.** `disablePlugin` runs `onDisable` (force-terminating the worker for a
 sandboxed plugin, even if `onDisable` hangs or throws) and unregisters the plugin's hooks. `onModuleDestroy`
-disables every enabled plugin on graceful shutdown so stateful plugins can flush. `uninstallPlugin`
-disables + unloads, drops the registry entry, and deletes the plugin's directory and its `ctx.storage`
-data dir (built-ins are protected and cannot be uninstalled). The unload path dispatches `onUnload`:
-for a sandboxed plugin it runs in the worker between `onDisable` and terminate (a plain disable does
-NOT fire `onUnload` — disable is reversible and its cleanup hook is `onDisable`).
+disables every enabled plugin on graceful shutdown so stateful plugins can flush. Plugins are disabled
+in parallel, so the order of `onDisable` across plugins is unspecified and a handler must not rely on
+another plugin still being enabled. Running plugins go first; then it waits for enables already in
+flight (a sandboxed enable is three 30 s-bounded calls) and disables those plugins too. The whole
+phase, waits included, is capped at 10 s; a plugin still running at the cap is terminated with the
+process. New enables are refused once teardown starts. A disable that arrives while the same plugin is
+still being disabled (shutdown overlapping a REST disable, an uninstall or an update unload) joins the
+running teardown, so `onDisable` runs once; an unload that joins this way gets no worker-side `onUnload`.
+`uninstallPlugin` disables + unloads, drops the registry entry, and deletes the plugin's directory and
+its `ctx.storage` data dir (built-ins are protected and cannot be uninstalled). The unload path
+dispatches `onUnload`: for a sandboxed plugin it runs in the worker between `onDisable` and terminate
+(a plain disable does NOT fire `onUnload`; disable is reversible and its cleanup hook is `onDisable`).
+Uninstall also hands every chat the plugin had taken over back to the bot. The plugin's integration
+instances, with their encrypted secrets, and its stored deliveries stay in the database, so a reinstall finds
+its provider webhooks still pointing at live instance ids; remove an instance for good with
+`DELETE /api/integration/plugins/:pluginId/instances/:instanceId`, which works with the plugin gone.
 
-**Context.** `createPluginContext` builds the `PluginContext` (§19.4): a per-plugin logger,
+**Context.** `PluginCapabilityContext.createPluginContext` (`src/core/plugins/plugin-capability-context.ts`) builds the `PluginContext` (§19.4): a per-plugin logger,
 `registerHook` (wrapped with the per-session activation gate), `registerWebhook`, the live
 `config` getter, and the permission-checked `messages` / `engine` / `net` / `storage` / `conversations` /
 `handover` / `mappings` capabilities. The capability methods call `assertPermission` before doing any
@@ -658,7 +675,8 @@ data) would declare `engine:read` and call `ctx.engine.getGroupInfo(...)` / `ctx
 ## 19.8 Plugin Management API
 
 `PluginsController` (`src/modules/plugins/plugins.controller.ts`) is mounted at `plugins` and **every
-route requires the `ADMIN` role** (`@RequireRole(ApiKeyRole.ADMIN)` — not a bare API-key guard). There
+route requires the `ADMIN` role** (`@RequireRole(ApiKeyRole.ADMIN)` — not a bare API-key guard) and an
+unscoped key (a session-scoped key is refused), except `PUT :id/config/:sessionId`. There
 is **no** `POST :id/reload` and **no** `GET :id/config`. Install is a multipart `.zip` upload (or by
 URL / catalog), not an npm/github source descriptor.
 
@@ -726,12 +744,12 @@ export const PluginCapabilityPermission = {
 ```
 
 There is no `PermissionChecker` class and no `PermissionDeniedError`. Enforcement of the five
-capability-facade permissions lives in the loader: each capability method calls
+capability-facade permissions lives in `PluginCapabilityContext`: each capability method calls
 `assertPermission(manifest, permission)` before doing any work, and a plugin whose manifest does not
 declare the matching permission (or declares none) is rejected with a `PluginCapabilityError`:
 
 ```typescript
-// src/core/plugins/plugin-loader.service.ts (paraphrased)
+// src/core/plugins/plugin-capability-context.ts (paraphrased)
 
 private assertPermission(manifest: PluginManifest, permission: PluginCapabilityPermission): void {
   if (!(manifest.permissions ?? []).includes(permission)) {
@@ -769,7 +787,8 @@ Two further checks apply on top of the permission:
   security boundary; the manifest half is static (editing config can't widen it).
 - **Network allowlist.** `ctx.net.fetch` additionally requires the target host to be on the plugin's
   **effective** allowlist: `manifest.net.allow` plus the https origin of every `net.allowConfigHosts` config key
-  that resolves to an https URL, taken across the base config **and** every per-session override. A host
+  that resolves to an https URL, taken across the base config, every per-session override **and** the config
+  of every enabled integration instance of the plugin. A host
   admitted only through `allowConfigHosts` is therefore allowed while absent from `net.allow`. The request
   always passes through the SSRF guard (which blocks internal IPs even for an allowlisted host).
 
@@ -785,6 +804,9 @@ tier automatically. Key properties:
   resolves `{ continue: true }` (fail-open), so each sandboxed subscriber delays the hook chain by at most
   5 s per event. The same fail-open value drains in-flight hooks if the worker crashes. The timeout is
   logged at most once per event per minute and shows as the last hook error in plugin health.
+- A sandboxed **webhook** handler (`ctx.registerWebhook`) has the same **5 s** budget (`INGRESS_DISPATCH_TIMEOUT_MS`), and the host
+  cannot cancel a handler that overruns it: the delivery is retried while the first run still lands, so a handler must key
+  its side effects on `req.deliveryId` and hand slow work to a background task (docs/25, section 25.7).
 - After a hook, webhook or search dispatch times out, the host pings the worker. A worker whose event
   loop is blocked (a synchronous loop) cannot answer within 5 s, so it is terminated and the plugin is
   set to `ERROR`, as on a crash; a slow async handler answers and is left running.

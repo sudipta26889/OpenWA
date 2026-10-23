@@ -70,6 +70,9 @@ export function normalizeChatScope(text: string): string[] {
   return [...new Set(parseScopeList(text).map(entry => (/^\d{5,}$/.test(entry) ? `${entry}@c.us` : entry)))];
 }
 
+/** The most chats a key may list: the gateway answers a longer list with 400 (ALLOWED_CHATS_MAX). */
+export const ALLOWED_CHATS_MAX = 2000;
+
 /** A stored instant as a `datetime-local` value in this browser's time zone, or '' for none. */
 export function toDateTimeLocal(iso: string | null | undefined): string {
   if (!iso) return '';

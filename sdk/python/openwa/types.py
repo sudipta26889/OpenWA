@@ -68,7 +68,7 @@ WebhookEvent = Literal[
     "message.received", "message.sent", "message.ack", "message.failed", "message.revoked",
     "message.reaction", "message.edited", "session.status", "session.qr", "session.authenticated",
     "session.disconnected", "session.reconnect_loop", "session.restriction", "presence.update",
-    "group.join", "group.leave", "group.update", "group.join_request",
+    "event.response", "group.join", "group.leave", "group.update", "group.join_request",
     "call.received", "status.received",
     "call.accepted", "call.rejected", "call.missed",
     "*",
@@ -78,7 +78,7 @@ WebhookDeliveryEvent = Literal[
     "message.received", "message.sent", "message.ack", "message.failed", "message.revoked",
     "message.reaction", "message.edited", "session.status", "session.qr", "session.authenticated",
     "session.disconnected", "session.reconnect_loop", "session.restriction", "presence.update",
-    "group.join", "group.leave", "group.update", "group.join_request",
+    "event.response", "group.join", "group.leave", "group.update", "group.join_request",
     "call.received", "status.received",
     "call.accepted", "call.rejected", "call.missed",
 ]
@@ -214,13 +214,13 @@ class GroupJoinInfo(TypedDict):
     participantCount: NotRequired[int]
 
 
-class CustomLinkPreview(TypedDict, total=False):
+class CustomLinkPreview(TypedDict):
     """A caller-supplied link preview. Nothing is fetched for these."""
 
     url: str
     # Required -- WhatsApp will not render a preview without a title.
     title: str
-    description: str
+    description: NotRequired[str]
 
 
 # ── Session ───────────────────────────────────────────────────────
@@ -486,7 +486,9 @@ class SendPollRequest(TypedDict):
 ListMessagesQuery = TypedDict(
     "ListMessagesQuery",
     # ``after`` is a keyset cursor: the id of the last message of the previous page.
-    {"chatId": Jid, "from": Jid, "limit": int, "offset": int, "after": str, "inlineMedia": bool},
+    {"chatId": Jid, "from": Jid, "limit": int, "offset": int, "after": str, "inlineMedia": bool,
+     "since": float, "until": float, "direction": Literal["incoming", "outgoing"],
+     "orderBy": Literal["createdAt", "timestamp"], "type": str, "messageId": str},
     total=False,
 )
 
@@ -592,6 +594,12 @@ class MessageContact(TypedDict, total=False):
     labels: list
 
 
+class ChatHistoryPoll(TypedDict):
+    name: str
+    options: list[str]
+    allowMultipleAnswers: bool
+
+
 # A message read live from WhatsApp by ``messages.history()`` — the engine
 # payload, richer and differently shaped than the persisted MessageRecord.
 ChatHistoryMessage = TypedDict(
@@ -619,6 +627,7 @@ ChatHistoryMessage = TypedDict(
         "font": NotRequired[int],
         "media": NotRequired[ChatHistoryMedia],
         "quotedMessage": NotRequired[QuotedMessage],
+        "poll": NotRequired[ChatHistoryPoll],
         "location": NotRequired[MessageLocation],
         "order": NotRequired[MessageOrder],
         "product": NotRequired[MessageProduct],
@@ -629,6 +638,7 @@ ChatHistoryMessage = TypedDict(
 class MessageListResponse(TypedDict):
     """Paginated payload returned by ``GET /sessions/:id/messages``."""
 
+    unknownTimestampTotal: NotRequired[int]
     messages: list[MessageRecord]
     total: int
 
@@ -893,14 +903,14 @@ class SetProfilePictureRequest(TypedDict, total=False):
 # ── Webhook ───────────────────────────────────────────────────────
 
 
-class WebhookFilterCondition(TypedDict, total=False):
+class WebhookFilterCondition(TypedDict):
     # field/operator/value required; caseSensitive optional (text fields only, default false).
     field: str
-    operator: str
+    operator: Literal["is", "isNot", "contains", "equals"]
     # Polymorphic per field kind: a single string (text fields), a list of
     # strings (id/idArray/enum fields), or a bool (boolean fields).
     value: str | list[str] | bool
-    caseSensitive: bool
+    caseSensitive: NotRequired[bool]
 
 
 class WebhookFilters(TypedDict):
@@ -993,6 +1003,40 @@ class WebhookDeliveryFailure(TypedDict):
     lastError: str
     # ISO timestamp of when the failure was first recorded.
     createdAt: str
+    # True when the row still holds the event data and can be replayed with
+    # WebhooksResource.redrive_delivery_failures: a terminal row (attempts > 0) recorded while the
+    # gateway's WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS is above 0, until that window passes.
+    replayable: bool
+
+
+class RedriveWebhookDeliveriesRequest(TypedDict, total=False):
+    """Body of ``WebhooksResource.redrive_delivery_failures``. An empty body takes the least-retried eligible rows."""
+
+    # Only rows of this session (within the key's allowedSessions).
+    sessionId: str
+    # Only rows of this webhook.
+    webhookId: str
+    # Only these failure rows (ids from delivery_failures), at most 500.
+    ids: list[str]
+    # Max rows replayed by this call (1-500, default 100).
+    limit: int
+
+
+class WebhookRedriveResult(TypedDict):
+    """Outcome of ``WebhooksResource.redrive_delivery_failures``."""
+
+    # Rows replayed by this call: delivered plus enqueued.
+    redriven: int
+    # Delivered by a direct POST; their failure rows were removed.
+    delivered: int
+    # Reserved for compatibility; operator redrive always returns zero.
+    enqueued: int
+    # Replays that failed again; their rows stay, with attempts raised by one.
+    failed: int
+    # Rows not replayed: the webhook was removed, disabled or unsubscribed, or a plugin cancelled it.
+    skipped: int
+    # Replayable rows still in scope after this call.
+    remaining: int
 
 
 # ── Chat ──────────────────────────────────────────────────────────
@@ -1005,6 +1049,7 @@ class ChatSummary(TypedDict):
     unreadCount: int
     # Server returns a plain preview string, not a message object.
     lastMessage: NotRequired[str]
+    lastMessageType: NotRequired[MessageType]
     timestamp: int
     kind: ChatKind
     archived: bool
@@ -1431,7 +1476,8 @@ class SearchQueryParams(_SearchQueryRequired, _SearchQueryOptional):
 
 # `from` is a Python keyword → functional form for the required keys. The builtin
 # provider returns waMessageId/snippet as "" when absent (always str, never null);
-# `score` is provider-dependent (builtin always returns it) → optional.
+# `score` is provider-dependent (the builtin provider on SQLite leaves it out for a key restricted to
+# sessions or chats) → optional.
 _SearchHitRequired = TypedDict(
     "_SearchHitRequired",
     {

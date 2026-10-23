@@ -291,6 +291,42 @@ describe('SessionProxyInterceptor', () => {
       expect(seen[1].headers['x-forwarded-for']).toBe('198.51.100.9, 10.0.0.4');
     });
 
+    // The owner claims the Idempotency-Key, not this hop: a send landing on a non-owner node is
+    // forwarded before the route's own interceptor runs. Without the header the owner would run the
+    // send unclaimed, and a client retry after a timeout would send the message twice.
+    it('forwards the Idempotency-Key to the owner', async () => {
+      const req = request({
+        method: 'POST',
+        originalUrl: `/api/sessions/${SID}/messages/send-text`,
+        headers: { 'x-api-key': 'k-123', 'content-type': 'application/json', 'idempotency-key': 'order-42' },
+        body: { chatId: '628@c.us', text: 'halo' },
+      });
+      const { interceptor, context, next } = build({ req, row: row({ nodeUrl: serverUrl }) });
+
+      await interceptor.intercept(context, next);
+
+      expect(seen[0].headers['idempotency-key']).toBe('order-42');
+    });
+
+    // Without it a client cannot tell an answer replayed from a stored key from a new send.
+    it('relays Idempotent-Replayed from the owner to the client', async () => {
+      const replaying = http.createServer((_req, res) => {
+        res.writeHead(201, { 'content-type': 'application/json', 'Idempotent-Replayed': 'true' });
+        res.end(JSON.stringify({ messageId: 'M1' }));
+      });
+      await new Promise<void>(resolve => replaying.listen(0, '127.0.0.1', resolve));
+      const url = `http://127.0.0.1:${(replaying.address() as AddressInfo).port}`;
+
+      try {
+        const { interceptor, context, next, res } = build({ row: row({ nodeUrl: url }) });
+        await interceptor.intercept(context, next);
+
+        expect(res.setHeader).toHaveBeenCalledWith('idempotent-replayed', 'true');
+      } finally {
+        await new Promise<void>(resolve => replaying.close(() => resolve()));
+      }
+    });
+
     // A forwarded 429 comes from the OWNER's counters; without relaying its throttle headers the
     // client is told to back off with no indication of for how long.
     it('relays the owner’s throttle headers to the client', async () => {

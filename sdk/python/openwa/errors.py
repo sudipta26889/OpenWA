@@ -59,7 +59,13 @@ class OpenWAApiError(OpenWAError):
 
     @classmethod
     def from_response(
-        cls, status_code: int, text: str, context: str, *, headers: Mapping[str, str] | None = None
+        cls,
+        status_code: int,
+        text: str,
+        context: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        reason: str | None = None,
     ) -> "OpenWAApiError":
         import json
 
@@ -75,6 +81,10 @@ class OpenWAApiError(OpenWAError):
             message_text = ", ".join(str(m) for m in raw_message)
         elif isinstance(raw_message, str):
             message_text = raw_message
+        elif raw_message is None:
+            # An empty body (a proxy's bare 502) or an envelope with no message: the status text is all
+            # there is, and "None" would be read as the reason.
+            message_text = reason or "no response body"
         else:
             message_text = str(raw_message)
         message = f"OpenWA API {status_code} — {context}: {message_text}"
@@ -96,7 +106,7 @@ class OpenWANotFoundError(OpenWAApiError):
 
 
 class OpenWAConflictError(OpenWAApiError):
-    """409 Conflict — typically an engine-not-ready condition."""
+    """409 Conflict: a conflicting state, typically a session that is not ready for the operation, or a keyed send that is pending or may already have been sent (see ``code``)."""
 
 
 class OpenWARateLimitError(OpenWAApiError):

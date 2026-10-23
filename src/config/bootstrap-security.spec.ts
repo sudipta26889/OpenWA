@@ -9,6 +9,7 @@ import {
   isApiKeyPepperMissingInProduction,
   isMainDbSynchronizeInProduction,
   isNodeEnvUnset,
+  rewrittenCorsOrigins,
 } from './bootstrap-security';
 
 describe('resolveCorsPolicy', () => {
@@ -18,6 +19,32 @@ describe('resolveCorsPolicy', () => {
       allowAnyOrigin: true,
       credentials: false,
     });
+  });
+
+  // A browser sends `Origin: https://dashboard.example.com`, never a path or a trailing slash, so an entry
+  // copied from the address bar could not match until it is used as the origin it names.
+  it('uses an entry written with a path or a trailing slash as its origin', () => {
+    expect(
+      resolveCorsPolicy('https://dashboard.example.com/, http://localhost:3000/app, https://b.com', 'production'),
+    ).toEqual({
+      origins: ['https://dashboard.example.com', 'http://localhost:3000', 'https://b.com'],
+      allowAnyOrigin: false,
+      credentials: true,
+    });
+    expect(rewrittenCorsOrigins('https://dashboard.example.com/, http://localhost:3000/app, https://b.com')).toEqual([
+      'https://dashboard.example.com/',
+      'http://localhost:3000/app',
+    ]);
+    expect(rewrittenCorsOrigins(undefined)).toEqual([]);
+  });
+
+  it('keeps a wildcard and a value that is not an http(s) URL as written', () => {
+    expect(resolveCorsPolicy('*', 'development').origins).toEqual(['*']);
+    expect(resolveCorsPolicy('localhost:3000,not a url', 'production').origins).toEqual([
+      'localhost:3000',
+      'not a url',
+    ]);
+    expect(rewrittenCorsOrigins('*,localhost:3000,not a url')).toEqual([]);
   });
 
   it('honors an explicit allowlist and enables credentials (no wildcard)', () => {

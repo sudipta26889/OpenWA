@@ -206,6 +206,39 @@ describe('generateSafeLinkPreview', () => {
       });
     });
 
+    // WordPress and most CMSs write curly quotes, dashes and ellipses as numeric references, and older
+    // pages write accents by name: left as written they reach the recipient as literal text.
+    it('decodes numeric references, decimal and hexadecimal, and the common named ones', async () => {
+      respondWith(
+        '<meta property="og:title" content="Don&#8217;t panic &#8211; a guide &amp; more">' +
+          '<meta property="og:description" content="Caf&eacute; &#x2014; 5 min read &hellip; &copy; 2026">',
+      );
+      // Code points rather than the characters, so the expectation reads the same in any editor.
+      const text = (...parts: Array<string | number>): string =>
+        parts.map(part => (typeof part === 'number' ? String.fromCodePoint(part) : part)).join('');
+
+      await expect(generateSafeLinkPreview('https://example.com')).resolves.toMatchObject({
+        title: text('Don', 0x2019, 't panic ', 0x2013, ' a guide & more'),
+        description: text('Caf', 0xe9, ' ', 0x2014, ' 5 min read ', 0x2026, ' ', 0xa9, ' 2026'),
+      });
+    });
+
+    it('leaves a reference that names no character, or one it does not know, as written', async () => {
+      respondWith('<meta property="og:title" content="&#0; &#xD800; &#1114112; &#9; &#150; &notanentity; &#x;">');
+
+      await expect(generateSafeLinkPreview('https://example.com')).resolves.toMatchObject({
+        title: '&#0; &#xD800; &#1114112; &#9; &#150; &notanentity; &#x;',
+      });
+    });
+
+    it('does not decode a numeric reference twice', async () => {
+      respondWith('<meta property="og:title" content="&amp;#39; &amp;#x41;">');
+
+      await expect(generateSafeLinkPreview('https://example.com')).resolves.toMatchObject({
+        title: '&#39; &#x41;',
+      });
+    });
+
     // Decoding the ampersand first would turn `&amp;lt;` into `<`.
     it('does not double-decode', async () => {
       respondWith('<meta property="og:title" content="&amp;lt;script&amp;gt;">');

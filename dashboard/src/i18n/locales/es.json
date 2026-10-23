@@ -98,6 +98,7 @@
     "loadingMessages": "Cargando mensajes...",
     "loadingOlderMessages": "Cargando mensajes anteriores...",
     "loadOlderMessagesError": "No se pudieron cargar los mensajes anteriores. Desplázate hacia arriba para reintentar.",
+    "loadOlderMessagesRetryHint": "Desplázate hacia arriba para reintentar.",
     "noMessagesInChat": "Aún no hay mensajes. ¡Envía el primero para empezar!",
     "downloadDocument": "Descargar documento",
     "actions": {
@@ -535,6 +536,7 @@
       "session.reconnect_loop": "Cuando una sesión sigue sin poder reconectarse",
       "session.restriction": "Cuando WhatsApp restringe la cuenta o levanta una restricción",
       "presence.update": "Cuando un chat suscrito se conecta, escribe o se desconecta",
+      "event.response": "Cuando un invitado responde a un evento de WhatsApp (asistirá, no asistirá, quizás)",
       "group.join": "Cuando participantes se unen a un grupo o son añadidos",
       "group.leave": "Cuando participantes salen de un grupo o son eliminados",
       "group.update": "Cuando cambian el nombre, la descripción o los ajustes de un grupo",
@@ -657,8 +659,9 @@
     },
     "chats": {
       "label": "Acceso a chats (opcional)",
-      "hint": "Un chat por línea: un ID de grupo que termina en @g.us, un ID de contacto que termina en @c.us o @lid, o un número de teléfono. Déjalo vacío para todos los chats. Una clave restringida a chats solo puede usar las rutas abiertas a ese tipo de clave; el WebSocket de eventos y MCP la rechazan.",
-      "invalid": "No es un ID de chat ni un número de teléfono: {{value}}"
+      "hint": "Un chat por línea: un ID de grupo que termina en @g.us, un ID de contacto que termina en @c.us o @lid, o un número de teléfono. Déjalo vacío para todos los chats. Una clave restringida a chats solo puede usar las rutas abiertas a ese tipo de clave; su acceso por el WebSocket de eventos y MCP se limita a esos chats.",
+      "invalid": "No es un ID de chat ni un número de teléfono: {{value}}",
+      "tooMany": "Demasiados chats ({{count}}): una clave puede listar como máximo {{max}}."
     },
     "expiry": {
       "label": "Caduca el (opcional)",

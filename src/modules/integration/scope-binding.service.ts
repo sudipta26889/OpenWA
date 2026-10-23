@@ -238,6 +238,12 @@ export class ScopeBindingService implements OnApplicationBootstrap {
       // Provisioning retires '*' (this instance narrows the plugin to one session); the additive boot
       // path keeps the restored set whole, so an operator's PUT /plugins/:id/sessions survives a restart.
       const set = new Set(opts.additive ? current : current.filter(s => s !== '*'));
+      // "*" covered the sessions of the plugin's other concrete instances too, so retiring it narrows the
+      // plugin to those scopes rather than to this one alone (the wildcard teardown above does the same).
+      // An explicit list has no "*" and stays as the operator set it.
+      if (!opts.additive && current.includes('*')) {
+        for (const i of siblings) if (i.enabled && i.sessionScope && i.sessionScope !== '*') set.add(i.sessionScope);
+      }
       if (activate) set.add(scope);
       else set.delete(scope);
       // Preserve '*' while an enabled wildcard/null sibling still binds all sessions ('*' subsumes

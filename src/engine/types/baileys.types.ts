@@ -25,6 +25,11 @@ export interface BaileysMessageStore {
    * replacement, or null to leave it untouched; an id the store does not hold stays absent.
    */
   update(sessionId: string, messageId: string, change: (stored: WAMessage) => WAMessage | null): Promise<void>;
+  /**
+   * Delete a stored message, but only while `shouldRemove` accepts the copy held when the delete runs.
+   * An id the store does not hold stays absent. Queued behind any put() or update() of the same id.
+   */
+  remove(sessionId: string, messageId: string, shouldRemove: (stored: WAMessage) => boolean): Promise<void>;
   /** Remove all stored messages for a session (called on logout). */
   clearSession(sessionId: string): Promise<void>;
 }

@@ -34,7 +34,7 @@ describe('invokeTool', () => {
     expect(out).toEqual({ got: 5 });
   });
 
-  it('refuses a chat-restricted key (chat-scoped tool arguments are a later slice)', async () => {
+  it('refuses a chat-restricted key on a tool that declares no chat scope', async () => {
     const a = auth({ allowedChats: ['123@g.us'] });
     await expect(invokeTool(readTool, { n: 1 }, 'rawkey', a as unknown as AuthService)).rejects.toBeInstanceOf(
       ForbiddenException,

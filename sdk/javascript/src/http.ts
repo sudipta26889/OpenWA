@@ -126,6 +126,15 @@ export async function requestBytes(
 }
 
 /**
+ * Whether a header value holds a character fetch cannot send: a control character other than a tab, or one
+ * above U+00FF. Checked at construction so that the refusal names the header and never repeats the value,
+ * which the transport's own TypeError does, and a credential would reach the application's log with it.
+ */
+export function hasUnsendableChar(value: string): boolean {
+  return /[\u0000-\u0008\u000a-\u001f\u007f\u0100-\uffff]/.test(value);
+}
+
+/**
  * A timeout in milliseconds, coerced once: untyped JS config can pass a numeric string (process.env).
  * `0` or `Infinity` turns the timeout off, so any other value that is not a non-negative number (an
  * empty variable, `30s`) is refused rather than read as "off", which would let a request hang forever.

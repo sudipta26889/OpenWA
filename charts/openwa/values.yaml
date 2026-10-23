@@ -77,9 +77,23 @@ resources:
     memory: 2Gi
     cpu: 1000m
 
-# Matches docker-compose stop_grace_period: graceful drain + per-engine Chromium
-# teardown can exceed the 30s k8s default.
-terminationGracePeriodSeconds: 45
+# Matches docker-compose stop_grace_period. Sized for the worst case (QUEUE_ENABLED, Redis, a plugin
+# enabled), where the bounded teardown stages add up to 63s: drain 3 + ingress reconciler 5 + engines
+# 10 (in parallel, whatever the session count) + auto-start wait 5 + webhook drain 5 + worker close 10
+# + producer queue close 2 for each of two queues + usage flush 5 + plugin phase 10 + three Redis quits
+# 2 each. The process force-exits 67s after the drain and 5s before this deadline. Raising
+# SHUTDOWN_DELAY_MS or WEBHOOK_SHUTDOWN_DRAIN_MS moves that exit later by the same amount, so raise
+# this by the same amount too.
+terminationGracePeriodSeconds: 75
+
+# Boot budget of the kubelet startupProbe on /api/health/live: the container is restarted after
+# periodSeconds x (failureThreshold - 1) = 5s x 59 = 295s without an answer. The first boot after an
+# upgrade builds indexes on a large messages table (about 3.8s per million rows) before the port
+# opens, so raise failureThreshold, or run the migrations first (docs/14, section 14.5). A higher
+# value only delays the restart of a boot that is genuinely stuck.
+startupProbe:
+  periodSeconds: 5
+  failureThreshold: 60
 
 # Pod-level securityContext, empty by default. The default image start is as
 # root: the entrypoint re-owns /app/data and the XDG dirs, then drops to the
@@ -107,14 +121,14 @@ terminationGracePeriodSeconds: 45
 # fsGroup is what makes a fresh volume writable by it. OnRootMismatch makes the
 # kubelet re-own the volume only when its root has the wrong group or mode,
 # instead of touching every file on every mount. `add: null` removes the
-# default list below; Helm merges maps, so leaving it out keeps all five.
+# default list below; Helm merges maps, so leaving it out keeps all six.
 # The RuntimeDefault seccomp profile is opt-in (it can also be set alone,
 # under either context) until a whatsapp-web.js session start under it has
 # been confirmed on arm64, where the image uses Debian's Chromium.
 podSecurityContext: {}
 
-# Parity with docker-compose hardening. The five added capabilities are used
-# only by the root entrypoint (chown, then the gosu drop); see
+# Parity with docker-compose hardening. The added capabilities support
+# the root entrypoint and init signal forwarding after the gosu drop; see
 # podSecurityContext above for the non-root alternative.
 containerSecurityContext:
   readOnlyRootFilesystem: true
@@ -126,12 +140,17 @@ containerSecurityContext:
       - CHOWN
       - DAC_OVERRIDE
       - FOWNER
+      - KILL
       - SETGID
       - SETUID
 
 ingress:
   enabled: false
   className: ""
+  # ingress-nginx refuses a request body over 1m by default, below the 25mb the app accepts
+  # (BODY_SIZE_LIMIT), so a base64 media send fails with 413 before it reaches the pod. Raise it
+  # to at least BODY_SIZE_LIMIT, for example:
+  #   nginx.ingress.kubernetes.io/proxy-body-size: 25m
   annotations: {}
   host: openwa.example.com
   paths:

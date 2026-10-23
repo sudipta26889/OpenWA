@@ -2,6 +2,7 @@ import type { AnyMessageContent, WAMessage, WASocket } from '@whiskeysockets/bai
 import { MediaInput, StatusPostOptions, StatusResult } from '../interfaces/whatsapp-engine.interface';
 import { BadRequestException } from '@nestjs/common';
 import { resolveMediaBuffer } from './baileys-messaging';
+import { describeAudio } from './baileys-audio-probe';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 
@@ -93,7 +94,7 @@ export class BaileysStatus {
         ? { image: data, caption: options.caption, mimetype }
         : kind === 'video'
           ? { video: data, caption: options.caption, mimetype }
-          : { audio: data, mimetype, ptt: true };
+          : { audio: data, mimetype, ptt: true, ...(await describeAudio(data, true)) };
     return this.postStatus(content, options);
   }
 

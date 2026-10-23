@@ -233,6 +233,32 @@ export function killRunningConversions(): void {
 }
 process.on('exit', killRunningConversions);
 
+/**
+ * What ffmpeg sees of the gateway's environment. It parses bytes a caller chose and needs no secret, so
+ * the database and Redis passwords and the API key pepper stay out of it. What remains is what finding
+ * a binary, its libraries, a home and a temp directory take, and the system root a Windows process
+ * cannot load its libraries without.
+ */
+function ffmpegEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const name of [
+    'PATH',
+    'LD_LIBRARY_PATH',
+    'DYLD_LIBRARY_PATH',
+    'HOME',
+    'TMPDIR',
+    'TEMP',
+    'TMP',
+    'LANG',
+    'LC_ALL',
+    'SystemRoot',
+  ]) {
+    const value = process.env[name];
+    if (value !== undefined) env[name] = value;
+  }
+  return env;
+}
+
 /** Spawn ffmpeg and resolve when it exits 0, else reject with whatever it wrote to stderr. */
 function execute(args: string[], options: FfmpegRunOptions): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -240,7 +266,11 @@ function execute(args: string[], options: FfmpegRunOptions): Promise<void> {
     // filename with a space or a quote is data rather than syntax.
     // `detached` puts the child at the head of its own process group, so the timeout can kill
     // everything under it (see below).
-    const child = spawn(options.ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
+    const child = spawn(options.ffmpegPath, args, {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      detached: true,
+      env: ffmpegEnv(),
+    });
     const pid = child.pid;
     if (pid !== undefined) runningGroups.add(pid);
 

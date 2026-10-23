@@ -18,6 +18,8 @@ import { Type } from 'class-transformer';
 import { Validate } from 'class-validator';
 import { ToStrictBoolean } from '../../../common/utils/strict-boolean';
 import {
+  BATCH_ID_MAX_LENGTH,
+  CHAT_ID_MAX_LENGTH,
   MENTIONS_DESCRIPTION,
   MENTIONS_MAX,
   MENTION_WID_MAX_LENGTH,
@@ -114,9 +116,10 @@ export class BulkMessageContentDto {
 }
 
 class BulkMessageItemDto {
-  @ApiProperty({ description: 'Recipient chat ID', example: '628123456789@c.us' })
+  @ApiProperty({ description: 'Recipient chat ID', example: '628123456789@c.us', maxLength: CHAT_ID_MAX_LENGTH })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiProperty({ description: 'Message type', enum: ['text', 'image', 'video', 'audio', 'document'] })
@@ -164,9 +167,13 @@ class BulkMessageOptionsDto {
 export const BULK_MESSAGES_MAX = 100;
 
 export class SendBulkMessageDto {
-  @ApiPropertyOptional({ description: 'Custom batch ID (auto-generated if not provided)' })
+  @ApiPropertyOptional({
+    description: 'Custom batch ID (auto-generated if not provided)',
+    maxLength: BATCH_ID_MAX_LENGTH,
+  })
   @IsOptional()
   @IsString()
+  @MaxLength(BATCH_ID_MAX_LENGTH)
   batchId?: string;
 
   @ApiProperty({

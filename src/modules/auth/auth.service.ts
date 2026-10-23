@@ -25,6 +25,7 @@ import { ActiveKeyIndex } from './active-key-index';
 import { apiKeyAuthorizationFingerprint, normalizeScopeList } from './api-key-authorization';
 import { normalizeChatAllowList } from '../../common/security/chat-scope';
 import { EventsGateway, type ApiKeyEvictionReason } from '../events/events.gateway';
+import { isSwaggerEnabled } from '../../config/bootstrap-security';
 
 /**
  * A 401 that names no stored key: the credential was missing or matched no row. Producing one costs
@@ -120,7 +121,10 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
     this.logger.log('  🟢 Welcome to OpenWA - WhatsApp API Gateway');
     this.logger.log('');
     this.logger.log(`  📊 Dashboard: ${dashboardUrl}`);
-    this.logger.log(`  📚 API Docs:  ${apiBaseUrl}/api/docs`);
+    // Swagger is off by default under NODE_ENV=production, where the URL would answer 404.
+    if (isSwaggerEnabled(process.env.ENABLE_SWAGGER, process.env.NODE_ENV)) {
+      this.logger.log(`  📚 API Docs:  ${apiBaseUrl}/api/docs`);
+    }
     this.logger.log('');
     if (isNewKey) {
       this.logger.log('  🔑 API Key (newly created):');

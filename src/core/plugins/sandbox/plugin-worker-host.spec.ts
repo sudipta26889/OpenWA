@@ -137,6 +137,55 @@ describe('PluginWorkerHost', () => {
     await expect(p).rejects.toThrow(/exit/i);
   });
 
+  // A worker that dies from an exception after it enabled reports the real reason as an error message
+  // just before it exits: with no load() waiting, the exit used to be all the host kept.
+  describe('the error a worker reports before it exits', () => {
+    const hostWithExit = (ch: FakeChannel, onExit: jest.Mock): PluginWorkerHost =>
+      new PluginWorkerHost(ch, undefined, undefined, undefined, undefined, undefined, undefined, undefined, onExit);
+
+    it('is named by the rejection of a call the exit drains and by the exit callback', async () => {
+      const ch = new FakeChannel();
+      const onExit = jest.fn();
+      const host = hostWithExit(ch, onExit);
+      void host.load('/p/index.js');
+      ch.reply({ kind: 'ready' });
+      const p = host.runLifecycle('onEnable');
+
+      ch.reply({ kind: 'error', error: 'boom: relay answered 500' });
+      ch.crash(1);
+
+      await expect(p).rejects.toThrow('plugin worker exited unexpectedly (code 1): boom: relay answered 500');
+      expect(onExit).toHaveBeenCalledWith(1, false, 'boom: relay answered 500');
+    });
+
+    it('is cut to one bounded line, since the plugin chose it', () => {
+      const ch = new FakeChannel();
+      const onExit = jest.fn();
+      hostWithExit(ch, onExit);
+
+      ch.reply({ kind: 'error', error: `first\nsecond ${'x'.repeat(2000)}` });
+      ch.crash(1);
+
+      const reason = (onExit.mock.calls[0] as [number, boolean, string])[2];
+      expect(reason.startsWith('first second x')).toBe(true);
+      expect(reason.length).toBeLessThanOrEqual(500);
+    });
+
+    it('leaves the message and the callback as they were when the worker reported nothing', async () => {
+      const ch = new FakeChannel();
+      const onExit = jest.fn();
+      const host = hostWithExit(ch, onExit);
+      void host.load('/p/index.js');
+      ch.reply({ kind: 'ready' });
+      const p = host.runLifecycle('onEnable');
+
+      ch.crash(1);
+
+      await expect(p).rejects.toThrow(/^plugin worker exited unexpectedly \(code 1\)$/);
+      expect(onExit).toHaveBeenCalledWith(1, false, undefined);
+    });
+  });
+
   it('terminate() terminates the underlying channel', async () => {
     const ch = new FakeChannel();
     const host = new PluginWorkerHost(ch);

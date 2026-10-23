@@ -95,6 +95,7 @@
     "loadingMessages": "Nachrichten werden geladen...",
     "loadingOlderMessages": "Ältere Nachrichten werden geladen...",
     "loadOlderMessagesError": "Ältere Nachrichten konnten nicht geladen werden. Zum erneuten Versuch nach oben scrollen.",
+    "loadOlderMessagesRetryHint": "Zum erneuten Versuch nach oben scrollen.",
     "noMessagesInChat": "Noch keine Nachrichten. Sende die erste Nachricht, um zu beginnen!",
     "downloadDocument": "Dokument herunterladen",
     "actions": {
@@ -529,6 +530,7 @@
       "session.reconnect_loop": "Wenn eine Sitzung wiederholt nicht neu verbinden kann",
       "session.restriction": "Wenn WhatsApp das Konto einschränkt oder eine Einschränkung aufhebt",
       "presence.update": "Wenn ein abonnierter Chat online geht, tippt oder offline geht",
+      "event.response": "Wenn ein Gast auf eine WhatsApp-Veranstaltung antwortet (Zusage, Absage, Vielleicht)",
       "group.join": "Wenn Teilnehmer einer Gruppe beitreten oder hinzugefügt werden",
       "group.leave": "Wenn Teilnehmer eine Gruppe verlassen oder entfernt werden",
       "group.update": "Wenn sich Name, Beschreibung oder Einstellungen einer Gruppe ändern",
@@ -701,8 +703,9 @@
     },
     "chats": {
       "label": "Chat-Zugriff (optional)",
-      "hint": "Ein Chat pro Zeile: eine Gruppen-ID mit @g.us, eine Kontakt-ID mit @c.us oder @lid oder eine Telefonnummer. Leer lassen für alle Chats. Ein auf Chats beschränkter Schlüssel kann nur die für solche Schlüssel freigegebenen Routen nutzen; der Events-WebSocket und MCP lehnen ihn ab.",
-      "invalid": "Keine Chat-ID und keine Telefonnummer: {{value}}"
+      "hint": "Ein Chat pro Zeile: eine Gruppen-ID mit @g.us, eine Kontakt-ID mit @c.us oder @lid oder eine Telefonnummer. Leer lassen für alle Chats. Ein auf Chats beschränkter Schlüssel kann nur die für solche Schlüssel freigegebenen Routen nutzen; sein Zugriff über den Events-WebSocket und MCP bleibt auf diese Chats beschränkt.",
+      "invalid": "Keine Chat-ID und keine Telefonnummer: {{value}}",
+      "tooMany": "Zu viele Chats ({{count}}): Ein Schlüssel darf höchstens {{max}} auflisten."
     },
     "expiry": {
       "label": "Läuft ab am (optional)",

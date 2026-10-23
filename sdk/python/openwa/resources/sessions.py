@@ -134,7 +134,11 @@ class SessionsResource:
         return self._http.request("GET", f"/api/sessions/{quote_segment(session_id)}/qr")
 
     def request_pairing_code(self, session_id: str, body: RequestPairingCodeRequest) -> PairingCodeResponse:
-        """Request a phone-pairing code."""
+        """Request a phone-pairing code.
+
+        On whatsapp-web.js, never request one for a number that already has a linked session: WhatsApp can
+        revoke that device. Link it by QR instead.
+        """
         return self._http.request("POST", f"/api/sessions/{quote_segment(session_id)}/pairing-code", body=body)
 
     def stats(self) -> SessionStatsOverview:

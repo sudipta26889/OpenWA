@@ -95,6 +95,7 @@
     "loadingMessages": "Loading messages...",
     "loadingOlderMessages": "Loading older messages...",
     "loadOlderMessagesError": "Couldn't load older messages. Scroll up to retry.",
+    "loadOlderMessagesRetryHint": "Scroll up to retry.",
     "noMessagesInChat": "No messages yet. Send the first message to get started!",
     "downloadDocument": "Download document",
     "actions": {
@@ -529,6 +530,7 @@
       "session.reconnect_loop": "When a session keeps failing to reconnect",
       "session.restriction": "When WhatsApp restricts the account or lifts a restriction",
       "presence.update": "When a subscribed chat comes online, types or goes offline",
+      "event.response": "When a guest answers a WhatsApp event invitation (going, not going, maybe)",
       "group.join": "When participants join or are added to a group",
       "group.leave": "When participants leave or are removed from a group",
       "group.update": "When a group's name, description or settings change",
@@ -701,8 +703,9 @@
     },
     "chats": {
       "label": "Chat access (optional)",
-      "hint": "One chat per line: a group ID ending in @g.us, a contact ID ending in @c.us or @lid, or a phone number. Leave empty for every chat. A chat-restricted key can use only the routes open to chat-scoped keys; the events WebSocket and MCP refuse it.",
-      "invalid": "Not a chat ID or phone number: {{value}}"
+      "hint": "One chat per line: a group ID ending in @g.us, a contact ID ending in @c.us or @lid, or a phone number. Leave empty for every chat. A chat-restricted key can use only the routes open to chat-scoped keys; its events WebSocket and MCP access stay within these chats.",
+      "invalid": "Not a chat ID or phone number: {{value}}",
+      "tooMany": "Too many chats ({{count}}): a key may list at most {{max}}."
     },
     "expiry": {
       "label": "Expires at (optional)",

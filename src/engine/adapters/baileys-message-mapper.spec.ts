@@ -3,6 +3,7 @@ import {
   BaileysIncomingFields,
   baileysChatJid,
   buildIncomingMessageFromBaileys,
+  extractBaileysPoll,
   extractBaileysBody,
   extractBaileysButtonReply,
   extractBaileysButtons,
@@ -360,6 +361,16 @@ describe('buildIncomingMessageFromBaileys', () => {
       participant: '222@lid',
     });
     expect(r.isLidSender).toBe(true);
+  });
+
+  it('reads an empty participant as none: a lid chat is still a lid sender and a group names no author', () => {
+    // A live key goes through cleanMessage, which writes '' for the participant of a 1:1 chat.
+    const direct = buildIncomingMessageFromBaileys({ ...base, remoteJid: '111@lid', participant: '' });
+    expect(direct.isLidSender).toBe(true);
+    expect(direct.author).toBeUndefined();
+    const group = buildIncomingMessageFromBaileys({ ...base, remoteJid: '123-456@g.us', participant: '' });
+    expect(group.author).toBeUndefined();
+    expect(group.isLidSender).toBeFalsy();
   });
 
   it('flags a status broadcast', () => {
@@ -1153,5 +1164,35 @@ describe('isBaileysCatalogShare (the productMessage arm with no product)', () =>
     expect(isBaileysCatalogShare({ productMessage: { product: { productId: '2' }, catalog: { title: 'S' } } })).toBe(
       false,
     );
+  });
+});
+
+describe('native poll choice metadata', () => {
+  it.each(['pollCreationMessage', 'pollCreationMessageV2', 'pollCreationMessageV3'] as const)(
+    'reads %s without changing option texts',
+    key => {
+      expect(
+        extractBaileysPoll({
+          [key]: {
+            name: 'Where?',
+            options: [{ optionName: ' Park ' }, { optionName: 'Beach' }],
+            selectableOptionsCount: 1,
+          },
+        }),
+      ).toEqual({ name: 'Where?', options: [' Park ', 'Beach'], allowMultipleAnswers: false });
+    },
+  );
+  it('reports multiple choices and omits unavailable poll data', () => {
+    expect(
+      extractBaileysPoll({
+        pollCreationMessageV3: {
+          name: 'Q',
+          options: [{ optionName: 'a' }, { optionName: 'b' }],
+          selectableOptionsCount: 0,
+        },
+      })?.allowMultipleAnswers,
+    ).toBe(true);
+    expect(extractBaileysPoll({})).toBeUndefined();
+    expect(extractBaileysPoll({ pollCreationMessage: {} })).toBeUndefined();
   });
 });

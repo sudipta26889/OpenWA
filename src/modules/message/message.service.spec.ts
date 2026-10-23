@@ -798,7 +798,11 @@ describe('MessageService', () => {
     it('clears the stored row through the same revoke as an engine revoke, after the engine delete', async () => {
       await service.deleteMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1' });
 
-      expect(messageProjector.recordRevoke).toHaveBeenCalledWith('sess-1', 'wa-msg-1');
+      // Naming the chat it deleted in, so the row of another chat that holds the id is left alone.
+      expect(messageProjector.recordRevoke).toHaveBeenCalledWith('sess-1', 'wa-msg-1', {
+        kind: 'revoke',
+        chatId: 'test@c.us',
+      });
       expect(mockEngine.deleteMessage.mock.invocationCallOrder[0]).toBeLessThan(
         messageProjector.recordRevoke.mock.invocationCallOrder[0],
       );
@@ -813,7 +817,11 @@ describe('MessageService', () => {
       expect(mockEngine.editMessage).toHaveBeenCalledWith('test@c.us', 'wa-msg-1', 'edited');
       // Persistence is delegated to the session's per-message mutation queue (serialized with the
       // inbound edit path) — the service no longer writes the row directly.
-      expect(messageProjector.recordOutboundMessageEdit).toHaveBeenCalledWith('sess-1', 'wa-msg-1', 'edited');
+      expect(messageProjector.recordOutboundMessageEdit).toHaveBeenCalledWith('sess-1', 'wa-msg-1', 'edited', {
+        kind: 'edit',
+        chatId: 'test@c.us',
+        fromMe: true,
+      });
       expect(repository.update).not.toHaveBeenCalled();
       expect(res).toEqual({ messageId: 'wa-msg-1', timestamp: 1706868000 });
     });
@@ -882,7 +890,28 @@ describe('MessageService', () => {
       await service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'secret' });
 
       expect(mockEngine.editMessage).toHaveBeenCalledWith('test@c.us', 'wa-msg-1', 'redacted');
-      expect(messageProjector.recordOutboundMessageEdit).toHaveBeenCalledWith('sess-1', 'wa-msg-1', 'redacted');
+      expect(messageProjector.recordOutboundMessageEdit).toHaveBeenCalledWith(
+        'sess-1',
+        'wa-msg-1',
+        'redacted',
+        expect.objectContaining({ kind: 'edit', chatId: 'test@c.us' }),
+      );
+    });
+
+    it('judges the stored row by the chat the gate sent the edit to, not the one the caller named', async () => {
+      (hookManager.execute as jest.Mock).mockResolvedValueOnce({
+        continue: true,
+        data: { input: { chatId: 'other@c.us', messageId: 'wa-msg-1', body: 'edited' } },
+      });
+
+      await service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' });
+
+      expect(mockEngine.editMessage).toHaveBeenCalledWith('other@c.us', 'wa-msg-1', 'edited');
+      expect(messageProjector.recordOutboundMessageEdit).toHaveBeenCalledWith('sess-1', 'wa-msg-1', 'edited', {
+        kind: 'edit',
+        chatId: 'other@c.us',
+        fromMe: true,
+      });
     });
 
     it('honours a plugin that rewrites the tag list, not the list the caller sent', async () => {

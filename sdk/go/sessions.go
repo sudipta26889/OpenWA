@@ -150,7 +150,8 @@ func (s *SessionsService) QRCode(ctx context.Context, sessionID string) (*QrCode
 	return &out, nil
 }
 
-// RequestPairingCode requests a phone-pairing code.
+// RequestPairingCode requests a phone-pairing code. On whatsapp-web.js, never request one for a number that
+// already has a linked session: WhatsApp can revoke that device. Link it by QR instead.
 func (s *SessionsService) RequestPairingCode(ctx context.Context, sessionID string, body RequestPairingCodeRequest) (*PairingCodeResponse, error) {
 	var out PairingCodeResponse
 	err := s.client.do(ctx, "POST", "/api/sessions/"+pathEscape(sessionID)+"/pairing-code", nil, body, &out)

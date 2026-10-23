@@ -2,6 +2,7 @@ import { Client, ClientConfig } from 'pg';
 import { DataSource, DataSourceOptions } from 'typeorm';
 import { createLogger } from '../common/services/logger.service';
 import { assertDataConnectionUtc, postgresUtcExtra } from './postgres-utc';
+import { DeduplicateTerminalWebhookFailures1787200000000 } from './migrations/1787200000000-DeduplicateTerminalWebhookFailures';
 
 const logger = createLogger('PgBootMigrations');
 
@@ -10,7 +11,9 @@ const logger = createLogger('PgBootMigrations');
 // the shared migrations ledger: the lock holder applies the chain while every other process waits
 // inside pg_advisory_lock, then sees a filled ledger and applies nothing. This replaces TypeORM's
 // built-in migrationsRun for that connection only (it has no cross-process serialization); the
-// sqlite connections keep @nestjs/typeorm's default construction + initialize path unchanged.
+// sqlite connection without synchronize keeps @nestjs/typeorm's default construction + initialize
+// path; with synchronize (the dev and e2e setup) it is initialized here, the terminal-failure dedupe
+// runs, and only then does the schema sync.
 //
 // Lock key in the two-int4 form — exact in JavaScript (a single bigint key would exceed
 // Number.MAX_SAFE_INTEGER). The values are fixed so every process and version agrees:
@@ -36,8 +39,9 @@ type PostgresOptions = Extract<DataSourceOptions, { type: 'postgres' }>;
 /**
  * dataSourceFactory for the 'data' connection. Postgres boot migrations execute here, under the
  * advisory lock, BEFORE the DataSource is handed to any provider — same ordering the built-in
- * migrationsRun gave (it finished inside DataSource.initialize()). Non-postgres options take
- * @nestjs/typeorm's default path: construct only, let the wrapper initialize as before. The
+ * migrationsRun gave (it finished inside DataSource.initialize()). SQLite with synchronize is
+ * initialized here, deduplicates terminal webhook failures and then synchronizes; other non-postgres
+ * options take @nestjs/typeorm's default path: construct only, let the wrapper initialize. The
  * wrapper also skips its own initialize() for the postgres branch because the DataSource comes
  * back already initialized, and keeps applying retryAttempts/retryDelay to this whole factory.
  *
@@ -50,6 +54,26 @@ export async function createBootDataSource(
 ): Promise<DataSource> {
   const createDataSource = deps.createDataSource ?? (opts => new DataSource(opts));
   const createLockClient = deps.createLockClient ?? createPgLockClient;
+
+  if (options?.type === 'better-sqlite3' && options.synchronize) {
+    const dataSource = createDataSource({ ...options, synchronize: false });
+    try {
+      await dataSource.initialize();
+      const runner = dataSource.createQueryRunner();
+      try {
+        if (await runner.hasTable('webhook_delivery_failures')) {
+          await new DeduplicateTerminalWebhookFailures1787200000000().up(runner);
+        }
+      } finally {
+        await runner.release();
+      }
+      await dataSource.synchronize();
+      return dataSource;
+    } catch (error) {
+      if (dataSource.isInitialized) await dataSource.destroy().catch(() => undefined);
+      throw error;
+    }
+  }
 
   if (options?.type !== 'postgres') {
     // useFactory always resolves a full options object; the optional parameter is the library's

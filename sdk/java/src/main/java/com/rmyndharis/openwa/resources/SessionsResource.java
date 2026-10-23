@@ -133,7 +133,10 @@ public final class SessionsResource {
         return client.request(HttpMethod.GET, "/api/sessions/" + encodeSegment(id) + "/qr", null, null, QrCodeResponse.class);
     }
 
-    /** Request an 8-character pairing code for phone-based login. */
+    /**
+     * Request an 8-character pairing code for phone-based login. On whatsapp-web.js, never request one for a
+     * number that already has a linked session: WhatsApp can revoke that device. Link it by QR instead.
+     */
     public PairingCodeResponse requestPairingCode(String id, RequestPairingCodeRequest body) {
         return client.request(HttpMethod.POST, "/api/sessions/" + encodeSegment(id) + "/pairing-code", null, body, PairingCodeResponse.class);
     }

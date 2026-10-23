@@ -10,6 +10,7 @@ import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import { SendImageStatusDto, SendVideoStatusDto, SendVoiceStatusDto } from './dto/send-media-status.dto';
 import { SendPacingService } from '../message/send-pacing.service';
+import { LoggerService } from '../../common/services/logger.service';
 
 describe('StatusService media validation and selection', () => {
   const engine = {
@@ -60,6 +61,37 @@ describe('StatusService media validation and selection', () => {
       await expect(service.postTextStatus('s1', 'hello', { recipients: [] })).rejects.toThrow('refused');
       expect(pacing.recordSendFailure).toHaveBeenCalledWith('s1');
       expect(pacing.recordSendSuccess).not.toHaveBeenCalled();
+    });
+
+    // The same classification picks the failures worth a log line: otherwise an engine-side failure
+    // leaves only Nest's generic `[ExceptionsHandler]` line, with no session to correlate it with.
+    it('logs the session and kind of a status post the engine refused', async () => {
+      const warn = jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
+      try {
+        engine.postImageStatus.mockRejectedValueOnce(new Error('upload failed: media entry was not created'));
+        await expect(
+          service.postImageStatus('s1', { base64: 'aGk=', mimetype: 'image/png' }, { recipients: [] }),
+        ).rejects.toThrow('upload failed');
+
+        expect(warn).toHaveBeenCalledWith(
+          'Status post failed in the engine (image)',
+          expect.objectContaining({ sessionId: 's1', error: 'Error: upload failed: media entry was not created' }),
+        );
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('logs nothing for a refusal that says nothing about the account', async () => {
+      const warn = jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
+      try {
+        engine.postTextStatus.mockRejectedValueOnce(new BadRequestException('bad status'));
+        await expect(service.postTextStatus('s1', 'hello', { recipients: [] })).rejects.toThrow('bad status');
+
+        expect(warn).not.toHaveBeenCalled();
+      } finally {
+        warn.mockRestore();
+      }
     });
   });
 

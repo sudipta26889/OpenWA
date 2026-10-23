@@ -62,6 +62,7 @@ import { applyGlobalValidation } from '../src/config/app-validation';
 import { PluginLoaderService } from '../src/core/plugins/plugin-loader.service';
 import { PluginInstance } from '../src/modules/integration/entities/plugin-instance.entity';
 import { IngressEvent } from '../src/modules/integration/entities/ingress-event.entity';
+import { WebhookOutboxEvent } from '../src/modules/webhook/entities/webhook-outbox-event.entity';
 import { sanitizeIngressJobId } from '../src/modules/integration/ingress-enqueue.service';
 import { QUEUE_NAMES } from '../src/modules/queue/queue-names';
 import { IngressJobData } from '../src/modules/queue/processors/ingress.processor';
@@ -101,6 +102,7 @@ describeQueueOn('Queued dispatch paths (e2e, QUEUE_ENABLED=true)', () => {
   let webhookService: WebhookService;
   let sessionRepo: Repository<Session>;
   let eventRepo: Repository<IngressEvent>;
+  let outboxRepo: Repository<WebhookOutboxEvent>;
   let apiKey: string;
   let received: Array<{ headers: http.IncomingHttpHeaders; body: Record<string, unknown> }>;
   let receiver: http.Server;
@@ -132,9 +134,9 @@ describeQueueOn('Queued dispatch paths (e2e, QUEUE_ENABLED=true)', () => {
     dedupHeader: 'x-chatwoot-delivery',
   };
 
-  const waitFor = async (predicate: () => boolean, timeoutMs = 10000): Promise<void> => {
+  const waitFor = async (predicate: () => boolean | Promise<boolean>, timeoutMs = 10000): Promise<void> => {
     const start = Date.now();
-    while (!predicate()) {
+    while (!(await predicate())) {
       if (Date.now() - start > timeoutMs) throw new Error('timed out waiting for condition');
       await new Promise(r => setTimeout(r, 10));
     }
@@ -203,6 +205,7 @@ describeQueueOn('Queued dispatch paths (e2e, QUEUE_ENABLED=true)', () => {
     );
 
     eventRepo = app.get<Repository<IngressEvent>>(getRepositoryToken(IngressEvent, 'data'));
+    outboxRepo = app.get<Repository<WebhookOutboxEvent>>(getRepositoryToken(WebhookOutboxEvent, 'data'));
     webhookService = app.get(WebhookService);
     sessionRepo = app.get(getRepositoryToken(Session, 'data'));
     apiKey = (await app.get(AuthService).createApiKey({ name: 'e2e-queue-on', role: ApiKeyRole.ADMIN })).rawKey;
@@ -286,5 +289,11 @@ describeQueueOn('Queued dispatch paths (e2e, QUEUE_ENABLED=true)', () => {
     await waitFor(() => received.length >= 1);
     expect(received[0].body.event).toBe('message.received');
     expect(received[0].headers['x-openwa-event']).toBe('message.received');
+
+    // With the queue on, the worker is the only party that retires the delivery's outbox row. Left queued,
+    // every reconciler sweep would replay the event to the receiver again.
+    const idempotencyKey = received[0].headers['x-openwa-idempotency-key'] as string;
+    await waitFor(async () => (await outboxRepo.findOneBy({ idempotencyKey }))?.state === 'dispatched');
+    expect(await outboxRepo.findOneByOrFail({ idempotencyKey })).toMatchObject({ state: 'dispatched', payload: null });
   }, 30000);
 });

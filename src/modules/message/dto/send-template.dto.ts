@@ -11,16 +11,18 @@ import {
   Validate,
 } from 'class-validator';
 import { ToStrictBoolean } from '../../../common/utils/strict-boolean';
-import { MENTIONS_DESCRIPTION, MENTIONS_MAX, MENTION_WID_MAX_LENGTH } from './send-message.dto';
+import { CHAT_ID_MAX_LENGTH, MENTIONS_DESCRIPTION, MENTIONS_MAX, MENTION_WID_MAX_LENGTH } from './send-message.dto';
 import { IsMentionWidConstraint } from './is-mention-wid.validator';
 
 export class SendTemplateMessageDto {
   @ApiProperty({
     description: 'WhatsApp chat ID (phone@c.us for individual, groupId@g.us for groups)',
     example: '628123456789@c.us',
+    maxLength: CHAT_ID_MAX_LENGTH,
   })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiPropertyOptional({

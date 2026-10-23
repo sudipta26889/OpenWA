@@ -209,7 +209,12 @@ export class IngressService {
     // dead-lettered, and the deliveries were simply gone. Fall through to the body hash, which is
     // exactly the "provider supplied no id" case it already exists for.
     const headerId = req.headers[dedupHeader]?.trim();
-    const deliveryId = route.dedupOn === 'body' || !headerId ? deriveDeliveryId(req) : headerId;
+    // An id past 255 characters is no id a provider mints, and the unique index it is stored under refuses an
+    // entry past about 2.7 KB on PostgreSQL with a 500, so such a header gets the body hash too.
+    const deliveryId =
+      route.dedupOn === 'body' || !headerId || headerId.length > MAX_DELIVERY_ID_LENGTH
+        ? deriveDeliveryId(req)
+        : headerId;
     // Provider request headers persist with the event (redrive/debugging); credentials must not.
     // Signature headers are re-derivable, auth material is not — redact before the first write.
     // A shared-secret route carries the instance secret itself in its declared header, and an hmac
@@ -269,8 +274,8 @@ export class IngressService {
       // Sync-response route: the ack is host-side and final; enqueue (queued or inline) must NOT block
       // it — a queue-disabled deployment otherwise holds the HTTP response for up to the inline dispatch
       // timeout. enqueue() is not awaited; the dedup row already persisted is the durability handle. The
-      // .catch() is a defensive guard: enqueue() never rejects today (it swallows inline failures and the
-      // factory wrapper writes a DLQ row on 'failed'), but a future regression must not become an unhandled
+      // .catch() is a defensive guard: enqueue() never rejects without a signal (it swallows inline failures
+      // and the factory wrapper writes a DLQ row on 'failed'), but a future regression must not become an unhandled
       // rejection that crashes the process on the ingress hot path.
       void this.deps.enqueue(jobData, deliveryId).catch(err => {
         this.deps.log?.('ingress_enqueue_unhandled', {
@@ -286,6 +291,9 @@ export class IngressService {
     return ack;
   }
 }
+
+/** The longest dedup header value taken as a delivery id, kept far below the index entry limit of PostgreSQL. */
+const MAX_DELIVERY_ID_LENGTH = 255;
 
 /**
  * Derives a DETERMINISTIC delivery id when the provider sends no dedup header, so a provider retry of

@@ -82,7 +82,7 @@ describe('DockerService.buildDockerOptions', () => {
 });
 
 describe('DockerService.stopManagedService (stop-only teardown)', () => {
-  // Teardown is deliberately stop-only: the pinned docker-socket-proxy v0.4.2 never reads its
+  // Teardown is deliberately stop-only: the pinned docker-socket-proxy v0.5.0 never reads its
   // DELETE env flag (deletion is admitted only as an undocumented side effect of its POST
   // method gate), so the code must not depend on container.remove() at all.
   const makeService = (container: unknown) => {
@@ -277,6 +277,7 @@ describe('prestartBuiltinDatabase', () => {
     expect(docker.listContainers).toHaveBeenCalledWith({
       all: true,
       filters: { label: ['com.openwa.service=database'] },
+      abortSignal: expect.any(AbortSignal) as unknown,
     });
     expect(container.start).toHaveBeenCalledTimes(1);
   });
@@ -413,6 +414,7 @@ describe('DockerService.getContainerByService label match and guard rails', () =
     expect(listContainers).toHaveBeenCalledWith({
       all: true,
       filters: { label: ['com.openwa.service=database'] },
+      abortSignal: expect.any(AbortSignal) as unknown,
     });
     expect(getContainer).toHaveBeenCalledWith('label-hit-1');
     expect(result).toEqual({ id: 'label-hit-1' });

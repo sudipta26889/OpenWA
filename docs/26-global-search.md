@@ -133,7 +133,8 @@ GET /api/search?q=<term>&sessionId=<id>&chatId=<id>&direction=<incoming|outgoing
             &from=<sender>&dateFrom=<ms>&dateTo=<ms>&limit=<n>&offset=<n>
 ```
 
-- **`q`** is required and must be non-empty (whitespace-only is rejected with `400`). Numeric params
+- **`q`** is required and must be non-empty (whitespace-only is rejected with `400`, and so is one
+  longer than 1000 characters or with more than 32 words, punctuation separating words as whitespace does and a symbol or emoji that stands apart counting as one; a whitespace-separated word said again counts once). Numeric params
   are coerced and validated; a non-numeric `limit`/`offset`/`dateFrom`/`dateTo` surfaces as `400`,
   never as a `NaN` SQL parameter.
 - **Auth scoping is authoritative.** The caller's API-key `allowedSessions` is injected by
@@ -141,6 +142,12 @@ GET /api/search?q=<term>&sessionId=<id>&chatId=<id>&direction=<incoming|outgoing
   key with a non-empty `allowedSessions` searches only those sessions, whatever its role, even if it
   passes `sessionId`; a key with a null or empty `allowedSessions` searches all sessions. The DTO
   carries no `sessionIds` field (it would be rejected as non-whitelisted).
+- **Chat scope applies the same way.** A key with a non-empty `allowedChats` searches only those
+  chats: the built-in provider narrows its hits before `limit`, `offset` and `total` apply, an explicit
+  `chatId` outside the allowlist answers `403`, and a plugin provider answers `403` for such a key
+  (set `SEARCH_PROVIDER=builtin-fts` to allow scoped search). On SQLite the hits of a key scoped to
+  sessions or chats carry no `score`, because the value is computed over the whole index and would
+  reflect messages outside its scope; the hits stay in relevance order.
 - **Response** is a `SearchResults` object: `{ hits: SearchHit[], total, tookMs, provider }`. Each hit
   carries `messageId`, `waMessageId`, `sessionId`, `chatId`, `body`, `snippet`, `timestamp`, `type`,
   `direction`, `from`, and optional `score`. `total` is an exact count (bounded; computed lazily only

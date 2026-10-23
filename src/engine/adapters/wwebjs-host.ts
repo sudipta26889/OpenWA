@@ -1,5 +1,9 @@
 import { type Client, type Message } from 'whatsapp-web.js';
-import { type EngineEventCallbacks, type IncomingMessage } from '../interfaces/whatsapp-engine.interface';
+import {
+  type EngineEventCallbacks,
+  type InboundTicket,
+  type IncomingMessage,
+} from '../interfaces/whatsapp-engine.interface';
 import { type createLogger } from '../../common/services/logger.service';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { type WhatsAppWebJsConfig } from './whatsapp-web-js.adapter';
@@ -20,7 +24,11 @@ export interface WwebjsEngineHost {
   reportIfPageTransportError(error: unknown, context: string): void;
   ensureNotChannelRecipient(chatId: string): void;
   getNumberId(number: string): Promise<string | null>;
-  capInboundMediaFor(msg: Message, maxBytesOverride?: number): Promise<IncomingMessage['media'] | undefined>;
+  capInboundMediaFor(
+    msg: Message,
+    maxBytesOverride?: number,
+    ticket?: InboundTicket,
+  ): Promise<IncomingMessage['media'] | undefined>;
   readonly config: WhatsAppWebJsConfig;
   /** Live callbacks bag — read per event, since initialize() installs it after delegates are built. */
   getCallbacks(): EngineEventCallbacks;
@@ -70,8 +78,9 @@ export async function reportPageDeath<T>(host: WwebjsEngineHost, context: string
     // Web threw in the page reaches the caller with its reason. A no-op for every other error.
     const mapped = toCapturedPageError(error);
     if (mapped !== error) {
-      // The mapped error is an HttpException, which Nest does not log, and the status path logs
-      // nothing of its own: this is the one line that keeps the full in-page summary.
+      // The mapped error is an HttpException, which Nest does not log, and a status post's own log line
+      // (StatusService.recordedPost) carries only the session and kind: this is the line that keeps the
+      // full in-page summary.
       host.logger.warn(`WhatsApp Web threw during ${context}`, {
         sessionId: host.config.sessionId,
         cause: (error as Error).message,

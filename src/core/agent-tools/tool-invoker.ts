@@ -2,13 +2,17 @@ import { BadRequestException, ForbiddenException, UnauthorizedException } from '
 import { ZodError } from 'zod';
 import { containsNul } from '../../common/validation/no-nul-character';
 import type { AuthService } from '../../modules/auth/auth.service';
+import type { ChatScopeService } from '../../modules/auth/chat-scope.service';
 import type { ApiKey } from '../../modules/auth/entities/api-key.entity';
 import type { AnyToolDescriptor } from './tool-descriptor';
 
 /**
  * Run one tool call with REST-equivalent guarantees, reusing core's own auth:
- * auth (role + allowedSessions + IP fail-closed) → validate input → handler.
- * Mirrors the REST guard-then-pipe order (auth before validation).
+ * auth (role + allowedSessions + IP fail-closed) → chat gate (a chat-restricted key may run only a
+ * tool that carries a `chatScope` mark) → validate input → NUL check → chat arguments and
+ * `quotedMessageId` → handler.
+ * Mirrors the REST guard-then-pipe order (auth before validation). The chat arguments are checked
+ * on the parsed values, so schema normalization cannot change the authorized target.
  * `clientIp` is undefined over MCP — a key with allowedIps therefore fails closed
  * inside validateApiKey (documented limitation).
  *
@@ -18,9 +22,9 @@ import type { AnyToolDescriptor } from './tool-descriptor';
  * string, preventing pre-auth bucket allocation by anonymous callers.
  * @param onAuthFailure Optional callback invoked with the error when the AUTH
  * phase rejects (missing/invalid/revoked/expired key, wrong role, IP/session not
- * allowed). Mirrors the REST ApiKeyGuard's auth-failure hook (which records the
- * audit trail). Fires BEFORE input validation and the tool handler, so a 401/403
- * thrown from a handler body is NOT surfaced here. Re-thrown after the callback.
+ * allowed, a tool the chat-restricted key may not run, or a chat argument outside
+ * its allowlist). Schema validation errors and handler errors do not reach this
+ * callback. Re-thrown after it.
  */
 export async function invokeTool(
   tool: AnyToolDescriptor,
@@ -29,6 +33,7 @@ export async function invokeTool(
   authService: AuthService,
   onAuthenticated?: (apiKeyId: string) => void,
   onAuthFailure?: (error: unknown) => void,
+  chatScope?: ChatScopeService,
   resolvedPrincipal?: ApiKey,
 ): Promise<unknown> {
   // AUTH PHASE — every rejection here is an authentication/authorization failure (the MCP analog of the
@@ -71,10 +76,8 @@ export async function invokeTool(
       throw new ForbiddenException('API key lacks the required role');
     }
 
-    // Tools carry no chat-scope marks, so a chat-restricted key cannot be confined to its chats here:
-    // refuse it outright rather than let a tool act on any chat. Mirrors the REST guard's
-    // default-deny for routes with no chat dimension.
-    if ((apiKey.allowedChats?.length ?? 0) > 0) {
+    // Restricted keys may reach only explicitly fenced, filtered or chat-independent tools.
+    if ((apiKey.allowedChats?.length ?? 0) > 0 && (!tool.chatScope || !chatScope)) {
       throw new ForbiddenException('API key is restricted to selected chats');
     }
   } catch (error) {
@@ -84,7 +87,7 @@ export async function invokeTool(
     throw error;
   }
 
-  // VALIDATION + HANDLER PHASE — not part of auth; their errors are not auth failures.
+  // Validate before checking chat arguments; validation errors are not auth failures.
   let input: unknown;
   try {
     input = tool.inputSchema.parse(rawInput);
@@ -96,7 +99,33 @@ export async function invokeTool(
   }
   // PostgreSQL rejects U+0000 in every text parameter; REST refuses the same input in NulBodyPipe.
   if (containsNul(input)) throw new BadRequestException('Tool input must not contain a NUL character');
+  if (chatScope?.isRestricted(apiKey)) {
+    try {
+      // Inspect the parsed values, so schema normalization cannot change the authorized target.
+      const values = input !== null && typeof input === 'object' ? (input as Record<string, unknown>) : {};
+      if (typeof tool.chatScope !== 'string') {
+        const fields = tool.chatScope ?? [];
+        if (fields.length === 0) throw new ForbiddenException('API key is restricted to selected chats');
+        for (const field of fields) {
+          const chatId = values[field];
+          if (typeof chatId !== 'string' || !chatId.trim()) {
+            throw new ForbiddenException(`${field} is required for a key restricted to selected chats`);
+          }
+          if (!(await chatScope.allows(apiKey, chatId))) {
+            throw new ForbiddenException('API key not authorized for this chat');
+          }
+        }
+      }
+      const quote = values.quotedMessageId;
+      if (!tool.chatQuotedAllowed && quote !== undefined && quote !== null && quote !== '') {
+        throw new ForbiddenException('API key is restricted to selected chats');
+      }
+    } catch (error) {
+      onAuthFailure?.(error);
+      throw error;
+    }
+  }
   // The single cast the erasure needs, placed next to the parse that justifies it: `input` is
   // whatever this tool's own `inputSchema` just accepted, which is exactly what its handler declares.
-  return tool.handler(input as never, apiKey);
+  return tool.handler(input as never, apiKey, chatScope);
 }

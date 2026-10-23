@@ -70,7 +70,9 @@ jobs:
           git config user.email "yudhi@rmyndharis.com"
           SPLIT_SHA="$(git subtree split --prefix=sdk/php HEAD)"
           echo "Split SHA: $SPLIT_SHA"
-          git push --force \
+          # Hooks off: nothing in this job runs project code, so none are expected, and none may run with the
+          # token in the push URL.
+          git -c core.hooksPath=/dev/null push --force \
             "https://x-access-token:${SPLIT_TOKEN}@github.com/rmyndharis/openwa-php.git" \
             "${SPLIT_SHA}:refs/heads/main"
           echo "Mirrored sdk/php -> rmyndharis/openwa-php@main"
