@@ -216,8 +216,6 @@ describe('validateApiKey entrypoint coverage', () => {
     ['modules/events/events.gateway.ts', 'websocket connect and per-subscribe re-validation'],
     ['modules/health/health.controller.ts', 'version disclosure on the public health check'],
     ['modules/mcp/mcp.server.ts', 'MCP mount key gate'],
-    // LOCAL: the self-hosted OAuth 2.1 consent step binds the auth code to the operator's key.
-    ['modules/oauth/oauth.service.ts', 'OAuth authorize consent'],
   ]);
 
   /** Where validateApiKey is declared, which is not a caller. */

@@ -82,16 +82,6 @@ if (process.env.MCP_ENABLED === 'true') {
   );
 }
 
-// Self-hosted OAuth 2.1 Authorization Server + Resource Server for the MCP endpoint. Opt-in so the
-// SDK/entities cost is avoided otherwise. Loaded (global) before McpModule so its OAuthService is
-// injectable into the MCP mount for bearer-token validation.
-const oauthModules: Array<Type | DynamicModule> = [];
-if (process.env.OAUTH_ENABLED === 'true') {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { OAuthModule } = require('./modules/oauth/oauth.module') as typeof import('./modules/oauth/oauth.module');
-  oauthModules.push(OAuthModule);
-}
-
 // Serve the bundled dashboard SPA from this same NestJS process/port when a build is
 // present (the production image copies dashboard/dist in). In local dev the build is
 // absent, so this stays inert and the Vite dev server (:2886) handles the UI. Opt out
@@ -108,16 +98,7 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
       rootPath: DASHBOARD_DIST,
       // Let Nest own these so unknown API/socket routes return real 404s/JSON rather
       // than the SPA index.html fallback (Express 5 / path-to-regexp v8 wildcard syntax).
-      exclude: [
-        '/api/{*splat}',
-        '/socket.io/{*splat}',
-        '/mcp',
-        '/mcp/{*splat}',
-        // LOCAL: self-hosted OAuth 2.1 AS+RS routes for the MCP endpoint. Nest must own these
-        // (real 404s/JSON), not the SPA fallback.
-        '/oauth/{*splat}',
-        '/.well-known/{*splat}',
-      ],
+      exclude: ['/api/{*splat}', '/socket.io/{*splat}', '/mcp', '/mcp/{*splat}'],
       // Disable this module's OWN catch-all SPA fallback. configure-app.ts already serves dashboard
       // documents (it injects the per-response CSP nonce, which is why it must own them), and
       // that handler is correctly narrow: it skips /assets and only answers extensionless paths
@@ -320,7 +301,6 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
     AgentToolsModule, // Agent-invocable tool registry (protocol-neutral)
     IntegrationModule, // Integration Fabric: @Public provider-webhook ingress + fast-ack pipeline
     ...searchModules, // Global message search (opt-out via SEARCH_ENABLED=false; default ON)
-    ...oauthModules, // OAuth 2.1 AS+RS for the MCP endpoint (opt-in via OAUTH_ENABLED=true) — before MCP
     ...mcpModules, // MCP Streamable-HTTP server (opt-in via MCP_ENABLED=true)
     ...serveStaticModules, // Bundled dashboard SPA (production single-port setup)
   ],

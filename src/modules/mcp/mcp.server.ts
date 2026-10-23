@@ -15,23 +15,11 @@ import { UnresolvedApiKeyException, type AuthService } from '../auth/auth.servic
 import { allowUnauthenticatedAuditRow } from '../audit/auth-failure-audit-limiter';
 import type { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
-import type { ApiKey } from '../auth/entities/api-key.entity';
-import { looksLikeJwt } from '../oauth/jwt.util';
 import { handleToolError, jsonToolResult, smartToolResult } from './tool-result';
 import type { KeyRateLimiter } from './mcp-rate-limit';
 import { limiterKeyForIp, resolveClientIp } from '../../common/utils/ip';
 import { resolveBodyLimit } from '../../config/bootstrap-security';
 import { bearerToken } from '../../common/security/bearer-token';
-
-/** Optional OAuth 2.1 bridge: verify a bearer JWT and (async) resolve it to an API-key principal. */
-export interface McpOAuthBridge {
-  /** Sync signature/claims check for the discovery guard (returns false → emit 401 + WWW-Authenticate). */
-  verify: (bearer: string) => boolean;
-  /** Resolve a verified bearer to the underlying API key, or null if invalid. */
-  resolve: (bearer: string) => Promise<ApiKey | null>;
-  /** URL of the protected-resource metadata, advertised in WWW-Authenticate. */
-  resourceMetadataUrl: string;
-}
 
 const logger = createLogger('McpServer');
 
@@ -118,7 +106,6 @@ function buildServer(
   auditService: AuditService | undefined,
   reqContext: McpRequestContext,
   chatScope?: ChatScopeService,
-  oauth?: McpOAuthBridge,
 ): McpServer {
   const server = new McpServer(
     { name: serverInfo.name, version: serverInfo.version },
@@ -144,17 +131,10 @@ function buildServer(
       async (input: Record<string, unknown>, extra: ToolExtra) => {
         const rawKey = extra.authInfo?.token ?? extractApiKey(extra.requestInfo?.headers);
         try {
-          // OAuth path: a JWT bearer is verified + resolved to an API-key principal here; the raw
-          // static-key path is unchanged (rawKey passed straight through to invokeTool).
-          let resolved: ApiKey | undefined;
-          if (oauth && rawKey && looksLikeJwt(rawKey)) {
-            resolved = (await oauth.resolve(rawKey)) ?? undefined;
-            if (!resolved) throw new UnauthorizedException('Invalid or expired OAuth token');
-          }
           const result = await invokeTool(
             tool,
             input,
-            resolved ? undefined : rawKey,
+            rawKey,
             authService,
             id => rateLimiter.check(id),
             // onAuthFailure: mirror the REST ApiKeyGuard — record rejected/denied auth attempts (401/403
@@ -163,7 +143,6 @@ function buildServer(
             // as auth failures. Best-effort; success and non-auth errors skip this.
             error => auditMcpAuthFailure(auditService, error, reqContext),
             chatScope,
-            resolved,
           );
           return tool.resultDisposition === 'json'
             ? jsonToolResult(result as object)
@@ -182,33 +161,6 @@ export interface MountMcpServerOptions {
   basePath?: string;
   serverInfo?: { name: string; version: string };
   readOnly?: boolean;
-  oauth?: McpOAuthBridge;
-}
-
-function sendMcpUnauthorized(res: Response, resourceMetadataUrl: string, invalidToken: boolean): void {
-  const errPart = invalidToken ? ', error="invalid_token"' : '';
-  res
-    .status(401)
-    .set('WWW-Authenticate', `Bearer resource_metadata="${resourceMetadataUrl}"${errPart}`)
-    .json({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null });
-}
-
-/**
- * When OAuth is enabled, emit an HTTP 401 + WWW-Authenticate (pointing at the protected-resource
- * metadata) for requests with no token or an invalid JWT — this is what triggers a cloud MCP client
- * (e.g. Claude) to start the OAuth flow. A non-JWT bearer (static API key) passes through and is
- * validated per-tool-call as before, so static-key auth keeps working alongside OAuth.
- */
-export function createOAuthGuard(oauth?: McpOAuthBridge): RequestHandler {
-  return (req, res, next) => {
-    if (!oauth) return next();
-    const bearer = extractApiKey(req.headers);
-    if (!bearer) return sendMcpUnauthorized(res, oauth.resourceMetadataUrl, false);
-    if (looksLikeJwt(bearer) && !oauth.verify(bearer)) {
-      return sendMcpUnauthorized(res, oauth.resourceMetadataUrl, true);
-    }
-    next();
-  };
 }
 
 /**
@@ -261,19 +213,11 @@ export function createIpThrottle(ipRateLimiter: KeyRateLimiter): RequestHandler 
 export function createKeyGate(
   authService: Pick<AuthService, 'validateApiKey'>,
   auditService: Pick<AuditService, 'logWarn'> | undefined,
-  oauth?: Pick<McpOAuthBridge, 'resolve'>,
 ): RequestHandler {
   return async (req, res, next) => {
     try {
       const rawKey = extractApiKey(req.headers);
       if (!rawKey) throw new UnresolvedApiKeyException('Missing API key');
-      // LOCAL: an OAuth JWT is not an API key; admit it only if it resolves to an API-key principal.
-      // The tool handler resolves it again per call for role/scope checks.
-      if (oauth && looksLikeJwt(rawKey)) {
-        if (!(await oauth.resolve(rawKey))) throw new UnauthorizedException('Invalid or expired OAuth token');
-        (req as Request & { auth?: AuthInfo }).auth = { token: rawKey, clientId: 'oauth', scopes: [] };
-        return next();
-      }
       await authService.validateApiKey(rawKey, undefined, undefined, { recordUsage: false });
       // The transport forwards req.auth to every tool call as extra.authInfo.
       (req as Request & { auth?: AuthInfo }).auth = { token: rawKey, clientId: 'api-key', scopes: [] };
@@ -316,7 +260,6 @@ export function mountMcpServer(
   const basePath = (options.basePath ?? '/mcp').replace(/\/$/, '') || '/mcp';
   const serverInfo = options.serverInfo ?? { name: 'openwa', version: '0.0.0' };
   const readOnly = resolveMcpReadOnly(options.readOnly);
-  const oauth = options.oauth;
 
   // Eagerly compute the tool list at mount time to validate the registry is populated
   // and to emit the log line once. The actual McpServer is re-created per request to
@@ -334,7 +277,6 @@ export function mountMcpServer(
       auditService,
       resolveReqContext(req),
       chatScope,
-      oauth,
     );
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     try {
@@ -364,16 +306,11 @@ export function mountMcpServer(
   // `limit` mirrors the same global cap for the same reason: without it a middleware reorder would
   // silently leave this mount uncapped.
   const bodyLimit = resolveBodyLimit(process.env.BODY_SIZE_LIMIT);
-  // LOCAL: createOAuthGuard (no-op when OAuth is disabled) emits 401 + WWW-Authenticate for a
-  // missing/invalid JWT bearer so cloud MCP clients start the OAuth flow; static keys pass through.
-  // It runs after the throttle, which needs the parsed body to charge per JSON-RPC message (e6f7289b).
-  // The key gate then admits a JWT only if it resolves to a live API-key principal.
   adapter.post(
     basePath,
     express.json({ limit: bodyLimit, inflate: false }),
     createIpThrottle(ipRateLimiter),
-    createOAuthGuard(oauth),
-    createKeyGate(authService, auditService, oauth),
+    createKeyGate(authService, auditService),
     handler,
   );
   // Stateless transport: no standalone SSE stream and no session to delete. The Streamable HTTP spec

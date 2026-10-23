@@ -880,8 +880,7 @@ Migrations are hand-authored and idempotent (`IF NOT EXISTS`) so they are safe t
 src/database/migrations-main/      # main connection (auth + audit, SQLite)
 ├── 1779900000000-CreateAuthAuditTables.ts   # creates api_keys + audit_logs
 ├── 1786600000000-AddApiKeyAllowedChats.ts   # adds api_keys.allowedChats
-├── 1786610000000-DropSynchronizeIndexDuplicates.ts  # drops synchronize-named duplicate indexes
-└── 1790000000000-LocalCreateOAuthTables.ts  # LOCAL: creates oauth_clients/auth_codes/refresh_tokens
+└── 1786610000000-DropSynchronizeIndexDuplicates.ts  # drops synchronize-named duplicate indexes
 
 src/database/migrations/           # data connection (pluggable)
 ├── 1770108659848-AddMessageStatus.ts

@@ -131,17 +131,6 @@ export function configureApp(app: INestApplication, options: ConfigureAppOptions
         path === '/socket.io' ||
         path.startsWith('/mcp/') ||
         path === '/mcp' ||
-        // LOCAL: the self-hosted OAuth 2.1 AS+RS (src/modules/oauth). Nest-owned JSON/redirect routes,
-        // but extensionless and fetched with an Accept that can include text/html — without this they
-        // match documentRequest and get answered with the dashboard shell, which breaks the whole MCP
-        // OAuth handshake (/.well-known/* returns HTML instead of AS/RS metadata; a browser landing on
-        // /oauth/authorize sees the dashboard, so the flow starts and never finishes).
-        // NOTE: this list has moved with nearly every upgrade (ServeStaticModule exclude <=v0.21 ->
-        // main.ts v0.22 -> configure-app.ts v0.23/v0.24). After every upgrade, assert the CONTENT TYPE of
-        // /.well-known/oauth-authorization-server and /oauth/authorize, not just the status code.
-        path.startsWith('/oauth/') ||
-        path === '/oauth' ||
-        path.startsWith('/.well-known/') ||
         path.startsWith('/assets/');
       const documentRequest =
         req.method === 'GET' &&

@@ -1,9 +1,11 @@
-# Homelab override — passes vars the base compose does not forward, and exposes
-# the API on the LAN. Secrets are interpolated from .env (not hardcoded here).
+# Homelab override — passes vars the base compose does not forward, and puts the MCP OAuth gateway in
+# front of the API on the LAN port. Secrets are interpolated from .env (not hardcoded here).
+# All homelab customisation lives here and under ops/, so upstream merges never conflict in src/.
 services:
   openwa-api:
+    # The gateway owns the published port; the API stays reachable on loopback for local debugging.
     ports: !override
-      - "0.0.0.0:${API_PORT:-2785}:2785"
+      - "127.0.0.1:2786:2785"
     # db.lan (Postgres + Redis, moved off nuc.lan on 2026-10-19) pinned: a DNS failure on 2026-09-21
     # left the API unable to reach Redis, then the stack was stopped and stayed down (502) for a week.
     extra_hosts:
@@ -16,11 +18,35 @@ services:
       - WEBHOOK_SSRF_PROTECT=${WEBHOOK_SSRF_PROTECT:-false}
       - ENABLE_SWAGGER=${ENABLE_SWAGGER:-true}
       - CSP_UPGRADE_INSECURE_REQUESTS=false
-      # Remote CDP browser opt-in (unset by default -> local Chrome). Point these at a DNS name, never a
-      # hardcoded IP (e.g. WWEBJS_BROWSER_WS_ENDPOINT=ws://nuc.lan:3001); URL form auto-resolves the ws.
-      - WWEBJS_BROWSER_URL=${WWEBJS_BROWSER_URL:-}
-      - WWEBJS_BROWSER_WS_ENDPOINT=${WWEBJS_BROWSER_WS_ENDPOINT:-}
       - MCP_ENABLED=${MCP_ENABLED:-false}
-      - OAUTH_ENABLED=${OAUTH_ENABLED:-false}
-      - OAUTH_ISSUER=${OAUTH_ISSUER:-}
       - MCP_READONLY=${MCP_READONLY:-true}
+      # Every request now arrives from the gateway, which appends the real client to X-Forwarded-For.
+      # Trusting the compose network keeps per-IP rate limits and IP allowlists on the real client.
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-10.201.7.0/24}
+
+  # OAuth 2.1 for /mcp, outside the OpenWA source tree (ops/mcp-oauth-gateway/README.md).
+  mcp-oauth-gateway:
+    build: ./ops/mcp-oauth-gateway
+    image: openwa-mcp-oauth-gateway
+    container_name: openwa-mcp-oauth-gateway
+    restart: unless-stopped
+    depends_on:
+      - openwa-api
+    ports:
+      - "0.0.0.0:${API_PORT:-2785}:2785"
+    environment:
+      - OAUTH_ISSUER=${OAUTH_ISSUER:?OAUTH_ISSUER must be the public https origin}
+      - UPSTREAM_URL=http://openwa-api:2785
+    volumes:
+      - mcp-oauth-gateway-data:/data
+    networks:
+      - openwa-network
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - 'no-new-privileges:true'
+    mem_limit: 128m
+
+volumes:
+  mcp-oauth-gateway-data:

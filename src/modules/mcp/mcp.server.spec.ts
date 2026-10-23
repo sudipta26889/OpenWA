@@ -259,33 +259,6 @@ describe('createKeyGate (every MCP request needs a valid key)', () => {
     return { res, next, logWarn };
   };
 
-  // LOCAL: an OAuth JWT bearer is admitted only when the bridge resolves it to an API-key principal.
-  it('admits a resolvable OAuth JWT without an API-key lookup, and refuses an unresolvable one', async () => {
-    const jwt = `${Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url')}.e30.sig`;
-    const headers = { authorization: `Bearer ${jwt}` };
-    for (const [resolved, admitted] of [
-      [{ id: 'k1' }, true],
-      [null, false],
-    ] as const) {
-      const validateApiKey = jest.fn();
-      const gate = createKeyGate(
-        { validateApiKey },
-        { logWarn: jest.fn() },
-        {
-          resolve: jest.fn().mockResolvedValue(resolved),
-        },
-      );
-      const req = { method: 'POST', path: '/mcp', headers, socket: { remoteAddress: '203.0.113.7' } };
-      const res = makeRes();
-      const next = jest.fn();
-      await gate(req as unknown as Request, res as unknown as Response, next);
-      expect(validateApiKey).not.toHaveBeenCalled();
-      expect(next).toHaveBeenCalledTimes(admitted ? 1 : 0);
-      if (admitted) expect((req as { auth?: { token: string } }).auth?.token).toBe(jwt);
-      else expect(res.statusCode).toBe(401);
-    }
-  });
-
   it('refuses a request with no key before any lookup: 401, JSON-RPC body, audited within the IP budget', async () => {
     const validateApiKey = jest.fn();
     const { res, next, logWarn } = await run(validateApiKey);
@@ -491,12 +464,12 @@ describe('mountMcpServer (raw-Express request-handling path)', () => {
     const [path, parser, ...rest] = h.adapter.post.mock.calls[0] as unknown[];
     expect(path).toBe('/mcp');
     expect((parser as { name?: string }).name).toBe('jsonParser');
-    expect(rest).toHaveLength(4); // throttle, LOCAL oauth guard, key gate, handler
+    expect(rest).toHaveLength(3); // throttle, key gate, handler
   });
 
   it('refuses a keyless POST at the gate before any MCP server is built', async () => {
     const h = mount();
-    const gate = (h.adapter.post.mock.calls[0] as unknown[])[4] as (
+    const gate = (h.adapter.post.mock.calls[0] as unknown[])[3] as (
       req: Request,
       res: Response,
       next: () => void,
@@ -640,7 +613,7 @@ describe('mountMcpServer (raw-Express request-handling path)', () => {
   it('uses the key the gate validated when the SDK headers carry a joined Authorization', async () => {
     const h = mount();
     h.authService.validateApiKey.mockResolvedValue({ id: 'k1' });
-    const gate = (h.adapter.post.mock.calls[0] as unknown[])[4] as (
+    const gate = (h.adapter.post.mock.calls[0] as unknown[])[3] as (
       req: Request,
       res: Response,
       next: () => void,

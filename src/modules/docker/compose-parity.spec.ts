@@ -323,9 +323,6 @@ describe('DockerService managed specs ↔ docker-compose.yml parity', () => {
       // forwarding them cannot degrade a deployment.
       WEBHOOK_SSRF_PROTECT: 'fails safe (default on)',
       ALLOW_DEV_API_KEY: 'refused outright in production',
-      // LOCAL: the homelab OAuth module's keys are forwarded by docker-compose.override.yml.
-      OAUTH_ENABLED: 'LOCAL: forwarded by docker-compose.override.yml',
-      OAUTH_ISSUER: 'LOCAL: forwarded by docker-compose.override.yml',
     },
     'docker-compose.dev.yml': {
       POSTGRES_BUILTIN: 'dashboard-managed',
@@ -336,8 +333,6 @@ describe('DockerService managed specs ↔ docker-compose.yml parity', () => {
       // The dev stack manages no built-in datastores; its daemon is the host's local socket, and a
       // stray DOCKER_HOST would point the app at an unrelated daemon.
       DOCKER_HOST: 'local socket is the dev default (production pins its socket-proxy)',
-      OAUTH_ENABLED: 'LOCAL: homelab-only, off (default false) in the dev stack',
-      OAUTH_ISSUER: 'LOCAL: homelab-only, off (default false) in the dev stack',
     },
   };
 

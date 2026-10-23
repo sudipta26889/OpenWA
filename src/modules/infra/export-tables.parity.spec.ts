@@ -40,8 +40,7 @@ const DATA_ENTITY_ROOTS = [
   'modules/automation',
 ];
 // The main-connection (auth/audit) roots; their tables are not this endpoint's payload.
-// LOCAL: modules/oauth holds the self-hosted OAuth 2.1 tables, which live on the main connection.
-const MAIN_ENTITY_ROOTS = ['modules/auth', 'modules/audit', 'modules/oauth'];
+const MAIN_ENTITY_ROOTS = ['modules/auth', 'modules/audit'];
 
 type Connection = 'data' | 'main' | 'unclassified';
 

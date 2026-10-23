@@ -48,8 +48,6 @@ export function mainConnectionOptions(
     entities: [
       join(__dirname, '..', 'modules/auth/**/*.entity{.ts,.js}'),
       join(__dirname, '..', 'modules/audit/**/*.entity{.ts,.js}'),
-      // LOCAL: self-hosted OAuth 2.1 tables, created by migrations-main/1790000000000-LocalCreateOAuthTables.
-      join(__dirname, '..', 'modules/oauth/**/*.entity{.ts,.js}'),
     ],
     // Dedicated migrations dir for the main connection only (must NOT run the data-connection
     // migrations, which target session/webhook/message tables).
