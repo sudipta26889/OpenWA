@@ -301,3 +301,81 @@ describe('poll choice metadata', () => {
     expect(mapped.poll).toEqual({ name: 'Where?', options: [' Park ', 'Beach'], allowMultipleAnswers: true });
   });
 });
+
+describe('buildIncomingMessageBase business prompts', () => {
+  const base: RawMessageFields = {
+    id: { _serialized: 'MSG1' },
+    from: 'bank@lid',
+    to: 'me@c.us',
+    body: '',
+    type: 'list',
+    timestamp: 1700000000,
+    fromMe: false,
+  };
+
+  it('publishes list rows as buttons and fills the empty body, staying unknown', () => {
+    const r = buildIncomingMessageBase({
+      ...base,
+      _data: {
+        list: {
+          title: 'Menu',
+          description: 'Pick one',
+          sections: [
+            { rows: [{ rowId: 'bal', title: 'Balance' }] },
+            { rows: [{ rowId: 'stmt', title: 'Statement' }, { title: 'No id' }, { rowId: 'no-title' }] },
+          ],
+        },
+      },
+    });
+    expect(r.type).toBe('unknown');
+    expect(r.body).toBe('Pick one');
+    expect(r.buttons).toEqual([
+      { id: 'bal', text: 'Balance' },
+      { id: 'stmt', text: 'Statement' },
+    ]);
+  });
+
+  it('caps the rows and drops an id past the length cap rather than rewriting it', () => {
+    const rows = Array.from({ length: 30 }, (_, i) => ({ rowId: `r${i}`, title: `Row ${i}` }));
+    rows[0] = { rowId: 'x'.repeat(257), title: 'Too long' };
+    const r = buildIncomingMessageBase({ ...base, _data: { list: { sections: [{ rows }] } } });
+    expect(r.buttons).toHaveLength(20);
+    expect(r.buttons?.[0]).toEqual({ id: 'r1', text: 'Row 1' });
+  });
+
+  it('publishes reply buttons on a chat prompt and keeps its own body', () => {
+    const r = buildIncomingMessageBase({
+      ...base,
+      type: 'chat',
+      body: 'Continue?',
+      _data: { dynamicReplyButtons: [{ buttonId: '1', buttonText: { displayText: 'Yes' } }] },
+    });
+    expect(r.type).toBe('text');
+    expect(r.body).toBe('Continue?');
+    expect(r.buttons).toEqual([{ id: '1', text: 'Yes' }]);
+  });
+
+  it('reports the row or button a tap chose', () => {
+    const row = buildIncomingMessageBase({
+      ...base,
+      type: 'list_response',
+      body: 'Balance',
+      _data: { listResponse: { singleSelectReply: { selectedRowId: 'bal' } } },
+    });
+    expect(row.button).toEqual({ id: 'bal', text: 'Balance' });
+    const button = buildIncomingMessageBase({
+      ...base,
+      type: 'buttons_response',
+      body: 'Yes',
+      _data: { selectedButtonId: '1' },
+    });
+    expect(button.button).toEqual({ id: '1', text: 'Yes' });
+  });
+
+  it('adds nothing to a plain message', () => {
+    const r = buildIncomingMessageBase({ ...base, type: 'chat', body: 'hi', _data: {} });
+    expect(r.body).toBe('hi');
+    expect(r.buttons).toBeUndefined();
+    expect(r.button).toBeUndefined();
+  });
+});

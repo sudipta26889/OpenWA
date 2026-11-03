@@ -150,8 +150,7 @@ export interface IncomingMessage {
   /**
    * Set when the sender tapped a WhatsApp Business button, template quick-reply, list row, or
    * native-flow control. `id` is the stable handle the business defined on the button/row; `text`
-   * is the visible label when WhatsApp still carries it (also mirrored into `body`). **Baileys
-   * only**: whatsapp-web.js does not surface interactive replies as structured fields.
+   * is the visible label when WhatsApp still carries it (also mirrored into `body`).
    */
   button?: {
     id: string;
@@ -162,7 +161,7 @@ export interface IncomingMessage {
    * buttons): the choices shown to the recipient. URL/call CTAs are omitted, since they are not
    * clickable via {@link IWhatsAppEngine.clickButton} and must not masquerade as button ids.
    * Distinct from {@link IncomingMessage.button}, which is set only when someone *taps* a choice.
-   * **Baileys only.** Capped (count and label length) so a malformed prompt cannot bloat
+   * Capped (count and label length) so a malformed prompt cannot bloat
    * persisted rows / webhook payloads.
    */
   buttons?: Array<{

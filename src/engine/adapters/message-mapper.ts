@@ -1,6 +1,7 @@
 import { EditedMessage, IncomingMessage, MessageContact, MessageType } from '../interfaces/whatsapp-engine.interface';
 import type { SerializedWid } from '../types/whatsapp-web-js.types';
 import { chatKind } from '../identity/wa-id';
+import { BUTTON_TEXT_MAX_LENGTH, BUTTONS_MAX_ENTRIES } from './baileys-message-mapper';
 
 /**
  * Map a whatsapp-web.js `MessageTypes` token to the engine-neutral {@link MessageType}, so no
@@ -75,7 +76,22 @@ export interface RawMessageFields {
   /** WIDs @mentioned in the message; whatsapp-web.js attaches this to every Message. */
   mentionedIds?: string[];
   /** Raw wwebjs payload; `notifyName` carries the sender's push name without an extra lookup. */
-  _data?: { notifyName?: string; ephemeralDuration?: number };
+  _data?: {
+    notifyName?: string;
+    ephemeralDuration?: number;
+    /** Set on a business list prompt. WA Web leaves `body` empty and keeps the text here. */
+    list?: {
+      title?: string;
+      description?: string;
+      sections?: Array<{ rows?: Array<{ rowId?: string; title?: string }> }>;
+    };
+    /** Set on a business reply-button prompt. */
+    dynamicReplyButtons?: Array<{ buttonId?: string; buttonText?: { displayText?: string } }>;
+    /** Set when a list row was tapped. */
+    listResponse?: { singleSelectReply?: { selectedRowId?: string } };
+    /** Set when a reply button was tapped. */
+    selectedButtonId?: string;
+  };
   /** Set on `order` messages: the placed order's id, and the single-order token that unlocks its items. */
   orderId?: string;
   token?: string;
@@ -89,6 +105,23 @@ export interface RawMessageFields {
   description?: string;
   /** The catalog owner's JID, on a shared product card. */
   businessOwnerJid?: string;
+}
+
+/**
+ * The choices a business prompt offers, under the caps Baileys applies to the same field. An id past
+ * the cap is dropped rather than rewritten, because it goes back to the bot verbatim.
+ */
+function extractWwebjsButtons(data: RawMessageFields['_data']): IncomingMessage['buttons'] {
+  const rows = (data?.list?.sections ?? []).flatMap(section => section.rows ?? []);
+  const candidates = [
+    ...rows.map(row => ({ id: row.rowId, text: row.title })),
+    ...(data?.dynamicReplyButtons ?? []).map(button => ({ id: button.buttonId, text: button.buttonText?.displayText })),
+  ];
+  const buttons = candidates
+    .filter((c): c is { id: string; text: string } => !!c.id && !!c.text && c.id.length <= BUTTON_TEXT_MAX_LENGTH)
+    .slice(0, BUTTONS_MAX_ENTRIES)
+    .map(c => ({ id: c.id, text: c.text.slice(0, BUTTON_TEXT_MAX_LENGTH) }));
+  return buttons.length > 0 ? buttons : undefined;
 }
 
 /**
@@ -110,7 +143,7 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
     from: msg.from,
     to: msg.to,
     chatId,
-    body: msg.body,
+    body: msg.body || msg._data?.list?.description || msg._data?.list?.title || msg.body,
     type: mapWwebjsMessageType(msg.type),
     timestamp: msg.timestamp,
     fromMe: msg.fromMe,
@@ -147,6 +180,15 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
   // Ephemeral/disappearing-messages timer, when the chat has one set.
   if (msg._data?.ephemeralDuration && msg._data.ephemeralDuration > 0) {
     incoming.ephemeralDuration = msg._data.ephemeralDuration;
+  }
+
+  const buttons = extractWwebjsButtons(msg._data);
+  if (buttons) {
+    incoming.buttons = buttons;
+  }
+  const chosenId = msg._data?.listResponse?.singleSelectReply?.selectedRowId ?? msg._data?.selectedButtonId;
+  if (chosenId) {
+    incoming.button = { id: chosenId, ...(msg.body ? { text: msg.body } : {}) };
   }
 
   // Commerce ids, keyed off the mapped type so a stray `title` on some other message shape cannot
