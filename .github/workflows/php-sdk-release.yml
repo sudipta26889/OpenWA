@@ -69,7 +69,7 @@ jobs:
           fi
           echo "branch-alias '$ACTUAL' matches $REF_NAME"
 
-      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
         with:
           # Oldest version composer.json supports (php >=8.1). Nothing is built here — the release only
           # moves a tag — so this run is purely a tripwire, and the oldest interpreter is the one that
