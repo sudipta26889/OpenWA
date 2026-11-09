@@ -19,9 +19,9 @@ Both are `external: true`, so a missing or misnamed volume fails the deploy inst
 
 Keep the running containers untouched until step 3.
 
-1. Read-only checks: both volumes and both networks (`openwa-network`, `openwa-internal-docker`) exist, and `openwa-network` is inside `TRUSTED_PROXIES` (10.201.7.0/24). Both GHCR images pull for linux/amd64.
-2. Create the stack Env from the live values, file to process, never printed. Keep `NODE_ID=openwa-api`.
-3. `pg_dump` the database on db.lan. Then stop the old containers with a grace period: `docker stop -t 90 openwa-mcp-oauth-gateway openwa-api openwa-docker-proxy`.
+1. Read-only checks: both volumes and both networks exist (on 2026-11-09 `openwa-network` was 10.201.6.0/24 and `openwa-internal-docker` 10.201.7.0/24; the stack assigns no subnet). Both GHCR images pull for linux/amd64, and the disk has room for the images and the volume backup.
+2. Build the stack Env from the live containers' env, file to process, never printed. Add `API_PORT=2785`, which only the port mapping uses. Keep `NODE_ID=openwa-api`.
+3. Stop the old containers with a grace period: `docker stop -t 90 openwa-mcp-oauth-gateway openwa-api openwa-docker-proxy`. Then `pg_dump` the database on db.lan.
 4. With everything stopped, tar both volumes to `~/backups/`.
 5. Rename the three stopped containers to `<name>-precutover`, because the stack reuses the names. Do not remove them.
 6. Create the Git stack `openwa-prod`: endpoint 11, `refs/heads/main`, path `ops/portainer/stack.yml`.
@@ -29,7 +29,7 @@ Keep the running containers untouched until step 3.
    - `:2785/api/health` is 200 and the public route answers.
    - Every session reaches `ready` with no QR.
    - An inbound message arrives and an MCP OAuth call works.
-   - The container env hash matches `.env`.
+   - The new containers' env matches the stopped old containers on every stack key, compared by hash.
 8. Create the webhook, then set the repo secret `PORTAINER_WEBHOOK_URL`.
 
 **Rollback before step 8:** stop the stack, rename the old containers back, `docker start` them. The volumes are the same.

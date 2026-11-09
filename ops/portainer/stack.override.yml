@@ -1,7 +1,7 @@
 # Input to generate-stack.sh, layered on docker-compose.yml and docker-compose.override.yml.
 # Portainer Git stacks cannot build, so images come from GHCR. Volumes and networks are external so
 # a wrong name fails the deploy instead of creating an empty volume (a QR re-scan for every session),
-# and so openwa-network keeps the subnet TRUSTED_PROXIES is written for.
+# and so both networks keep their current subnets.
 services:
   # Datastores live on db.lan; the built-in profiles must not reach production.
   postgres: !reset null
