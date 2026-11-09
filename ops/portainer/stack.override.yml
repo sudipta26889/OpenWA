@@ -1,0 +1,42 @@
+# Input to generate-stack.sh, layered on docker-compose.yml and docker-compose.override.yml.
+# Portainer Git stacks cannot build, so images come from GHCR. Volumes and networks are external so
+# a wrong name fails the deploy instead of creating an empty volume (a QR re-scan for every session),
+# and so openwa-network keeps the subnet TRUSTED_PROXIES is written for.
+services:
+  # Datastores live on db.lan; the built-in profiles must not reach production.
+  postgres: !reset null
+  redis: !reset null
+  minio: !reset null
+
+  openwa-api:
+    build: !reset null
+    image: ghcr.io/sudipta26889/openwa-api:latest
+    depends_on: !override
+      docker-proxy:
+        condition: service_started
+        required: false
+
+  mcp-oauth-gateway:
+    build: !reset null
+    image: ghcr.io/sudipta26889/openwa-mcp-oauth-gateway:latest
+
+volumes:
+  postgres-data: !reset null
+  redis-data: !reset null
+  minio-data: !reset null
+  openwa-data:
+    name: openwa_openwa-data
+    external: true
+    driver: !reset null
+  mcp-oauth-gateway-data:
+    name: openwa_mcp-oauth-gateway-data
+    external: true
+
+networks:
+  openwa-network:
+    name: openwa-network
+    external: true
+  internal-docker:
+    name: openwa-internal-docker
+    external: true
+    internal: !reset null

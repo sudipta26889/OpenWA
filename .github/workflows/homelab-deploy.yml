@@ -1,0 +1,101 @@
+name: Homelab Deploy
+
+# main: tests, then linux/amd64 images to GHCR, then the Portainer webhook for stack openwa-prod
+# (ops/portainer/stack.yml). With PORTAINER_WEBHOOK_URL unset, images build and nothing is redeployed.
+# A redeploy restarts the API and every WhatsApp session, so changes that cannot affect it don't deploy.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'sdk/**'
+      - 'charts/**'
+      - 'ops/watchdog/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One release at a time; a newer push waits for the current one.
+concurrency:
+  group: homelab-deploy
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci --ignore-scripts
+      - run: npx jest --silent
+      - run: node --test ops/mcp-oauth-gateway/*.test.mjs
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - image: openwa-api
+            context: .
+          - image: openwa-mcp-oauth-gateway
+            context: ops/mcp-oauth-gateway
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/sudipta26889/${{ matrix.image }}:latest
+            ghcr.io/sudipta26889/${{ matrix.image }}:${{ steps.sha.outputs.short }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # ponytail: no post-deploy health poll, because the public health route does not report a build
+      # SHA and the old container would pass it. Add one if src/ ever exposes the revision.
+      - name: Trigger Portainer stack redeploy
+        env:
+          # A credential: anyone holding this URL can redeploy the stack.
+          PORTAINER_WEBHOOK_URL: ${{ secrets.PORTAINER_WEBHOOK_URL }}
+        run: |
+          if [ -z "$PORTAINER_WEBHOOK_URL" ]; then
+            echo "::warning::PORTAINER_WEBHOOK_URL is not set; images are built but not deployed"
+            exit 0
+          fi
+          # A webhook that lands during a redeploy gets 409, so wait it out.
+          for _ in $(seq 1 20); do
+            status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+              --retry 3 --retry-delay 5 --max-time 120 "$PORTAINER_WEBHOOK_URL")
+            echo "Portainer responded HTTP $status"
+            [ "$status" = "409" ] || break
+            sleep 30
+          done
+          [ "${status:0:1}" = "2" ]
