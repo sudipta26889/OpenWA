@@ -33,7 +33,7 @@ jobs:
           cache: 'npm'
       - run: npm ci --ignore-scripts
       - run: npx jest --silent
-      - run: node --test ops/mcp-oauth-gateway/*.test.mjs
+      - run: node --test ops/mcp-oauth-gateway/*.test.mjs ops/watchdog/*.test.mjs
 
   build-and-push:
     needs: test

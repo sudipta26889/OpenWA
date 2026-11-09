@@ -20,16 +20,24 @@ services:
     build: !reset null
     image: ghcr.io/sudipta26889/openwa-mcp-oauth-gateway:latest
 
-  # Self-heals the message stream after a WhatsApp Web reload (see ops/watchdog/watchdog.sh). Its only
-  # credential path is `docker exec` into openwa-api, so it holds no secret.
+  # Self-heals the message stream after a WhatsApp Web reload (see ops/watchdog/watchdog.sh). No docker
+  # socket: logs come through docker-proxy, restarts over HTTP with an operator-role key.
   openwa-watchdog:
     image: ghcr.io/sudipta26889/openwa-watchdog:latest
     container_name: openwa-watchdog
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - openwa-network
+      - internal-docker
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
       - openwa-watchdog-state:/state
     environment:
+      - DOCKER_HOST=tcp://docker-proxy:2375
+      - WATCHDOG_API_KEY=${WATCHDOG_API_KEY:-}
       - OPENWA_CONTAINER=openwa-api
       - WATCHDOG_POLL_SECONDS=60
       # 0 disables the blind refresh: since v0.22.0 the engine's eventsAttached guard replaces it.

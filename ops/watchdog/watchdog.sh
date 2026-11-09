@@ -13,43 +13,45 @@
 # case even if a death is never logged). A per-session debounce prevents restart loops. If a restart
 # lands on qr_ready (auth genuinely lost), that CANNOT self-heal — it's logged as an ALERT.
 #
-# Runs as a container (docker:cli) with the docker socket mounted; all API calls + the master key stay
-# INSIDE openwa-api (via `docker exec`), so no secret is copied into this watchdog.
+# Runs as a container with no docker socket: it reads logs through docker-proxy (DOCKER_HOST) and calls
+# the API over HTTP with its own operator-role key, WATCHDOG_API_KEY.
 set -u
 
 CONT="${OPENWA_CONTAINER:-openwa-api}"
 POLL="${WATCHDOG_POLL_SECONDS:-60}"
 BACKSTOP="${WATCHDOG_BACKSTOP_SECONDS:-21600}"   # 6h: max age before a proactive refresh
 DEBOUNCE="${WATCHDOG_DEBOUNCE_SECONDS:-180}"     # min gap between restarts of the SAME session
-STATE=/state
+STATE="${WATCHDOG_STATE_DIR:-/state}"
+API="${WATCHDOG_API_URL:-http://openwa-api:2785}/api/sessions"
 # Stream-death markers. Deliberately NOT plain "DISCONNECTED" (too noisy — a normal restart logs it).
 DEATH='Execution context was destroyed|because of a navigation|Session engine failed|"action":"engine_error"|detached Frame|Target closed|Protocol error'
 
 mkdir -p "$STATE"
 log(){ echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] $*"; }
 
-# Emit "<id> <status>" for every session (node one-liner run INSIDE openwa-api → its DB + creds).
+[ -n "${WATCHDOG_API_KEY:-}" ] || log "ALERT: WATCHDOG_API_KEY is not set; session restarts will be refused"
+
+# Emit "<id> <status>" for every session.
 list_sessions(){
-  docker exec "$CONT" node -e '
-    const {Client}=require("pg");
-    const c=new Client({host:process.env.DATABASE_HOST,port:+process.env.DATABASE_PORT||5432,database:process.env.DATABASE_NAME,user:process.env.DATABASE_USERNAME,password:process.env.DATABASE_PASSWORD});
-    c.connect().then(()=>c.query("SELECT id,status FROM sessions")).then(r=>{for(const x of r.rows)console.log(x.id+" "+x.status);return c.end();}).catch(()=>process.exit(0));' 2>/dev/null
+  curl -fsS -m 30 -H "x-api-key: ${WATCHDOG_API_KEY:-}" "$API" 2>/dev/null | jq -r '.[] | "\(.id) \(.status)"' 2>/dev/null
 }
 
-# stop -> start one session via the in-container API + master key; prints the /start HTTP status.
+# POST one session action; prints the HTTP status.
+post_session(){
+  curl -s -m 90 -o /dev/null -w '%{http_code}' -X POST -H "x-api-key: ${WATCHDOG_API_KEY:-}" "$API/$1/$2"
+}
+
+# stop -> start one session; prints the /start HTTP status.
+# 12s, not 4s: Chromium does not fully release the LocalAuth profile within 4s of /stop. Restarting
+# into a profile the previous browser still holds makes whatsapp-web.js loop on
+# "Page navigated; re-injecting" and the v0.22.0 eventsAttached guard then (correctly) refuses to
+# promote the session, marks it FAILED, and the watchdog restarts it again -- an endless loop.
+# Observed on personal-wa 2026-08-20; the same session recovered first try with a 12s gap.
 do_restart(){
   sid="$1"
-  docker exec "$CONT" node -e '
-    // No API_MASTER_KEY in production: the admin key is the bootstrap file OpenWA generates.
-    const k=process.env.API_MASTER_KEY||require("fs").readFileSync(process.env.BOOTSTRAP_KEY_FILE||"/app/data/.api-key","utf8").trim(), sid=process.argv[1], B="http://localhost:2785/api/sessions/";
-    const post=p=>fetch(B+sid+p,{method:"POST",headers:{"x-api-key":k}}).then(r=>r.status).catch(()=>0);
-    // 12s, not 4s: Chromium does not fully release the LocalAuth profile within 4s of /stop. Restarting
-    // into a profile the previous browser still holds makes whatsapp-web.js loop on
-    // "Page navigated; re-injecting" and the v0.22.0 eventsAttached guard then (correctly) refuses to
-    // promote the session, marks it FAILED, and the watchdog restarts it again -- an endless loop.
-    // Observed on personal-wa 2026-08-20; the same session recovered first try with a 12s gap.
-    (async()=>{ await post("/stop"); await new Promise(x=>setTimeout(x,12000)); console.log(await post("/start")); })();
-  ' "$sid" 2>/dev/null
+  post_session "$sid" stop >/dev/null
+  sleep 12
+  post_session "$sid" start
   date +%s > "$STATE/last_$sid"
 }
 
