@@ -11,7 +11,6 @@ on:
       - '**/*.md'
       - 'sdk/**'
       - 'charts/**'
-      - 'ops/watchdog/**'
   workflow_dispatch:
 
 permissions:
@@ -50,6 +49,8 @@ jobs:
             context: .
           - image: openwa-mcp-oauth-gateway
             context: ops/mcp-oauth-gateway
+          - image: openwa-watchdog
+            context: ops/watchdog
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4

@@ -34,4 +34,4 @@ Keep the running containers untouched until step 3.
 
 **Rollback before step 8:** stop the stack, rename the old containers back, `docker start` them. The volumes are the same.
 
-The watchdog (`ops/watchdog`) is not in this stack. It has been exited since 2026-09-30 and bind-mounts `watchdog.sh` from the checkout, so it needs an owner decision and an image of its own if it returns.
+The watchdog runs in this stack from its own image (`ops/watchdog`).

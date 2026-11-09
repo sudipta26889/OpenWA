@@ -40,7 +40,8 @@ list_sessions(){
 do_restart(){
   sid="$1"
   docker exec "$CONT" node -e '
-    const k=process.env.API_MASTER_KEY, sid=process.argv[1], B="http://localhost:2785/api/sessions/";
+    // No API_MASTER_KEY in production: the admin key is the bootstrap file OpenWA generates.
+    const k=process.env.API_MASTER_KEY||require("fs").readFileSync(process.env.BOOTSTRAP_KEY_FILE||"/app/data/.api-key","utf8").trim(), sid=process.argv[1], B="http://localhost:2785/api/sessions/";
     const post=p=>fetch(B+sid+p,{method:"POST",headers:{"x-api-key":k}}).then(r=>r.status).catch(()=>0);
     // 12s, not 4s: Chromium does not fully release the LocalAuth profile within 4s of /stop. Restarting
     // into a profile the previous browser still holds makes whatsapp-web.js loop on
