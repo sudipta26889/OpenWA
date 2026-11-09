@@ -715,7 +715,8 @@ flowchart LR
 
 Responses are the **raw handler payload** — there is no `{success, data, meta}` envelope.
 A controller that returns an object sends exactly that object; a list endpoint returns a bare array.
-Errors use the NestJS default shape.
+Errors use the NestJS default shape, except on the few routes that define their own error body (the readiness
+probe, the plugin ingress and the `/mcp` endpoint).
 
 ```typescript
 // Success Response — the resource itself
@@ -748,7 +749,7 @@ flowchart TB
     end
 
     subgraph Security["Security Layers"]
-        R --> HTTPS[HTTPS/TLS]
+        R --> HTTPS[HTTPS/TLS at the reverse proxy]
         HTTPS --> CORS[CORS Check]
         CORS --> RATE[Rate Limiter]
         RATE --> AUTH[API Key Auth]
@@ -757,10 +758,12 @@ flowchart TB
     end
 
     subgraph Internal["Internal Security"]
-        APP --> ENC[Data Encryption]
-        ENC --> LOG[Audit Logging]
+        APP --> LOG[Audit Logging]
     end
 ```
+
+The gateway serves plain HTTP, so TLS is terminated at the operator's reverse proxy, and the gateway does not
+encrypt stored data itself. See [04 - Security Design](./04-security-design.md#44-data-encryption).
 
 ## 3.10 Error Handling Architecture
 
@@ -791,9 +794,11 @@ flowchart TB
     SU --> F
     S --> F
 
-    F --> R["{ statusCode, message, error }"]
+    F --> R["{ statusCode, message, error? }"]
     S --> L[Log with stack]
 ```
+
+DTO validation with detail disabled (the production default) returns `{ statusCode: 400, message: "Bad Request" }` without an `error` field; see [Error Response](./06-api-specification.md#error-response).
 
 ## 3.11 Scalability Considerations
 
@@ -933,7 +938,10 @@ export interface EngineEventCallbacks {
   onMessageCreate?: (message: IncomingMessage, ticket?: InboundTicket) => void; // outgoing (incl. linked-phone sends)
   onMessageAck?: (messageId: string, status: DeliveryStatus, chatId?: string) => void;
   onMessageReceipt?: (event: MessageReceiptEvent) => void; // per-recipient group/status receipts (Baileys only)
-  onMessageRevoked?: (message: RevokedMessage, actor?: { fromMe: boolean }) => void;
+  onMessageRevoked?: (
+    message: RevokedMessage,
+    actor?: { fromMe: boolean; participant?: string; admin?: boolean },
+  ) => void; // a status post's delete names its sender, a member's group revoke names them and what the roster said (Baileys)
   onMessageReaction?: (event: ReactionEvent) => void;
   onMessageEdited?: (message: EditedMessage) => void;
   onEventResponse?: (event: EventResponseEvent) => void; // an RSVP to a WhatsApp event; Baileys only

@@ -597,6 +597,11 @@ export class MessageService implements PluginMessagePort {
     return engine.getMessageReactions(chatId, messageId);
   }
 
+  async getMessageReceipts(sessionId: string, chatId: string, messageId: string) {
+    const engine = this.getEngine(sessionId);
+    return engine.getMessageReceipts(chatId, messageId);
+  }
+
   /**
    * Read a message's media: the archived file when one exists, else the inline copy persisted on
    * the message row. The fallback is what makes media sent BY the account retrievable here — the
@@ -744,12 +749,20 @@ export class MessageService implements PluginMessagePort {
     dto: { chatId: string; messageId: string; forEveryone?: boolean },
   ): Promise<void> {
     const engine = this.getEngine(sessionId);
-    await engine.deleteMessage(dto.chatId, dto.messageId, dto.forEveryone ?? true);
+    const deleted = await engine.deleteMessage(dto.chatId, dto.messageId, dto.forEveryone ?? true);
 
     // Clear the stored message the same way an engine revoke does (body, media and metadata), on
     // its mutation chain. Best-effort: never rejects. No localized display string is persisted
     // here; the dashboard renders the localized "message deleted" text.
-    await this.messageProjector.recordRevoke(sessionId, dto.messageId, { kind: 'revoke', chatId: dto.chatId });
+    //
+    // Under the id the caller named (Baileys keys its rows by it, and so does a row an earlier engine stored) and,
+    // when the engine found the message under another form of that id, under the one it keys it by: whatsapp-web.js
+    // also takes the bare key id of a message it stores under the serialized id.
+    const source = { kind: 'revoke', chatId: dto.chatId } as const;
+    await this.messageProjector.recordRevoke(sessionId, dto.messageId, source);
+    if (typeof deleted === 'string' && deleted && deleted !== dto.messageId) {
+      await this.messageProjector.recordRevoke(sessionId, deleted, source);
+    }
   }
 
   // ========== Edit Message ==========

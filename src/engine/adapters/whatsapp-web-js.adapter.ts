@@ -18,6 +18,7 @@ import {
   PollInput,
   ContactCard,
   MessageReaction,
+  MessageReceipts,
   Label,
   Channel,
   ChannelMessage,
@@ -669,6 +670,10 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
     return this.messaging.getMessageReactions(chatId, messageId);
   }
 
+  getMessageReceipts(chatId: string, messageId: string): Promise<MessageReceipts> {
+    return this.messaging.getMessageReceipts(chatId, messageId);
+  }
+
   // Labels (Phase 3) - WhatsApp Business only
   getLabels(): Promise<Label[]> {
     return this.labels.getLabels();
@@ -746,7 +751,7 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
     return this.messaging.unpinMessage(chatId, messageId);
   }
 
-  deleteMessage(chatId: string, messageId: string, forEveryone: boolean = true): Promise<void> {
+  deleteMessage(chatId: string, messageId: string, forEveryone: boolean = true): Promise<string | void> {
     return this.messaging.deleteMessage(chatId, messageId, forEveryone);
   }
 

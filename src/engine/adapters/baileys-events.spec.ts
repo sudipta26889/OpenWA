@@ -3,6 +3,7 @@ import { BaileysEvents, type BaileysEventsHost } from './baileys-events';
 import { createLogger } from '../../common/services/logger.service';
 import { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
 import { inboundMediaConcurrency } from './inbound-media-cap';
+import { toNeutralJid } from '../identity/wa-id';
 import type { WAMessage, WASocket } from '@whiskeysockets/baileys';
 import type { Contact, EventResponseEvent, MessageReceiptEvent } from '../interfaces/whatsapp-engine.interface';
 
@@ -762,6 +763,164 @@ describe('BaileysEvents.handleMessageReceiptUpdate', () => {
   });
 });
 
+// Baileys raises a group message's receipts member by member and never its 1:1 status update, so the message
+// would stay at "sent". Each member reports in the dialect the group addresses them by (a lid), once per device.
+describe('BaileysEvents group message acks', () => {
+  const group = '120363000000000001@g.us';
+  const alice = '111111111111111@lid';
+  const bob = '222222222222222@lid';
+  // The roster as Baileys lists a lid-addressed group: the lid with the phone number beside it, and this
+  // account among the members.
+  const roster = [
+    [alice, '6281111111111@s.whatsapp.net'],
+    [bob, '6282222222222@s.whatsapp.net'],
+    ['999999999999999@lid', '6280000000000@s.whatsapp.net'],
+  ];
+  const own = { user: { id: '6280000000000:3@s.whatsapp.net', lid: '999999999999999@lid' } } as unknown as WASocket;
+  const delivered = (userJid: string, remoteJid = group) => ({
+    key: { id: 'OUT1', remoteJid, fromMe: true },
+    receipt: { userJid, receiptTimestamp: 1 },
+  });
+  const read = (userJid: string) => ({
+    key: { id: 'OUT1', remoteJid: group, fromMe: true },
+    receipt: { userJid, readTimestamp: 2 },
+  });
+  const settle = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
+
+  function setup(overrides: Partial<BaileysEventsHost> = {}) {
+    const onMessageAck = jest.fn();
+    const readGroupRoster = jest.fn(() => Promise.resolve(roster));
+    const events = new BaileysEvents(
+      makeHost({ getOnMessageAck: () => onMessageAck, readGroupRoster, getSocketOrNull: () => own, ...overrides }),
+    );
+    return { events, onMessageAck, readGroupRoster };
+  }
+
+  it('reports delivered and then read once every other member has received and read the message', async () => {
+    const { events, onMessageAck, readGroupRoster } = setup();
+    events.handleMessageReceiptUpdate([delivered(alice), delivered(alice), delivered('999999999999999@lid')]);
+    await settle();
+    expect(onMessageAck).not.toHaveBeenCalled();
+
+    events.handleMessageReceiptUpdate([delivered(bob)]);
+    await settle();
+    expect(onMessageAck.mock.calls).toEqual([['OUT1', 'delivered', group]]);
+
+    events.handleMessageReceiptUpdate([read(alice)]);
+    await settle();
+    expect(onMessageAck).toHaveBeenCalledTimes(1);
+
+    events.handleMessageReceiptUpdate([read(bob)]);
+    await settle();
+    expect(onMessageAck.mock.calls).toEqual([
+      ['OUT1', 'delivered', group],
+      ['OUT1', 'read', group],
+    ]);
+    expect(readGroupRoster).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not wait for this account, whose own devices are left out of the roster', async () => {
+    const { events, onMessageAck } = setup();
+    events.handleMessageReceiptUpdate([delivered(alice), delivered(bob)]);
+    await settle();
+    expect(onMessageAck.mock.calls).toEqual([['OUT1', 'delivered', group]]);
+  });
+
+  it('still reports the per-recipient events beside the aggregate ack', async () => {
+    const onMessageReceipt = jest.fn();
+    const { events, onMessageAck } = setup({ getOnMessageReceipt: () => onMessageReceipt });
+    events.handleMessageReceiptUpdate([delivered(alice), delivered(bob)]);
+    await settle();
+    expect(onMessageReceipt).toHaveBeenCalledTimes(2);
+    expect(onMessageAck).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves a status post at sent', async () => {
+    const { events, onMessageAck, readGroupRoster } = setup();
+    events.handleMessageReceiptUpdate([delivered(alice, 'status@broadcast'), delivered(bob, 'status@broadcast')]);
+    await settle();
+    expect(readGroupRoster).not.toHaveBeenCalled();
+    expect(onMessageAck).not.toHaveBeenCalled();
+  });
+
+  it('reports no ack when the engine cannot read a roster, and still reports the receipts', async () => {
+    const onMessageReceipt = jest.fn();
+    const { events, onMessageAck } = setup({ readGroupRoster: undefined, getOnMessageReceipt: () => onMessageReceipt });
+    events.handleMessageReceiptUpdate([delivered(alice), delivered(bob)]);
+    await settle();
+    expect(onMessageReceipt).toHaveBeenCalledTimes(2);
+    expect(onMessageAck).not.toHaveBeenCalled();
+  });
+
+  it('does nothing without an ack callback or a receipt callback', async () => {
+    const { events, readGroupRoster } = setup({ getOnMessageAck: () => undefined });
+    events.handleMessageReceiptUpdate([delivered(alice), delivered(bob)]);
+    await settle();
+    expect(readGroupRoster).not.toHaveBeenCalled();
+  });
+
+  it('stops waiting for a member who leaves the group', async () => {
+    const { events, onMessageAck } = setup();
+    events.handleMessageReceiptUpdate([delivered(alice)]);
+    await settle();
+    expect(onMessageAck).not.toHaveBeenCalled();
+
+    // Baileys 7 lists a departure as objects that carry the lid and the phone number
+    events.handleGroupParticipantsUpdate({
+      id: group,
+      action: 'remove',
+      participants: [{ id: bob, phoneNumber: '6282222222222@s.whatsapp.net' }],
+    });
+    expect(onMessageAck.mock.calls).toEqual([['OUT1', 'delivered', group]]);
+  });
+
+  it('keeps waiting through an add, a promotion and a departure from another group', async () => {
+    const { events, onMessageAck } = setup();
+    events.handleMessageReceiptUpdate([delivered(alice)]);
+    await settle();
+    events.handleGroupParticipantsUpdate({ id: group, action: 'add', participants: [{ id: bob }] });
+    events.handleGroupParticipantsUpdate({ id: group, action: 'promote', participants: [{ id: bob }] });
+    events.handleGroupParticipantsUpdate({ id: '120363000000000009@g.us', action: 'remove', participants: [bob] });
+    expect(onMessageAck).not.toHaveBeenCalled();
+  });
+
+  it('waits for a member who joins while the roster of the group is being read', async () => {
+    const answers: Array<(rows: string[][]) => void> = [];
+    const readGroupRoster = jest.fn(() => new Promise<string[][]>(resolve => answers.push(resolve)));
+    const { events, onMessageAck } = setup({ readGroupRoster });
+    const ownRow = ['999999999999999@lid', '6280000000000@s.whatsapp.net'];
+
+    events.handleMessageReceiptUpdate([delivered(alice)]);
+    events.handleGroupParticipantsUpdate({ id: group, action: 'add', participants: [{ id: bob }] });
+    events.handleMessageReceiptUpdate([
+      { key: { id: 'OUT2', remoteJid: group, fromMe: true }, receipt: { userJid: alice, receiptTimestamp: 1 } },
+    ]);
+    expect(readGroupRoster).toHaveBeenCalledTimes(2);
+
+    answers[0]([roster[0], ownRow]); // the read that began before Bob joined
+    await settle();
+    answers[1](roster);
+    await settle();
+    expect(onMessageAck).not.toHaveBeenCalled();
+
+    events.handleMessageReceiptUpdate([delivered(bob)]);
+    await settle();
+    expect(onMessageAck.mock.calls).toEqual([['OUT1', 'delivered', group]]);
+  });
+
+  it("recognises this account's row by the phone number the session knows for its lid", async () => {
+    // Credentials without `user.lid`, and a roster row for this account that lists only its lid
+    const { events, onMessageAck } = setup({
+      getSocketOrNull: () => ({ user: { id: '6280000000000:3@s.whatsapp.net' } }) as unknown as WASocket,
+      resolvePhone: jid => (jid === '999999999999999@lid' ? '6280000000000' : null),
+      readGroupRoster: () => Promise.resolve([[alice], [bob], ['999999999999999@lid']]),
+    });
+    events.handleMessageReceiptUpdate([delivered(alice), delivered(bob)]);
+    await settle();
+    expect(onMessageAck.mock.calls).toEqual([['OUT1', 'delivered', group]]);
+  });
+});
+
 // Baileys' event buffer merges a receipt that lands while a message's own upsert is still buffered (about
 // 100 ms after the send, or inside an offline replay) into that upsert as `userReceipt`, and raises no
 // message-receipt.update for it.
@@ -1320,6 +1479,106 @@ describe('BaileysEvents event RSVPs (event.response)', () => {
       await flush();
 
       expect(onEventResponse).toHaveBeenCalledWith(expect.objectContaining({ chatId: phone, responderId: phone }));
+    });
+
+    it("reports a guest's answer by phone number to the account's own event kept under the guest's lid", async () => {
+      const onEventResponse = jest.fn();
+      const events = new BaileysEvents(
+        makeHost({
+          getOnEventResponse: () => onEventResponse,
+          // Posted from the phone in a chat addressed by lid there: the account's own number sits beside the lid.
+          getStoredMessage: storedIn('99887766@lid', { fromMe: true, remoteJidAlt: '6280000000000@s.whatsapp.net' }),
+          toNeutralJid: jid => toNeutralJid(jid),
+        }),
+      );
+
+      events.handleMessagesUpdate([
+        {
+          key: { id: 'EVT1', remoteJid: '6280000000000@s.whatsapp.net', fromMe: false },
+          update: {
+            eventResponses: [
+              rsvp({
+                eventResponseMessageKey: { id: 'RSVP10', remoteJid: '6282222222222@s.whatsapp.net', fromMe: false },
+              }),
+            ],
+          },
+        },
+      ] as never);
+      await flush();
+
+      expect(onEventResponse).toHaveBeenCalledWith(expect.objectContaining({ chatId: '6282222222222@c.us' }));
+    });
+
+    it("reports the account's own answer from a lid chat to a contact's event kept under the number", async () => {
+      const onEventResponse = jest.fn();
+      const events = new BaileysEvents(
+        makeHost({
+          getOnEventResponse: () => onEventResponse,
+          getStoredMessage: storedIn('6282222222222@s.whatsapp.net'),
+          toNeutralJid: jid => toNeutralJid(jid),
+        }),
+      );
+
+      events.handleMessagesUpdate([
+        {
+          key: { id: 'EVT1', remoteJid: '99887766@lid', fromMe: false },
+          update: {
+            eventResponses: [
+              rsvp({
+                // Typed on the phone: Baileys files the account's own number beside the chat's lid.
+                eventResponseMessageKey: {
+                  id: 'RSVP12',
+                  remoteJid: '99887766@lid',
+                  remoteJidAlt: '6280000000000@s.whatsapp.net',
+                  fromMe: true,
+                },
+              }),
+            ],
+          },
+        },
+      ] as never);
+      await flush();
+
+      expect(onEventResponse).toHaveBeenCalledTimes(1);
+    });
+
+    it('drops an answer from a lid whose own phone number is not the chat of the event', async () => {
+      const onEventResponse = jest.fn();
+      const logger = createLogger('BaileysEventsSpec');
+      const warn = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+      const events = new BaileysEvents(
+        makeHost({
+          getOnEventResponse: () => onEventResponse,
+          getStoredMessage: storedIn('6282222222222@s.whatsapp.net', { fromMe: true }),
+          toNeutralJid: jid => toNeutralJid(jid),
+          logger,
+        }),
+      );
+
+      events.handleMessagesUpdate([
+        {
+          key: { id: 'EVT1', remoteJid: '6280000000000@s.whatsapp.net', fromMe: false },
+          update: {
+            eventResponses: [
+              rsvp({
+                eventResponseMessageKey: {
+                  id: 'RSVP11',
+                  remoteJid: '55443322@lid',
+                  remoteJidAlt: '6283333333333@s.whatsapp.net',
+                  fromMe: false,
+                },
+              }),
+            ],
+          },
+        },
+      ] as never);
+      await flush();
+
+      expect(onEventResponse).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(
+        'Dropping an event response sent in a chat other than its event',
+        expect.objectContaining({ responseMessageId: 'RSVP11' }),
+      );
     });
   });
 

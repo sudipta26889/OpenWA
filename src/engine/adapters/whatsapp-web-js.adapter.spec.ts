@@ -27,6 +27,7 @@ import {
 import { READY_RECONCILE_TIMEOUT_MS, READY_RECONCILE_BRIDGE_RELOAD_GRACE_MS } from './wwebjs-reconcile';
 import { DEFAULT_PUPPETEER_ARGS, PINNED_BROWSER_LOCALE } from '../../config/configuration';
 import { type WwebjsCalls } from './wwebjs-calls';
+import * as patchStatus from './engine-patch-status';
 import { getEffectiveWebVersionInfo, resolveWebVersionPin, __resetWebVersionCache } from '../wa-web-version';
 import { resolveAuthTimeoutMs, resolveEngineInitTimeoutMs } from '../engine-init-timeout';
 import * as fs from 'fs';
@@ -237,8 +238,8 @@ describe('WhatsAppWebJsAdapter initialize() failure reason (#1081)', () => {
 });
 
 // A WhatsApp Web page navigation during the FIRST inject rejects Client.initialize() before the
-// library's own framenavigated re-inject handler exists (Client.js:502 vs :504), so nothing upstream
-// retries it — and the adapter's onError channel is terminal. One in-adapter retry converts that
+// library's own framenavigated re-inject handler exists (it is added after the first inject() resolves), so
+// nothing upstream retries it — and the adapter's onError channel is terminal. One in-adapter retry converts that
 // one-navigation death into a normal slow start (#1081).
 describe('WhatsAppWebJsAdapter initialize() retry on a navigation-killed first inject (#1081)', () => {
   const newAdapter = (): WhatsAppWebJsAdapter =>
@@ -2178,9 +2179,10 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     expect(jest.getTimerCount()).toBe(0);
   });
 
-  // whatsapp-web.js sets `eventsAttached = false` in its constructor (Client.js:109) and flips it only
-  // after attachEventListeners() resolves (Client.js:373). Everything in between — LoadUtils, a poll of
-  // up to 30s for window.WWebJS (Client.js:334), ClientInfo, InterfaceController — is a legitimately
+  // whatsapp-web.js sets `eventsAttached = false` in its constructor (and, with the ready-sync patch, whenever its
+  // post-auth callback starts attaching for a page without the helpers) and flips it only after
+  // attachEventListeners() resolves. Everything in between — LoadUtils, a poll of
+  // up to 30s for window.WWebJS, ClientInfo, InterfaceController — is a legitimately
   // slow attach, not a dead bridge. Reloading inside that window navigates the page out from under the
   // in-flight inject(): the re-inject then dies at getWWebVersion before it re-exposes any of the
   // bridge, and the one-shot guard blocks a retry, so the session is doomed to the deadline (#1081).
@@ -2229,7 +2231,7 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
 
     expect(reload).toHaveBeenCalledTimes(1);
 
-    // Upstream's window.WWebJS poll alone is 30s (Client.js:334) and is only one stage of the attach.
+    // Upstream's window.WWebJS poll alone is 30s and is only one stage of the attach.
     // The grace has to outlast it, or we go back to aborting healthy attaches; and what remains before
     // the deadline has to outlast it too, or a warranted reload could never finish reinjecting.
     const UPSTREAM_WWEBJS_POLL_MS = 30_000;
@@ -2964,6 +2966,9 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
   // an `.on` method, and the rest of its evaluate completes either way. The page read that settles
   // it is one line, so ready says it instead of staying quiet.
   it('warns at ready when the page carries no call hook', async () => {
+    // The probe only runs on a tree that carries the ready-sync patch; what the installed tree carries is not this
+    // test's concern.
+    const patches = jest.spyOn(patchStatus, 'unappliedPatches').mockReturnValue([]);
     const adapter = newAdapter();
     const logger = (adapter as unknown as { logger: { warn: jest.Mock } }).logger;
     const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
@@ -2989,6 +2994,7 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     expect(missing).toBeDefined();
     expect(missing?.[1]).toMatchObject({ sessionId: 'sess-1' });
     warnSpy.mockRestore();
+    patches.mockRestore();
   });
 
   it('stays quiet at ready when the call hook is installed', async () => {
@@ -4132,10 +4138,10 @@ describe('WhatsAppWebJsAdapter message_reaction (id resolution across WA Web bui
     return calls[0][0];
   };
 
-  const emitReaction = (client: EventEmitter, msgId: unknown): void => {
+  const emitReaction = (client: EventEmitter, msgId: unknown, key: object = { remote: 'peer@c.us' }): void => {
     client.emit('message_reaction', {
       msgId,
-      id: { remote: 'peer@c.us' },
+      id: key,
       reaction: '👍',
       senderId: 'peer@c.us',
     });
@@ -4167,6 +4173,31 @@ describe('WhatsAppWebJsAdapter message_reaction (id resolution across WA Web bui
     // Never undefined: downstream looks the message up by this id, and TypeORM drops an undefined
     // condition from the where-clause — which would match an unrelated row.
     expect(reactionArg(onMessageReaction).messageId).toBe('');
+  });
+
+  // The reaction's key crosses the page boundary as JSON, so a chat id WhatsApp Web keeps as a Wid object arrives
+  // as an object; downstream compares chatId as a string and publishes it in the message.reaction payload.
+  it.each([
+    ['a string', 'peer@c.us'],
+    ['an object with _serialized', { _serialized: 'peer@c.us', user: 'peer', server: 'c.us' }],
+    ['an object on a build that renamed _serialized (#747)', { $1: 'peer@c.us' }],
+  ])('reads the chat id of a reaction whose remote arrives as %s', (_how, remote) => {
+    const { onMessageReaction, client } = wireReactionHandler();
+
+    emitReaction(client, { _serialized: 'REACTED_MSG' }, { remote });
+
+    expect(reactionArg(onMessageReaction).chatId).toBe('peer@c.us');
+  });
+
+  it.each([
+    ['missing', {}],
+    ['an object with no readable id', { remote: {} }],
+  ])('emits the empty chat id, never undefined or an object, when the remote is %s', (_how, key) => {
+    const { onMessageReaction, client } = wireReactionHandler();
+
+    emitReaction(client, { _serialized: 'REACTED_MSG' }, key);
+
+    expect(reactionArg(onMessageReaction).chatId).toBe('');
   });
 });
 

@@ -1,4 +1,4 @@
-import { Fragment, useState, useEffect, useRef } from 'react';
+import { Fragment, useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Trans, useTranslation } from 'react-i18next';
 import {
@@ -85,6 +85,33 @@ export function Infrastructure() {
   const { data: engines = [] } = useEnginesQuery();
   const { data: currentEngineData } = useCurrentEngineQuery();
   const currentEngine = currentEngineData?.engineType ?? '';
+  const footerRef = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    const footer = footerRef.current;
+    const stack = document.querySelector<HTMLElement>('.toast-container');
+    if (!footer || !stack) return;
+    const reserveSpace = () => {
+      const stackRect = stack.getBoundingClientRect();
+      const action = footer.querySelector('button')?.getBoundingClientRect();
+      const overlaps =
+        toast.toasts.length > 0 &&
+        action &&
+        action.bottom > stackRect.top &&
+        action.top < stackRect.bottom &&
+        action.right > stackRect.left &&
+        action.left < stackRect.right;
+      footer.style.setProperty(
+        '--toast-stack-height',
+        toast.toasts.length ? `${window.innerHeight - stackRect.top}px` : '0px',
+      );
+      // Extra scroll space alone would leave an already visible action under a newly added toast.
+      if (overlaps) footer.scrollIntoView({ block: 'end' });
+    };
+    reserveSpace();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(reserveSpace);
+    observer?.observe(stack);
+    return () => observer?.disconnect();
+  }, [loading, configLoading, infraStatus, savedConfig, toast.toasts.length]);
 
   const configForm = useInfraConfigForm(infraStatus, savedConfig);
   const queryClient = useQueryClient();
@@ -245,6 +272,16 @@ export function Infrastructure() {
       });
     },
   });
+
+  const saveButtonRef = useRef<HTMLButtonElement>(null);
+  const restoreSaveFocus = useRef(false);
+  useEffect(() => {
+    if (configSave.saving || restartFlow.showRestartModal || !restoreSaveFocus.current) return;
+    restoreSaveFocus.current = false;
+    if (document.activeElement === null || document.activeElement === document.body) {
+      saveButtonRef.current?.focus({ preventScroll: true });
+    }
+  }, [configSave.saving, restartFlow.showRestartModal]);
 
   const [queueStats, setQueueStats] = useState({
     webhooks: { pending: 0, completed: 0, failed: 0 } as QueueStats,
@@ -655,8 +692,9 @@ export function Infrastructure() {
             ))}
           </div>
 
-          {/* The WhatsApp Web build sessions request as their pin, distinct from the library version above (#488).
-              A page can still run another build; each session logs the one it runs at ready. */}
+          {/* The WhatsApp Web build the gateway resolves for sessions to pin, distinct from the library version above
+              (#488). A session whose pinned page cannot be downloaded or written starts unpinned, and a page can
+              still run another build; each session logs the one it runs at ready. */}
           {infraStatus?.engine.webVersion !== undefined && (
             <p className="engine-web-version">
               {t('infrastructure.engine.webVersion')}:{' '}
@@ -1198,8 +1236,16 @@ export function Infrastructure() {
         </Modal>
       )}
 
-      <footer className="page-footer">
-        <button className="btn-primary large" onClick={configSave.saveConfig} disabled={configSave.saving}>
+      <footer ref={footerRef} className="page-footer">
+        <button
+          ref={saveButtonRef}
+          className="btn-primary large"
+          onClick={event => {
+            restoreSaveFocus.current = document.activeElement === event.currentTarget;
+            void configSave.saveConfig();
+          }}
+          disabled={configSave.saving}
+        >
           {configSave.saving ? <Loader2 className="animate-spin" size={20} /> : <Save size={20} />}
           {configSave.saving ? t('infrastructure.saving') : t('infrastructure.saveConfig')}
         </button>
