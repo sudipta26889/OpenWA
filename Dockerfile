@@ -15,7 +15,7 @@
 # security-scan.yml fails once the pin differs from what the tag serves and either the tag has
 # served that image for 7 or more days, or for 3 or more days with the pin last changed 28 or more
 # days ago. Update both stages together.
-FROM --platform=$BUILDPLATFORM docker.io/node:22-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS builder
+FROM --platform=$BUILDPLATFORM docker.io/node:22-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS builder
 
 WORKDIR /app
 
@@ -63,7 +63,7 @@ RUN npm run build && npm run dashboard:ci -- --include=dev && npm run dashboard:
 
 # ===== Stage 2: Production =====
 # Same digest-pinned node:22-slim base as the builder stage.
-FROM docker.io/node:22-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS production
+FROM docker.io/node:22-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS production
 
 # Run the app with production defaults from the first boot: an unset NODE_ENV selects the
 # development branch of the CORS/Swagger/DTO-error-detail/default-secret hardening (main.ts
@@ -194,7 +194,7 @@ COPY package*.json ./
 # scripts/postinstall.js rides along so a bare local `npm ci` keeps working, but the
 # --ignore-scripts install below skips the hook here: the explicit fatal run right
 # after is the sole (and stricter) applier for the image.
-COPY scripts/postinstall.js scripts/atomic-write.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832.patch scripts/patch-wwebjs-newsletter-preview.js scripts/patch-wwebjs-status.js scripts/patch-wwebjs-ready-sync.js scripts/patch-wwebjs-participant-arity.js scripts/patch-wwebjs-block.js scripts/patch-wwebjs-group-description.js scripts/patch-wwebjs-media-id.js scripts/patch-wwebjs-send-error.js scripts/patch-wwebjs-puppeteer.js scripts/patch-baileys-appstate.js scripts/patch-baileys-newsletter-create.js scripts/patch-baileys-pairing.js ./scripts/
+COPY scripts/postinstall.js scripts/atomic-write.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832.patch scripts/patch-wwebjs-newsletter-preview.js scripts/patch-wwebjs-status.js scripts/patch-wwebjs-ready-sync.js scripts/patch-wwebjs-participant-arity.js scripts/patch-wwebjs-block.js scripts/patch-wwebjs-group-description.js scripts/patch-wwebjs-media-id.js scripts/patch-wwebjs-send-error.js scripts/patch-wwebjs-puppeteer.js scripts/patch-baileys-appstate.js scripts/patch-baileys-newsletter-create.js scripts/patch-baileys-pairing.js scripts/patch-baileys-media-stream.js ./scripts/
 
 # Install production dependencies only, then apply the backports. Each patcher matches the pristine
 # library on its own and none depends on another's edits, so the order below is not load-bearing:
@@ -211,6 +211,15 @@ COPY scripts/postinstall.js scripts/atomic-write.js scripts/patch-wwebjs-201832.
 # msgpackr-extract) are optional=true with runtime fallbacks. The patchers that DO
 # need to run are the explicit fatal invocations below; baileys' preinstall is only
 # a node-version check that the engines field enforces anyway.
+#
+# typescript and ts-node come out again at the end of the same RUN. They are root devDependencies
+# and also optional peers of valibot and typeorm, so the lockfile marks them devOptional and
+# `--omit=dev` keeps them: about 24 MiB that nothing loads. `node dist/main` registers no loader,
+# and migration:*:prod run the plain typeorm CLI on the compiled data sources under dist/. Their
+# bin links go with them, or they would dangle. ts-node's small helper packages (acorn, diff and
+# others) stay: they are generic names that a later dependency may come to share. The removal has
+# a line of its own, ahead of the cache clean that docs/10 quotes, and
+# scripts/smoke-test-engine-libs.sh checks the built image on each architecture.
 RUN npm ci --omit=dev --ignore-scripts \
     && node scripts/patch-wwebjs-201832.js \
     && node scripts/patch-wwebjs-newsletter-preview.js \
@@ -224,7 +233,10 @@ RUN npm ci --omit=dev --ignore-scripts \
     && node scripts/patch-baileys-appstate.js \
     && node scripts/patch-baileys-newsletter-create.js \
     && node scripts/patch-baileys-pairing.js \
+    && node scripts/patch-baileys-media-stream.js \
     && node scripts/patch-wwebjs-puppeteer.js \
+    && rm -rf node_modules/typescript node_modules/ts-node node_modules/.bin/tsc node_modules/.bin/tsserver \
+        node_modules/.bin/ts-script node_modules/.bin/ts-node* \
     && npm cache clean --force
 
 # Replace the npm the base image bundles. npm is not on the request path — the entrypoint runs
@@ -266,7 +278,7 @@ RUN if [ "$TARGETARCH" = arm64 ]; then \
         ln -s /usr/bin/chromium /usr/local/bin/puppeteer-chrome; \
     else \
         mkdir -p /opt/puppeteer && \
-        PUPPETEER_CACHE_DIR=/opt/puppeteer ./node_modules/.bin/puppeteer browsers install 'chrome@156.0.8078.80' && \
+        PUPPETEER_CACHE_DIR=/opt/puppeteer ./node_modules/.bin/puppeteer browsers install 'chrome@157.0.8103.38' && \
         chown -R openwa:openwa /opt/puppeteer && \
         chrome_path=$(find /opt/puppeteer/chrome/linux*/chrome-linux64/chrome | head -n 1) && \
         test -n "$chrome_path" && \

@@ -18,6 +18,7 @@ import { limiterKeyForIp, resolveClientIp, type RequestLike } from '../../common
 import { SlidingWindowLimiter } from '../events/ws-rate-limit';
 import { StatsService, type OverviewStats } from '../stats/stats.service';
 import { getWebhookDeliveryFailuresTotal } from '../../common/metrics/webhook-delivery-metrics';
+import { getIngressDedupBodyMismatchesTotal } from '../../common/metrics/ingress-metrics';
 import {
   getSessionReconnectAttemptsTotal,
   getSessionReconnectLoopAlertsTotal,
@@ -73,6 +74,8 @@ export class MetricsService implements OnModuleDestroy {
   private readonly logger = createLogger('MetricsService');
 
   private cachedRender: { at: number; text: string } | null = null;
+  /** The render in progress, which scrapes that arrive meanwhile share. */
+  private pendingRender: Promise<string> | null = null;
   private pendingOverview: Promise<OverviewStats | null> | null = null;
   private pendingSince = 0;
   /** What the newest read to finish kept: its result and when it started, or nothing after a failure. */
@@ -148,7 +151,16 @@ export class MetricsService implements OnModuleDestroy {
     if (this.cachedRender && now - this.cachedRender.at < METRICS_RENDER_TTL_MS) {
       return this.cachedRender.text;
     }
+    // A render reads and then resets the event-loop histogram, and its text is what the next five seconds of scrapes
+    // are served. Scrapes that arrive while one runs share it: a second render would read the emptied histogram,
+    // tell its caller there was no stall, and overwrite the cache with that.
+    this.pendingRender ??= this.renderFresh(now).finally(() => {
+      this.pendingRender = null;
+    });
+    return this.pendingRender;
+  }
 
+  private async renderFresh(now: number): Promise<string> {
     // The database-derived series are best-effort. Awaiting them unguarded meant a single rejected
     // query — a statement timeout, pool exhaustion, SQLITE_BUSY under load, or a genuine outage —
     // answered the whole scrape with a 500, so Prometheus lost the process, HTTP and webhook series
@@ -234,6 +246,11 @@ export class MetricsService implements OnModuleDestroy {
     );
     lines.push('# TYPE openwa_webhook_delivery_failures_total counter');
     lines.push(`openwa_webhook_delivery_failures_total ${getWebhookDeliveryFailuresTotal()}`);
+    lines.push(
+      '# HELP openwa_ingress_dedup_body_mismatches_total Ingress requests with different body bytes under an existing delivery id since process start.',
+    );
+    lines.push('# TYPE openwa_ingress_dedup_body_mismatches_total counter');
+    lines.push(`openwa_ingress_dedup_body_mismatches_total ${getIngressDedupBodyMismatchesTotal()}`);
 
     lines.push(
       '# HELP openwa_session_reconnect_attempts_total Reconnect attempts scheduled across all sessions since process start.',

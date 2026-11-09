@@ -135,6 +135,13 @@ export interface IncomingMessage {
   author?: string;
   /** WIDs @mentioned in the message (empty/absent when none). Surfaced for command targeting. */
   mentionedIds?: string[];
+  /**
+   * True when the sender forwarded this message rather than writing it. Absent (never `false`) for a
+   * message that was not forwarded, so consumers can treat the key's presence as the signal.
+   */
+  isForwarded?: boolean;
+  /** How many times the message has been forwarded; WhatsApp flags a widely forwarded one at 5 or more. Set with `isForwarded`. */
+  forwardingScore?: number;
   /** Set for `call` (call_log) messages: video vs voice, and whether an incoming call went unanswered. */
   call?: { video: boolean; missed: boolean };
   /**
@@ -437,6 +444,20 @@ export interface ReactionSender {
 export interface MessageReaction {
   emoji: string;
   senders: ReactionSender[];
+}
+
+export interface MessageReceiptParticipant {
+  participant: string;
+  timestamp: number;
+}
+
+export interface MessageReceipts {
+  delivery: MessageReceiptParticipant[];
+  deliveryRemaining?: number;
+  read: MessageReceiptParticipant[];
+  readRemaining?: number;
+  played: MessageReceiptParticipant[];
+  playedRemaining?: number;
 }
 
 // Phase 3: Labels (WhatsApp Business)
@@ -1003,9 +1024,15 @@ export interface EngineEventCallbacks {
   onMessageReceipt?: (event: MessageReceiptEvent) => void;
   /**
    * `actor.fromMe` says whether the account itself made the revoke (from its phone). Only an engine that
-   * receives the raw protocol message can say; whatsapp-web.js leaves it out.
+   * receives the raw protocol message can say; whatsapp-web.js leaves it out. The payload of a status post's
+   * delete names no sender, so there `actor.participant` is the neutral id of the contact who sent it. For a
+   * group revoke a member sent, `actor.participant` is that member's neutral id and `actor.admin` whether the
+   * group's roster shows them an admin, undefined when the engine did not read it or it could not say.
    */
-  onMessageRevoked?: (message: RevokedMessage, actor?: { fromMe: boolean }) => void;
+  onMessageRevoked?: (
+    message: RevokedMessage,
+    actor?: { fromMe: boolean; participant?: string; admin?: boolean },
+  ) => void;
   onMessageReaction?: (event: ReactionEvent) => void;
   onMessageEdited?: (message: EditedMessage) => void;
   /**
@@ -1255,7 +1282,19 @@ export interface MessageOperationsCapability {
 
   getMessageReactions(chatId: string, messageId: string): Promise<MessageReaction[]>;
 
-  deleteMessage(chatId: string, messageId: string, forEveryone?: boolean): Promise<void>;
+  /**
+   * Get per-participant delivery and read receipts for an own (fromMe) message.
+   * Returns delivery, read, and played participant lists with timestamps.
+   */
+  getMessageReceipts(chatId: string, messageId: string): Promise<MessageReceipts>;
+
+  /**
+   * Delete a message. Resolves the id the engine keys the deleted message by, when it reports one, so the caller can
+   * clear the stored copy under that id too: whatsapp-web.js resolves the serialized id of the message it found, which
+   * differs from the id it was given when that was the bare key id of a message it keys by the serialized id. An engine
+   * that keys the message by the id it was given (Baileys) resolves nothing.
+   */
+  deleteMessage(chatId: string, messageId: string, forEveryone?: boolean): Promise<string | void>;
 
   /**
    * Edit the body of a text message. Only the account's OWN messages can be edited; engines reject
@@ -1681,9 +1720,10 @@ export interface StoredChatMessage {
 }
 
 /**
- * Reads the newest stored message of the chat a write is for, across the chat's id forms. Engines
- * call it only when they know no message of the chat themselves, so a lookup costs nothing when it is
- * not needed; it resolves null when the gateway stored none.
+ * Reads the newest stored message of the chat a write is for, across the chat's id forms, among the rows
+ * of the account the engine is linked to. Engines call it only when they know no message of the chat
+ * themselves, so a lookup costs nothing when it is not needed; it resolves null when the gateway stored
+ * none.
  */
 export type StoredChatMessageLookup = () => Promise<StoredChatMessage | null>;
 

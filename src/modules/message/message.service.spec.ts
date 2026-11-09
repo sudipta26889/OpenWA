@@ -55,6 +55,7 @@ function createMockEngine() {
   return {
     reactToMessage: jest.fn().mockResolvedValue(undefined),
     getMessageReactions: jest.fn().mockResolvedValue([]),
+    getMessageReceipts: jest.fn().mockResolvedValue({ delivery: [], read: [], played: [] }),
     deleteMessage: jest.fn().mockResolvedValue(undefined),
     pinMessage: jest.fn().mockResolvedValue(undefined),
     starMessage: jest.fn().mockResolvedValue(undefined),
@@ -725,6 +726,13 @@ describe('MessageService', () => {
     });
   });
 
+  describe('getMessageReceipts', () => {
+    it('should call engine.getMessageReceipts', async () => {
+      await service.getMessageReceipts('sess-1', 'test@c.us', 'wa-msg-1');
+      expect(mockEngine.getMessageReceipts).toHaveBeenCalledWith('test@c.us', 'wa-msg-1');
+    });
+  });
+
   describe('getChatHistory', () => {
     it('should call engine.getChatHistory with default limit and includeMedia=false', async () => {
       await service.getChatHistory('sess-1', 'test@c.us');
@@ -820,6 +828,32 @@ describe('MessageService', () => {
         messageProjector.recordRevoke.mock.invocationCallOrder[0],
       );
       expect(repository.update).not.toHaveBeenCalled();
+    });
+
+    it('also clears the row stored under the id the engine deleted, after the id the caller named', async () => {
+      mockEngine.deleteMessage.mockResolvedValueOnce('true_test@c.us_wa-msg-1');
+
+      await service.deleteMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1' });
+
+      const source = { kind: 'revoke', chatId: 'test@c.us' };
+      expect(messageProjector.recordRevoke.mock.calls).toEqual([
+        ['sess-1', 'wa-msg-1', source],
+        ['sess-1', 'true_test@c.us_wa-msg-1', source],
+      ]);
+    });
+
+    it.each([
+      ['the id the caller named', 'wa-msg-1'],
+      ['an empty id', ''],
+      ['no id', undefined],
+      ['something that is not an id', {}],
+    ])('clears one row when the engine answers %s', async (_what, answer) => {
+      mockEngine.deleteMessage.mockResolvedValueOnce(answer);
+
+      await service.deleteMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1' });
+
+      expect(messageProjector.recordRevoke).toHaveBeenCalledTimes(1);
+      expect(messageProjector.recordRevoke).toHaveBeenCalledWith('sess-1', 'wa-msg-1', expect.anything());
     });
   });
 

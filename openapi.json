@@ -624,7 +624,7 @@
             }
           },
           "400": {
-            "description": "Validation failed, or the body carries a field the DTO does not declare.",
+            "description": "Validation failed, the body carries a field the DTO does not declare, or `config` is over 16384 bytes serialised as JSON.",
             "content": {
               "application/json": {
                 "schema": {
@@ -787,7 +787,7 @@
             }
           },
           "400": {
-            "description": "The session id is not a UUID",
+            "description": "The session id has characters other than letters, digits and hyphens, or is longer than 128 characters",
             "content": {
               "application/json": {
                 "schema": {
@@ -850,7 +850,7 @@
             "description": "Session deleted"
           },
           "400": {
-            "description": "The session id is not a UUID",
+            "description": "The session id has characters other than letters, digits and hyphens, or is longer than 128 characters",
             "content": {
               "application/json": {
                 "schema": {
@@ -900,7 +900,7 @@
             }
           },
           "503": {
-            "description": "The session could not be claimed for the delete because the database did not answer (nothing is deleted), or, on SQLite, another database transaction stayed open for 10 s before a delete transaction (no further rows are removed). Retry the delete.",
+            "description": "The session could not be read, checked or claimed for the delete because the database did not answer (nothing is deleted), or, on SQLite, another database transaction stayed open for 10 s before a delete transaction (no further rows are removed). Retry the delete.",
             "content": {
               "application/json": {
                 "schema": {
@@ -942,7 +942,7 @@
             }
           },
           "400": {
-            "description": "The session id is not a UUID",
+            "description": "The session id has characters other than letters, digits and hyphens, or is longer than 128 characters",
             "content": {
               "application/json": {
                 "schema": {
@@ -1105,7 +1105,7 @@
             }
           },
           "400": {
-            "description": "The session id is not a UUID",
+            "description": "The session id has characters other than letters, digits and hyphens, or is longer than 128 characters",
             "content": {
               "application/json": {
                 "schema": {
@@ -1308,7 +1308,7 @@
             }
           },
           "503": {
-            "description": "The gateway is shutting down, the session could not be claimed for this node (a database error; nothing was launched), or the engine's browser or socket connection died during launch and the one automatic retry failed too (no engine is left running); the start can be retried.",
+            "description": "The gateway is shutting down, the session could not be checked (the database could not serve the read) or claimed for this node (nothing was launched), or the engine's browser or socket connection died during launch and the one automatic retry failed too (no engine is left running); the start can be retried.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1360,7 +1360,7 @@
             }
           },
           "400": {
-            "description": "The session id is not a UUID",
+            "description": "The session id has characters other than letters, digits and hyphens, or is longer than 128 characters",
             "content": {
               "application/json": {
                 "schema": {
@@ -1411,6 +1411,16 @@
           },
           "502": {
             "description": "Session was stopped locally, but the engine teardown did not complete (the graceful disconnect and the force-destroy escalation both failed, so the engine process may still be running). Retryable — the body carries `code: 'SESSION_STOP_INCOMPLETE'`; the status is settled to `disconnected` and no success audit is written. Retry the stop; restart the node to reap a leaked process.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The database did not answer the check of whether another node holds the session, so nothing was stopped. Retry the stop.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2475,7 +2485,7 @@
             }
           },
           "400": {
-            "description": "The session id is not a UUID",
+            "description": "The session id has characters other than letters, digits and hyphens, or is longer than 128 characters",
             "content": {
               "application/json": {
                 "schema": {
@@ -6764,6 +6774,126 @@
         ]
       }
     },
+    "/api/sessions/{sessionId}/messages/{chatId}/{messageId}/receipts": {
+      "get": {
+        "operationId": "MessageController_getReceipts",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "chatId",
+            "required": true,
+            "in": "path",
+            "description": "Chat ID containing the message",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "messageId",
+            "required": true,
+            "in": "path",
+            "description": "Full serialized ID of a message this account sent, as the send routes return it",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Message delivery and read receipts with timestamps",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageReceiptsResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session not active",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The API key is missing, unknown, revoked, or expired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The message was received, not sent by this account (only its own messages carry receipts), or the API key's role, session or chat scope, or IP allow-list does not allow this operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such message in this chat: the id is not a full serialized message id, WhatsApp Web no longer holds the message, or the message belongs to another chat.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "The active engine cannot serve this operation. It is part of the engine contract, but the engine currently running has no implementation for it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The whatsapp-web.js page connection died mid-read, so nothing could be read. Retry once the session is ready again.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Get delivery and read receipts for a specific message",
+        "tags": [
+          "messages"
+        ]
+      }
+    },
     "/api/sessions/{sessionId}/messages/{chatId}/{messageId}/media": {
       "get": {
         "operationId": "MessageController_getChatMedia",
@@ -9334,7 +9464,7 @@
     },
     "/api/sessions/{sessionId}/contacts/check/{number}": {
       "get": {
-        "description": "Returns whether the number is a registered WhatsApp account and its canonical id. Use this to pre-validate a recipient before sending. Baileys also checks unmapped phone destinations before sending: a number reported as unregistered is rejected with 400. A successful check does not confirm message delivery. Requires an OPERATOR key.",
+        "description": "Returns whether the number is a registered WhatsApp account and its canonical id. Use this to pre-validate a recipient before sending. Only the digits of `number` are queried, so a `+`, spaces or an `@c.us` suffix are tolerated. Baileys also checks unmapped phone destinations before sending: a number reported as unregistered is rejected with 400. A successful check does not confirm message delivery. Requires an OPERATOR key.",
         "operationId": "ContactController_checkNumber",
         "parameters": [
           {
@@ -9368,7 +9498,7 @@
             }
           },
           "400": {
-            "description": "Session is not started",
+            "description": "Session is not started, or `number` is an id of another kind (a privacy id, a group or a channel) or holds no digits, so it names no phone number",
             "content": {
               "application/json": {
                 "schema": {
@@ -10005,7 +10135,7 @@
             }
           },
           "400": {
-            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry.",
+            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry. Also answered when the group id in the path does not name a group.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10198,7 +10328,7 @@
             }
           },
           "400": {
-            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry.",
+            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry. Also answered when the group id in the path does not name a group.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10307,7 +10437,7 @@
             }
           },
           "400": {
-            "description": "No setting provided, an unknown body field, or an invalid value: `announce` and `locked` take a boolean, `ephemeralSeconds` an integer of 0 or more, `memberAddMode` `all` or `admins`, and `null` is refused. Also answered when the session is not started (no engine is running for it).",
+            "description": "No setting provided, an unknown body field, or an invalid value: `announce` and `locked` take a boolean, `ephemeralSeconds` an integer of 0 or more, `memberAddMode` `all` or `admins`, and `null` is refused. Also answered when the session is not started (no engine is running for it), or the group id in the path does not name a group.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10428,7 +10558,7 @@
             }
           },
           "400": {
-            "description": "A participant does not name an individual. Pass a phone number, `<phone>@c.us` or `<lid>@lid`; a group id or free text is rejected. With send pacing on, also answered (without `retryAfterSeconds`) when the request names more new contacts than the whole day's cold-reachout allowance; split it into smaller batches.",
+            "description": "A participant does not name an individual. Pass a phone number, `<phone>@c.us` or `<lid>@lid`; a group id or free text is rejected. With send pacing on, also answered (without `retryAfterSeconds`) when the request names more new contacts than the whole day's cold-reachout allowance; split it into smaller batches. Also answered when the group id in the path does not name a group.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10537,7 +10667,7 @@
             }
           },
           "400": {
-            "description": "A participant does not name an individual. Pass a phone number, `<phone>@c.us` or `<lid>@lid`; a group id or free text is rejected.",
+            "description": "A participant does not name an individual. Pass a phone number, `<phone>@c.us` or `<lid>@lid`; a group id or free text is rejected. Also answered when the group id in the path does not name a group.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10648,7 +10778,7 @@
             }
           },
           "400": {
-            "description": "A participant does not name an individual. Pass a phone number, `<phone>@c.us` or `<lid>@lid`; a group id or free text is rejected.",
+            "description": "A participant does not name an individual. Pass a phone number, `<phone>@c.us` or `<lid>@lid`; a group id or free text is rejected. Also answered when the group id in the path does not name a group.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10759,7 +10889,7 @@
             }
           },
           "400": {
-            "description": "A participant does not name an individual. Pass a phone number, `<phone>@c.us` or `<lid>@lid`; a group id or free text is rejected.",
+            "description": "A participant does not name an individual. Pass a phone number, `<phone>@c.us` or `<lid>@lid`; a group id or free text is rejected. Also answered when the group id in the path does not name a group.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10864,7 +10994,7 @@
             }
           },
           "400": {
-            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry.",
+            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry. Also answered when the group id in the path does not name a group.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10976,7 +11106,7 @@
             }
           },
           "400": {
-            "description": "The body failed validation, or the session is not started (no engine is running for it).",
+            "description": "The body failed validation, or the session is not started (no engine is running for it). Also answered when the group id in the path does not name a group.",
             "content": {
               "application/json": {
                 "schema": {
@@ -11088,7 +11218,7 @@
             }
           },
           "400": {
-            "description": "The body failed validation, or the session is not started (no engine is running for it).",
+            "description": "The body failed validation, or the session is not started (no engine is running for it). Also answered when the group id in the path does not name a group.",
             "content": {
               "application/json": {
                 "schema": {
@@ -11199,7 +11329,7 @@
             }
           },
           "400": {
-            "description": "The body failed validation, or the session is not started (no engine is running for it).",
+            "description": "The body failed validation, or the session is not started (no engine is running for it). Also answered when the group id in the path does not name a group.",
             "content": {
               "application/json": {
                 "schema": {
@@ -11310,7 +11440,7 @@
             }
           },
           "400": {
-            "description": "The body failed validation, or the session is not started (no engine is running for it).",
+            "description": "The body failed validation, or the session is not started (no engine is running for it). Also answered when the group id in the path does not name a group.",
             "content": {
               "application/json": {
                 "schema": {
@@ -11533,7 +11663,7 @@
             }
           },
           "400": {
-            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry.",
+            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry. Also answered when the group id in the path does not name a group.",
             "content": {
               "application/json": {
                 "schema": {
@@ -11943,7 +12073,7 @@
             }
           },
           "400": {
-            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry.",
+            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry. Also answered when the group id in the path does not name a group.",
             "content": {
               "application/json": {
                 "schema": {
@@ -12044,7 +12174,7 @@
             }
           },
           "400": {
-            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry.",
+            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry. Also answered when the group id in the path does not name a group.",
             "content": {
               "application/json": {
                 "schema": {
@@ -18464,7 +18594,7 @@
   "info": {
     "title": "OpenWA API",
     "description": "Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API\n\n**Gateway-wide responses.** Three statuses are returned by middleware before routing, so any operation can emit them:\n\n- `415 Unsupported Media Type` — the request body carries a `Content-Encoding` other than `identity`. The aggregate in-flight body cap counts wire bytes, so a compressed body would be admitted on its compressed size and then inflated past the memory it is meant to bound. Send the body uncompressed.\n- `413 Payload Too Large`: the declared `Content-Length` is more than the gateway could hold in flight for this caller even when idle. The body is not read; retrying it unchanged cannot succeed.\n- `503 Service Unavailable` with `Retry-After` — the gateway already has too much request body data in flight (the body is not read; retry after the given delay), or, without `Retry-After`, shutdown teardown has begun: every route except `/api/health` and `/api/health/*` then answers it with `Connection: close`.\n\nEvery operation that takes an API key can also answer `429 Too Many Requests` (the per-IP rate-limit windows; with send pacing on, a send can also be refused with `code: SEND_PACING_LIMITED` and `retryAfterSeconds`) and `500 Internal Server Error` (an unexpected failure, or `code: ENGINE_PAGE_ERROR` when WhatsApp Web threw inside the page during a whatsapp-web.js send or status post). Error bodies follow the `ErrorResponse` schema.",
-    "version": "0.27.1",
+    "version": "0.29.1",
     "contact": {
       "name": "OpenWA",
       "url": "https://github.com/rmyndharis/OpenWA",
@@ -18787,7 +18917,7 @@
           },
           "keyPrefix": {
             "type": "string",
-            "description": "First 12 characters of the key (for identification)"
+            "description": "First 12 characters of the key (for identification). A key seeded from API_MASTER_KEY lists the fixed text \"(master key)\" instead, except one seeded by an earlier release, which lists its first 12 characters."
           },
           "role": {
             "type": "string",
@@ -18861,7 +18991,7 @@
           },
           "keyPrefix": {
             "type": "string",
-            "description": "First 12 characters of the key (for identification)"
+            "description": "First 12 characters of the key (for identification). A key seeded from API_MASTER_KEY lists the fixed text \"(master key)\" instead, except one seeded by an earlier release, which lists its first 12 characters."
           },
           "role": {
             "type": "string",
@@ -19004,7 +19134,7 @@
           },
           "config": {
             "type": "object",
-            "description": "Session configuration. Only three keys are read: autoRejectCalls (boolean, default false, Baileys engine only) rejects incoming calls as soon as they ring, and the call.received event is still emitted first; maxReconnectAttempts (0-20, default unlimited) caps consecutive reconnects (the count restarts once the session has stayed READY for 5 minutes) and reconnectBaseDelay (1000-300000 ms, default 5000) sets the backoff base, both for the gateway's own reconnect only (on Baileys the engine retries a transient drop itself, with a fixed backoff and no cap). Anything else is stored but ignored. All three can be changed later with PATCH /api/sessions/{sessionId}/config without a restart: autoRejectCalls applies from the next incoming call, the two reconnect settings from the next session start.",
+            "description": "Session configuration. Only three keys are read: autoRejectCalls (boolean, default false, Baileys engine only) rejects incoming calls as soon as they ring, and the call.received event is still emitted first; maxReconnectAttempts (0-20, default unlimited) caps consecutive reconnects (the count restarts once the session has stayed READY for 5 minutes) and reconnectBaseDelay (1000-300000 ms, default 5000) sets the backoff base, both for the gateway's own reconnect only (on Baileys the engine retries a transient drop itself, with a fixed backoff and no cap). Anything else is stored but ignored, up to 16384 bytes for the whole object serialised as JSON (a larger one is refused with 400). All three can be changed later with PATCH /api/sessions/{sessionId}/config without a restart: autoRejectCalls applies from the next incoming call, the two reconnect settings from the next session start.",
             "example": {
               "autoRejectCalls": false,
               "maxReconnectAttempts": 5,
@@ -19841,6 +19971,7 @@
               "session.status"
             ],
             "minItems": 1,
+            "maxItems": 27,
             "items": {
               "type": "string",
               "enum": [
@@ -20042,6 +20173,7 @@
             "type": "array",
             "description": "Event types to subscribe to. '*' subscribes to all events except `message.receipt`, which must be named explicitly.",
             "minItems": 1,
+            "maxItems": 27,
             "items": {
               "type": "string",
               "enum": [
@@ -21538,6 +21670,16 @@
               "type": "string"
             }
           },
+          "isForwarded": {
+            "type": "boolean",
+            "description": "True when the sender forwarded this message rather than writing it. Absent otherwise.",
+            "example": true
+          },
+          "forwardingScore": {
+            "type": "number",
+            "description": "How many times the message has been forwarded. Set with `isForwarded`.",
+            "example": 1
+          },
           "call": {
             "description": "Set for `call` messages.",
             "allOf": [
@@ -21663,6 +21805,71 @@
         "required": [
           "emoji",
           "senders"
+        ]
+      },
+      "MessageReceiptParticipantDto": {
+        "type": "object",
+        "properties": {
+          "participant": {
+            "type": "string",
+            "example": "628123456789@c.us",
+            "description": "Participant WhatsApp ID"
+          },
+          "timestamp": {
+            "type": "number",
+            "description": "Unix seconds the receipt occurred.",
+            "example": 1700000010
+          }
+        },
+        "required": [
+          "participant",
+          "timestamp"
+        ]
+      },
+      "MessageReceiptsResponseDto": {
+        "type": "object",
+        "properties": {
+          "delivery": {
+            "description": "Participants who received the message",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MessageReceiptParticipantDto"
+            }
+          },
+          "deliveryRemaining": {
+            "type": "number",
+            "description": "Number of participants remaining to receive",
+            "example": 0
+          },
+          "read": {
+            "description": "Participants who read the message",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MessageReceiptParticipantDto"
+            }
+          },
+          "readRemaining": {
+            "type": "number",
+            "description": "Number of participants remaining to read",
+            "example": 0
+          },
+          "played": {
+            "description": "Participants who played the audio/voice message",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MessageReceiptParticipantDto"
+            }
+          },
+          "playedRemaining": {
+            "type": "number",
+            "description": "Number of participants remaining to play",
+            "example": 0
+          }
+        },
+        "required": [
+          "delivery",
+          "read",
+          "played"
         ]
       },
       "DeleteMessageDto": {
@@ -22446,7 +22653,7 @@
           },
           "headless": {
             "type": "boolean",
-            "description": "Whether Chromium runs headless. Meaningful for whatsapp-web.js only.",
+            "description": "Whether Chromium runs headless, from `PUPPETEER_HEADLESS`. A stored whatsapp-web.js plugin config can override it for sessions, and is not reflected here. Meaningful for whatsapp-web.js only.",
             "example": true
           },
           "sessionDataPath": {
@@ -22455,13 +22662,13 @@
           },
           "browserArgs": {
             "type": "string",
-            "description": "Effective Chromium launch arguments: PUPPETEER_ARGS or the defaults, with --lang=en-US appended unless a --lang flag is already present.",
+            "description": "Chromium launch arguments from `PUPPETEER_ARGS` or the defaults, with --lang=en-US appended unless a --lang flag is already present. A stored whatsapp-web.js plugin config (`puppeteer.args`) takes precedence for sessions and is not reflected here.",
             "example": "--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu --lang=en-US"
           },
           "webVersion": {
             "type": "string",
             "nullable": true,
-            "description": "whatsapp-web.js only: the WhatsApp Web build sessions request as their pin, which is distinct from the library version. A page can still run another build; each session logs the one it runs when it reaches ready. Omitted for other engines.",
+            "description": "whatsapp-web.js only: the WhatsApp Web build the gateway resolves for sessions to pin, which is distinct from the library version. It is not read back from a page. A session whose pinned page cannot be downloaded or written starts unpinned and logs `web_version_html_unavailable`, and a page can still run another build; each session logs the one it runs when it reaches ready. Omitted for other engines.",
             "example": "2.3000.1234567890"
           },
           "webVersionSource": {

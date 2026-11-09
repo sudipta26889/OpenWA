@@ -2,11 +2,11 @@ import { ChatLabelsUnsupportedError } from '../../common/errors/chat-labels-unsu
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { isChannelJid, parseWaId, toNeutralJid } from '../identity/wa-id';
 import type * as BaileysLib from '@whiskeysockets/baileys';
-import type { WASocket } from '@whiskeysockets/baileys';
+import type { GroupMetadata, WASocket } from '@whiskeysockets/baileys';
 import { BaileysChannels } from './baileys-channels';
 import { BaileysCatalog } from './baileys-catalog';
 import { BaileysContacts } from './baileys-contacts';
-import { BaileysEvents } from './baileys-events';
+import { BaileysEvents, type GroupMember } from './baileys-events';
 import { BaileysGroups } from './baileys-groups';
 import { BaileysHistory, toUnixSeconds } from './baileys-history';
 import { type BaileysEngineHost } from './baileys-host';
@@ -37,6 +37,7 @@ import {
   LocationInput,
   MediaInput,
   MessageReaction,
+  MessageReceipts,
   MessageResult,
   PaginatedProducts,
   ParticipantOperationResult,
@@ -126,6 +127,24 @@ export class BaileysAdapter implements IWhatsAppEngine {
     // is added once here, not to nine per-delegate bags. Each delegate keeps its own narrow Host
     // interface, which this literal satisfies structurally - least privilege stays enforceable.
     const delegates: { events?: BaileysEvents } = {};
+    // A group's members: every id form each is listed under, and whether an admin.
+    const membersOf = (metadata: GroupMetadata): GroupMember[] =>
+      metadata.participants.map(participant => ({
+        ids: [participant.id, participant.lid, participant.phoneNumber].filter((jid): jid is string => !!jid),
+        admin: !!participant.admin,
+      }));
+    // From the cached metadata, or from a bounded query.
+    const readGroupMembers = async (groupId: string): Promise<GroupMember[] | null> => {
+      const sock = this.sock;
+      if (!sock) return null;
+      const query = () =>
+        withQueryDeadline(
+          sock.groupMetadata(groupId),
+          BAILEYS_QUERY_BUDGET_MS,
+          'WhatsApp did not answer the group metadata query in time',
+        );
+      return membersOf((await this.lifecycle.groupMetadata.read(groupId, query)) ?? (await query()));
+    };
     const host: BaileysEngineHost = {
       // Read after a delegate's awaits too, when a stop or logout may have torn the socket down since
       // its readiness check: that is a not-ready session (409), not a null dereference (500).
@@ -178,6 +197,12 @@ export class BaileysAdapter implements IWhatsAppEngine {
       getOnMessageReaction: () => this.callbacks.onMessageReaction,
       getOnMessageAck: () => this.callbacks.onMessageAck,
       getOnMessageReceipt: () => this.callbacks.onMessageReceipt,
+      readGroupRoster: async groupId => (await readGroupMembers(groupId))?.map(member => member.ids) ?? null,
+      readGroupMembers,
+      peekGroupMembers: groupId => {
+        const cached = this.lifecycle.groupMetadata.peek(groupId);
+        return cached ? membersOf(cached) : null;
+      },
       getOnGroupEvent: () => this.callbacks.onGroupEvent,
       getOnEventResponse: () => this.callbacks.onEventResponse,
       getOnCall: () => this.callbacks.onCall,
@@ -207,6 +232,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
       upsertContacts: records => this.sessionStore.upsertContacts(records),
       upsertChats: records => this.sessionStore.upsertChats(records),
       removeChats: ids => this.sessionStore.removeChats(ids),
+      seedStoredPreviews: rows => this.sessionStore.seedStoredPreviews(rows),
       extractEphemeralDuration: msg => this.sessionStore.extractEphemeralDuration(msg),
       getOnHistoryMessages: () => this.callbacks.onHistoryMessages,
       getStoredWriteGeneration: () => this.events.getStoredWriteGeneration(),
@@ -611,6 +637,10 @@ export class BaileysAdapter implements IWhatsAppEngine {
 
   getMessageReactions(_chatId: string, _messageId: string): Promise<MessageReaction[]> {
     return this.unsupported('getMessageReactions');
+  }
+
+  getMessageReceipts(_chatId: string, _messageId: string): Promise<MessageReceipts> {
+    return this.unsupported('getMessageReceipts');
   }
 
   // Baileys exposes label WRITES only — chats.d.ts:69-73 has addLabel/addChatLabel/removeChatLabel

@@ -9,8 +9,9 @@
 > (`leaseExpiresAt`). A process claims a session before starting its engine and refuses
 > when another node holds a live claim, so two replicas can no longer both launch the same
 > session — which is what corrupted the shared LocalAuth directory. A booting process also
-> resets only the sessions it may claim, instead of reporting a live peer's sessions as
-> disconnected. Claims are released on a clean shutdown and expire otherwise, so failover
+> resets only the sessions it may claim (its own, unowned ones, and those whose holder's lease
+> has lapsed), instead of reporting a peer's sessions as disconnected while its lease is live.
+> Claims are released on a clean shutdown and expire otherwise, so failover
 > does not depend on one. `NODE_ID` names the process; it defaults to the hostname and must
 > be stable across restarts and unique per running process: two processes sharing a hostname
 > (host networking, pm2 cluster mode) must each set it, and a node that sees another process
@@ -71,6 +72,20 @@
 > renewal still finds its own claim, so it detects no loss, and a steadily connected engine emits no
 > new status. The row reads `disconnected` until that engine's status next changes.
 >
+> Known limitation: the boot reset takes a lease that lapsed by any amount, where the sweep's status
+> correction above waits for more than two TTLs. A healthy peer's lease can lapse for a second, so a node
+> that boots in that moment marks the peer's `ready` session `disconnected`. With `AUTO_START_SESSIONS` on,
+> that node then claims the session, when the row has a phone, carries no operator stop or delete marker and the
+> node passes the normal capacity and lease checks, and the peer gives up its engine at its next heartbeat, as in an
+> adoption. When it does not (auto-start off, the node at its session cap, or the peer renewing first),
+> nothing writes the status back while the peer keeps renewing: the row reads `disconnected` until that
+> engine's status next changes. A peer's `qr_ready` session that has a phone is reset the same way, and
+> with auto-start on boot launches it under the same conditions, a start the sweep avoids by leaving such a row as it is. The reset
+> stays this broad because a single node recreated under a new hostname (`NODE_ID` unset) finds its
+> previous identity's rows foreign: narrower, a `qr_ready` row with a phone would keep its status with no
+> engine behind it, and `ready` rows would read active until the sweep corrects them minutes later. More
+> than one node is not a supported topology (see above), and the shipped chart keeps `replicaCount: 1`.
+>
 > **Request routing now exists, opt-in via `NODE_URL`.** When every node sets its own
 > reachable URL (e.g. `NODE_URL=http://10.0.0.5:2785`), a session-scoped request landing on
 > a non-owner is forwarded to the live owner and the owner's response is relayed back
@@ -124,6 +139,22 @@
 > may already have carried it out, so a non-idempotent call such as a message send must not
 > be repeated blindly on either.
 >
+> **The owner lookup can fail first.** A node with `NODE_URL` reads a session's owner before it routes any
+> request for the session. When the database cannot serve that read for the moment (a dropped, refused or timed-out
+> connection, a connection limit, a locked SQLite file, a database starting up or shutting down), the node answers
+> `503` and nothing was done, so the request is safe to retry; a statement the database rejects stays `500`.
+>
+> **A large answer is relayed as it arrives.** The forwarding node holds an answer of up to
+> 4 MiB whole: a read that fails answers `502` or `504`, and nothing of the owner's status
+> or headers is passed on. A larger answer, such as a media download, is passed on as it
+> arrives instead, so that concurrent downloads through a node that does not own the session
+> do not each hold a copy in its memory. It carries the owner's `Content-Length` when the
+> owner sent one and the body was not encoded. `SESSION_PROXY_TIMEOUT_MS` then covers the owner's reply up to those first
+> 4 MiB and no more, so a slow client is not cut by it, and an owner that stops sending is
+> ended by the HTTP client's own limit of 5 minutes without data. A failure once the relay has
+> begun can no longer answer `502`: the connection to the client is cut, so a short body
+> cannot pass for the whole one, and the client should repeat the download.
+>
 > **The lease compares timestamps written by different nodes, so their clocks must agree.** Each
 > node writes `leaseExpiresAt` from its own clock and reads every other node's the same way. Just
 > before each renewal the holder's lease is only one TTL minus one heartbeat ahead, so a node whose
@@ -160,10 +191,16 @@
 > connected to node A receives an event raised on node B. Scope honestly: this distributes event
 > **fan-out only**. The per-key WS rate-limit buckets (counted per replica) and the engine registry
 > are still process-local. Without `REDIS_ENABLED` the adapter is inert and delivery is single-node,
-> exactly as before. With it, every event of a one-to-one chat also costs the emitting node one or two
+> exactly as before. With it, an event of a one-to-one chat also costs the emitting node one or two
 > `lid_mappings` lookups (one for a `@lid` chat, none for a group), even when no chat-restricted key
 > exists: it cannot know whether another replica holds a restricted socket, so it names the chat in
-> every form for the rooms to match.
+> every form for the rooms to match. Events about one chat of one session that are raised together
+> share a lookup, and an answer that named the chat's other identity is reused for 5 seconds (for up to
+> 1,000 chats). That reuse applies whenever the gateway expands a chat for chat-restricted delivery: with
+> Redis fan-out on, or while a chat-restricted socket is connected to the node. A mapping that arrives can
+> be seen up to 5 seconds late, and after a mapping is removed or moved, events of that chat can keep
+> reaching sockets restricted to the old identity for up to 5 seconds. A chat the table has no other
+> identity for is read again by every event.
 >
 > **The fan-out to other replicas is best effort and keeps no replay queue.** A Redis that pauses for less
 > than 10 s (a snapshot fork, a slow fsync) answers afterwards, and every event raised meanwhile reaches the

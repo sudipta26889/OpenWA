@@ -6,7 +6,7 @@
 
   <groupId>com.rmyndharis</groupId>
   <artifactId>openwa</artifactId>
-  <version>0.8.0</version>
+  <version>0.10.0</version>
   <packaging>jar</packaging>
 
   <name>OpenWA Java SDK</name>
@@ -66,7 +66,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.5.2</version>
+        <version>3.6.1</version>
       </plugin>
     </plugins>
   </build>

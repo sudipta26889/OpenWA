@@ -49,6 +49,14 @@ flowchart TD
     A3 -->|No| A3a[Check message format]
 ```
 
+### Issue: Source install fails with a `GLIBC_2.xx not found` error
+
+**Symptoms:** A Linux source install exits during startup with an error such as `version GLIBC_2.29 not found` or `version GLIBC_2.33 not found (required by .../better-sqlite3/prebuilds/linux-x64.node)` or `ERR_DLOPEN_FAILED` naming that prebuild.
+
+**Cause:** The shipped `better-sqlite3` Linux x64/arm64 glibc prebuilds require **glibc 2.34 or newer**. The main authentication database always uses SQLite, so selecting PostgreSQL does not avoid this requirement. Node.js can run on older glibc versions while this native driver cannot.
+
+**Solution:** Use a host with glibc 2.34+ (Ubuntu 22.04+, Debian 12+, RHEL 9+) or the published Docker image. `npm rebuild better-sqlite3 --build-from-source` does not help while the shipped prebuild exists: the package skips an ordinary rebuild when it finds a prebuild, and its loader chooses that file ahead of a local build.
+
 ## 12.2 Podman Compatibility
 
 ### Issue: `FileNotFoundError` / Docker socket missing
@@ -251,6 +259,12 @@ Proxy egress (if WhatsApp is blocked on your network) is configured **per sessio
 which need an ADMIN key. It is **not** an environment variable, and an unreachable proxy silently
 blocks the WhatsApp WebSocket on either engine (see the _No QR code appears, or `/start` returns `504`_
 entry below: on whatsapp-web.js `/start` returns `504`, on Baileys it succeeds and no QR arrives).
+On whatsapp-web.js a SOCKS proxy cannot log in: Chromium cannot authenticate one, so the user name and
+password of a `socks4://` or `socks5://` `proxyUrl` are not used and a SOCKS proxy that requires a login
+refuses the session. Use a proxy that admits the gateway by its IP address, or an `http`/`https` proxy
+with credentials. A start that such a proxy refuses ends in `auth timeout` or a browser network error
+and adds this to the session's `lastError`; a proxy that never answers ends at the engine
+initialization deadline, without it.
 
 ### Issue: Linking asks for a passkey and never completes (both engines)
 
@@ -362,7 +376,12 @@ executed inside the `web.whatsapp.com` origin without an integrity check. Set
 unpinned session (this setting, or an auto-resolve that could not reach the registry) caches nothing to
 disk, so it also works on the image's read-only root filesystem. A pinned build's HTML is downloaded
 at start, with a 10 s bound, into `<SESSION_DATA_PATH>/.wa-web-cache/` on the writable data volume and
-served from there; a build no session has started on for a week is removed.
+served from there; a build no session has started on for a week is removed. A registry build whose page is
+WhatsApp's logged-out landing page, not the app (its root element is `<html id="whatsapp-web-logged-out">`, the
+value quoted or not), is refused: the auto-resolved pin moves to the next older settled build from the same
+registry read (up to three are tried, with the warning `web_version_html_rejected`), so the fallback needs no
+second registry read. An exact build you set is not swapped, so
+that session starts on the live build with the `web_version_html_unavailable` warning above.
 
 A pin is not guaranteed to hold. whatsapp-web.js applies it by answering the page's document request
 with the pinned HTML, and that can miss in two ways: a pin whose HTML could not be fetched is dropped
@@ -501,7 +520,7 @@ custom container that drops the `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` setup or th
 
 **Cause D — Debian 12 OS Chromium SIGTRAP in non-root Pods.**
 If `Code: null` happens on Kubernetes, and the host kernel logs or `dmesg` shows `Trace/breakpoint trap (core dumped)` with exit code 133, the underlying Debian 12 OS `chromium` package has crashed due to strict non-root or seccomp constraints (even with `--no-zygote` or `Unconfined` seccomp).
-_Fix:_ On amd64, do not use the `chromium` package from Debian's `apt` — it SIGTRAPs under strict non-root/seccomp. Instead, download Chrome for Testing via Puppeteer during the Docker build (`./node_modules/.bin/puppeteer browsers install 'chrome@156.0.8078.80'`) and point `PUPPETEER_EXECUTABLE_PATH` to it. (arm64 keeps Debian's `chromium`, which ships a native arm64 binary, by choice: Chrome for Testing publishes linux-arm64 builds only from 153, and the image has not moved arm64 to one.) The official `Dockerfile` implements this mixed approach.
+_Fix:_ On amd64, do not use the `chromium` package from Debian's `apt` — it SIGTRAPs under strict non-root/seccomp. Instead, download Chrome for Testing via Puppeteer during the Docker build (`./node_modules/.bin/puppeteer browsers install 'chrome@157.0.8103.38'`) and point `PUPPETEER_EXECUTABLE_PATH` to it. (arm64 keeps Debian's `chromium`, which ships a native arm64 binary, by choice: Chrome for Testing publishes linux-arm64 builds only from 153, and the image has not moved arm64 to one.) The official `Dockerfile` implements this mixed approach.
 
 **Quick triage:** run `docker stats openwa-api`, click **Start**, and watch which resource spikes toward its
 limit the instant before the failure — that tells you A vs B. If neither moves and you see the crashpad
@@ -534,8 +553,8 @@ the session card) carries a short form of it, so the pointer survives without re
 of a profile a newer Chrome has opened, and that is where whatsapp-web.js keeps the WhatsApp login: every
 previously linked session starts at a QR code instead of reconnecting, the log names no cause (0.23.3 and
 0.23.4 log only a generic `relink_required` warning), and upgrading again does not bring the pairing back. On
-amd64 this follows a rollback from 0.26.0 (Chrome for Testing 156) to 0.25.0 or earlier, and
-from 0.23.5 or later to 0.23.4 or earlier (146); on arm64, a rollback to an image built with an older Debian
+amd64 this follows a rollback from 0.29.0 or later (Chrome for Testing 157) to 0.28.0 or earlier,
+from 0.26.0 or later (156) to 0.25.0 or earlier, and from 0.23.5 or later to 0.23.4 or earlier (146); on arm64, a rollback to an image built with an older Debian
 chromium major. Restoring `sessions/` from a backup taken before the first start on the newer image keeps the
 pairing (see the upgrade runbook's rollback in docs/11); without one, scan a new QR.
 
@@ -774,7 +793,7 @@ rm -rf node_modules/whatsapp-web.js && npm ci
   block/unblock refusing every id, a status media send that never arrives, a group description that
   cannot be set, an app-state resync that never settles
 
-**Cause:** OpenWA applies thirteen exact source transforms to its engine libraries at install time
+**Cause:** OpenWA applies fourteen exact source transforms to its engine libraries at install time
 (docs/29 §29.3). The Docker image runs them without `--best-effort`, so a source shape a patcher
 cannot recognise fails the image build. Source installs run the Puppeteer compatibility transform
 without best-effort too, because browser teardown depends on it. The other transforms use
@@ -902,6 +921,51 @@ curl -X POST http://localhost:2785/api/sessions/{id}/messages/send-image \
   }'
 ```
 
+### Issue: `send-video` fails after about 20 seconds with `ENGINE_PAGE_ERROR` `TimeoutError: TimeoutError` (whatsapp-web.js)
+
+**Symptoms:**
+
+- `send-video`, or a video status post, answers `500` with `"code": "ENGINE_PAGE_ERROR"` and
+  `"message": "WhatsApp Web rejected the operation: TimeoutError: TimeoutError (build ...)"` about 20
+  seconds after the request
+- Text sends keep working
+
+**Cause:** Before it uploads a video, WhatsApp Web loads the file into a `<video>` element in the page
+to read its size and duration and to draw the thumbnail. When that element neither loads nor reports
+an error within 20 seconds, WhatsApp Web throws its own `TimeoutError` without a message, which is the
+text above. The 20 seconds belong to WhatsApp Web, not to a gateway setting, and the file is already
+inside the page at that point, so neither the upload nor `MEDIA_DOWNLOAD_MAX_BYTES` is involved.
+
+A file the browser cannot decode does not produce this error. In tests, an MP4 whose video track the
+browser had no decoder for failed in under a second with `MediaUnsupportedError`, and a container the
+browser could not open, or random bytes, failed in under a second with
+`InvalidMediaCheckRepairFailedType`. Both reach the caller as `ENGINE_PAGE_ERROR` with that name
+instead of `TimeoutError`.
+
+One trigger was reproduced in a test: with another tab in front, so that the WhatsApp Web page was
+hidden, a valid H.264/AAC MP4 failed after 20 seconds with exactly this error, while the same page
+prepared the same file as a document, and an image, in milliseconds. It has not been seen in OpenWA,
+which runs a single headless page in front.
+
+**Diagnosis:**
+
+1. Read the warning logged right after the failure, `WhatsApp Web timed out loading a video.` with
+   `action: video_load_timeout`:
+   - `pageVisibility` is the page's `document.visibilityState`; `hidden` matches the reproduced trigger.
+   - `h264Aac` is the browser's answer to `canPlayType('video/mp4; codecs="avc1.42E01E, mp4a.40.2"')`.
+     The published images answer `probably`; an empty answer means the browser does not claim to play
+     H.264/AAC MP4.
+   - `browser` is the version of the browser the session runs.
+2. Read the `Send failed in the engine (video)` warning, or for a status post
+   `WhatsApp Web threw during postMediaStatus`. Its `cause` holds what the page threw, including the
+   WhatsApp Web stack, which names the code that timed out.
+3. Compare the `build` in the error with the startup lines `Pinning WhatsApp Web version ...` and
+   `WhatsApp Web build ... is running on this session's page`.
+4. Send the same file with `send-document`. If that succeeds while `send-video` times out, the file and
+   the upload are fine and the video load in the page is what stalls.
+
+Include all four in a bug report.
+
 ### Issue: Webhook Not Receiving Messages
 
 **Symptoms:**
@@ -966,6 +1030,14 @@ retries nothing. The delivery timings are process-wide environment variables:
 WEBHOOK_TIMEOUT=10000      # per-attempt HTTP timeout in ms (default 10000)
 WEBHOOK_RETRY_DELAY=5000   # base retry backoff in ms (default 5000)
 ```
+
+### Issue: A first outbound message appears under an unnamed id
+
+**Symptoms:** A first 1:1 message sent to an unsaved contact by phone number can appear under an unnamed id on the linked account's own phone, even after a successful number check.
+
+**Cause:** Both engines prefer the contact's `@lid` when it is known or returned by a lookup. This includes cold contacts: Baileys can query WhatsApp through `getLIDForPN`, and whatsapp-web.js resolves the send destination through `getNumberId`. The phone id returned by a number check does not override that send-time resolution. WhatsApp can reject phone-addressed sends to LID-migrated contacts with ack `463` (missing privacy token), so preferring the LID avoids that refusal. If the lookup resolves no LID, the engine retains its phone-addressed fallback.
+
+The unnamed chat display alone does not establish whether the message was delivered. Check `message.ack` for acknowledgement state. See [engine addressing caveats](./29-engine-capability-matrix.md#297-caveats-on-supported-rows).
 
 ### Issue: An inbound sender arrives as an `@lid` id instead of a phone number
 
@@ -1259,12 +1331,14 @@ docker exec openwa-api curl http://host.docker.internal:8080
 >
 > A media burst adds roughly `INBOUND_MEDIA_CONCURRENCY` x `MEDIA_DOWNLOAD_MAX_BYTES` per session on top of that (4 x 50 MiB by default; about a third more on whatsapp-web.js, which holds each payload as base64). On whatsapp-web.js Chromium also holds each file being downloaded, encrypted and decrypted, and a download starts whenever the size the sender declares is within `MEDIA_DOWNLOAD_MAX_BYTES`, so a sender that understates it can make one download exceed that cap. Set `INBOUND_MEDIA_GLOBAL_CONCURRENCY` to cap concurrent inbound media downloads across all sessions. On whatsapp-web.js a download that times out keeps its slot until Puppeteer fails the call (`PUPPETEER_PROTOCOL_TIMEOUT_MS`, 180 s by default), since it cannot be aborted.
 >
-> On PostgreSQL media messages can also wait in memory after the download: received media, and the echo of media this account sends, which is downloaded the same way (every media send on whatsapp-web.js; on Baileys, media sent from a linked phone). Each payload is held as base64, about 4/3 of the file size (roughly 67 MiB for a 50 MiB file), until its message row is stored. A session downloads media only into one of `INBOUND_MEDIA_CONCURRENCY` slots, and a slot stays taken until the row is stored and the engine has let go of the payload, so one session holds at most `INBOUND_MEDIA_CONCURRENCY` x 4 x ceil(`MEDIA_DOWNLOAD_MAX_BYTES` / 3) bytes of payload: 279,620,272 bytes (about 267 MiB) at the defaults, 69,905,068 with `INBOUND_MEDIA_CONCURRENCY=1`. That holds however slow the inserts are, including one that never finishes, and across a reconnect of the session; size a process for sessions x that bound. It does not count a Baileys download in progress (the decoded file, up to `MEDIA_DOWNLOAD_MAX_BYTES`, while it is encoded), the copies the PostgreSQL driver makes while it writes a row, or anything that keeps a message after its row is stored (webhook deliveries, archiving, plugins). Each payload takes a whole slot whatever its size, and a chat's messages are stored in arrival order, so a text waits for media that arrived before it in its chat while other chats keep flowing. When no slot is freed for 2 x `MEDIA_DOWNLOAD_TIMEOUT_MS` (60 s by default), media still waiting for one arrives with the omitted marker, so a stalled database costs media rather than memory. A chat message the sender deletes for everyone before its row is stored is stored cleared on both engines, and media it had not downloaded yet is not downloaded. A delete, edit or reaction from another chat, an edit from someone other than the sender, and a delete from the other side of a one-to-one chat are ignored, as they are for a stored message (a reaction to a message the account sent to a broadcast list or posted as a status is excepted, since its recipients react from their own chats); a delete inside a group is checked for its chat only, since an admin may delete anyone's message. On SQLite this now also holds while the message is still being downloaded, where Baileys used to pass such a change on. On Baileys, a status post deleted meanwhile, or a message a history sync reports deleted, is dropped instead, as before. On whatsapp-web.js a held message also looks up its sender's contact and its quoted message before it is emitted, and its chat's later messages wait for it: each lookup waits at most `MEDIA_DOWNLOAD_TIMEOUT_MS`, and the message goes out without what did not arrive. On a local PostgreSQL 16 where a 50 MiB row took about 0.4 s to insert, 24 files of 50 MiB arriving at 8 per second held at most 4 payloads (267 MiB; without the slots 17 waited, 1.1 GiB), and a table lock that stalled every insert for 30 s held 4 for the whole stall (without the slots all 24, 1.6 GiB) and shed none, since the 60 s wait had not run out. On SQLite rows are written as messages arrive and none wait, except behind a slow `message:received` or `message:sent` plugin hook, or with `RESOLVE_LID_TO_PHONE=true` a slow phone lookup for a privacy-id sender: there those hold payloads for as long as they run, with no limit on how many, and the chat's later messages wait behind them. On PostgreSQL they run inside the slots: a slot is held until its message's commit settles, which covers the hook chain, the phone lookup, the insert and, on whatsapp-web.js, a timed-out page download (until `PUPPETEER_PROTOCOL_TIMEOUT_MS` fails it). A plugin loaded from the plugins directory delays a slot by at most 5 s per hook (`SANDBOX_HOOK_TIMEOUT_MS`), but a hook registered in-process has no time limit: one that never settles keeps its chat's later messages from being stored, and holds every slot they or its own message took, until the process restarts, since a reconnect does not free them. Once `INBOUND_MEDIA_CONCURRENCY` slots are stuck that way, every media message of the session arrives with the omitted marker. The [high memory runbook](./11-operational-runbooks.md#runbook-high-memory-usage) shows how to find the holder.
+> On PostgreSQL media messages can also wait in memory after the download: received media, and the echo of media this account sends, which is downloaded the same way (every media send on whatsapp-web.js; on Baileys, media sent from a linked phone). Each payload is held as base64, about 4/3 of the file size (roughly 67 MiB for a 50 MiB file), until its message row is stored. A session downloads media only into one of `INBOUND_MEDIA_CONCURRENCY` slots, and a slot stays taken until the row is stored and the engine has let go of the payload, so one session holds at most `INBOUND_MEDIA_CONCURRENCY` x 4 x ceil(`MEDIA_DOWNLOAD_MAX_BYTES` / 3) bytes of payload: 279,620,272 bytes (about 267 MiB) at the defaults, 69,905,068 with `INBOUND_MEDIA_CONCURRENCY=1`. That holds however slow the inserts are, including one that never finishes, and across a reconnect of the session; size a process for sessions x that bound. It does not count a Baileys download in progress (the decoded file, up to `MEDIA_DOWNLOAD_MAX_BYTES`, while it is encoded), the copies the PostgreSQL driver makes while it writes a row, or anything that keeps a message after its row is stored (webhook deliveries, archiving, plugins). Each payload takes a whole slot whatever its size, and a chat's messages are stored in arrival order, so a text waits for media that arrived before it in its chat while other chats keep flowing. When no slot is freed for 2 x `MEDIA_DOWNLOAD_TIMEOUT_MS` (60 s by default), media still waiting for one arrives with the omitted marker, so a stalled database costs media rather than memory. A chat message the sender deletes for everyone before its row is stored is stored cleared on both engines, and media it had not downloaded yet is not downloaded. A delete, edit or reaction from another chat, an edit from someone other than the sender, and a delete from the other side of a one-to-one chat are ignored, as they are for a stored message (a reaction to a message the account sent to a broadcast list or posted as a status is excepted, since its recipients react from their own chats); a delete inside a group counts for someone else's message only from a group admin (on Baileys, as the group roster shows it: a roster that cannot be read in time lets the delete through; a message still being stored is judged by the cached roster alone, so a delete of it is let through when none is cached; a lid with no number beside it that no reported pairing ties to a number cannot be compared with a phone number, whichever of the sender and the author it names, and such a delete is let through, while two lids are always compared as they are; a number other than the one a message was stored under, whether a reported pairing names it or it is sent beside the lid, as for an author whose number has changed, makes that author's own delete read as another member's; and a delete synced from history is applied as before, since today's roster does not say who was an admin when it was made). On SQLite this now also holds while the message is still being downloaded, where Baileys used to pass such a change on. On Baileys, a status post deleted meanwhile, or a message a history sync reports deleted, is dropped instead, as before. On whatsapp-web.js a held message also looks up its sender's contact and its quoted message before it is emitted, and its chat's later messages wait for it: each lookup waits at most `MEDIA_DOWNLOAD_TIMEOUT_MS`, and the message goes out without what did not arrive. On a local PostgreSQL 16 where a 50 MiB row took about 0.4 s to insert, 24 files of 50 MiB arriving at 8 per second held at most 4 payloads (267 MiB; without the slots 17 waited, 1.1 GiB), and a table lock that stalled every insert for 30 s held 4 for the whole stall (without the slots all 24, 1.6 GiB) and shed none, since the 60 s wait had not run out. On SQLite rows are written as messages arrive and none wait, except behind a slow `message:received` or `message:sent` plugin hook, or with `RESOLVE_LID_TO_PHONE=true` a slow phone lookup for a privacy-id sender: there those hold payloads for as long as they run, with no limit on how many, and the chat's later messages wait behind them. On PostgreSQL they run inside the slots: a slot is held until its message's commit settles, which covers the hook chain, the phone lookup, the insert and, on whatsapp-web.js, a timed-out page download (until `PUPPETEER_PROTOCOL_TIMEOUT_MS` fails it). A plugin loaded from the plugins directory delays a slot by at most 5 s per hook (`SANDBOX_HOOK_TIMEOUT_MS`), but a hook registered in-process has no time limit: one that never settles keeps its chat's later messages from being stored, and holds every slot they or its own message took, until the process restarts, since a reconnect does not free them. Once `INBOUND_MEDIA_CONCURRENCY` slots are stuck that way, every media message of the session arrives with the omitted marker. The [high memory runbook](./11-operational-runbooks.md#runbook-high-memory-usage) shows how to find the holder.
 >
 > - `MEDIA_DOWNLOAD_MAX_BYTES` caps each waiting payload (larger media arrive as the omitted marker), and with it the bound. It also caps outbound media sends.
 > - `MEDIA_DOWNLOAD_ENABLED=false` holds no payload at all; every media message arrives as the omitted marker.
 > - Lowering `INBOUND_MEDIA_CONCURRENCY` lowers the bound on PostgreSQL, at the cost of fewer media downloaded and stored at once. On SQLite it only limits downloads in progress.
 > - Archiving (`CHAT_MEDIA_ARCHIVE_ENABLED=true`) adds to it on either database, in both `MESSAGE_INLINE_MEDIA` modes. Each message is archived after its row is written, with no limit on how many archive at once, and each one holds its base64 payload and the decoded bytes until the upload finishes. `MESSAGE_INLINE_MEDIA=archive` also holds the read-back file, the re-read metadata and its snapshot, and saves no memory, since the row is still written with the inline copy first. Only media up to `CHAT_MEDIA_ARCHIVE_MAX_BYTES` (25 MiB by default) are archived; larger media add nothing, so lowering it bounds the cost per message, not how many archive at once. How many overlap grows with storage latency (such as S3) and with how fast downloads complete. On SQLite, 40 files of 20 MiB at 10 per second peaked at about 0.55 GiB RSS without archiving, and at 1.4 GiB with archiving in the default inline mode when each upload took 2 s (17 at once). In a burst of 24 files of 50 MiB at 8 per second, with `CHAT_MEDIA_ARCHIVE_MAX_BYTES` raised so the 50 MiB files were archived to local disk storage, peak RSS on SQLite rose from about 1 GiB to 2.1 to 3 GiB in inline mode and to 4.2 to 5.1 GiB in archive mode (up to 20 archives at once).
+>
+> A media message sent by `url` is downloaded by the gateway before WhatsApp is asked to send it. Each download is capped by `MEDIA_DOWNLOAD_MAX_BYTES` and `MEDIA_DOWNLOAD_TIMEOUT_MS`, holds up to twice its size while the body is joined, and the bytes stay in memory until the send finishes (about a third more on whatsapp-web.js, which hands the file to the page as base64). Nothing limits how many such sends run at once, and the in-flight request body budget does not count them, since the request carries only the URL. What bounds the rate at which they start is the request rate limit (`RATE_LIMIT_*`, per client address), so where several clients hold `OPERATOR` keys, size the process for the URL sends they can have open at once, or lower `MEDIA_DOWNLOAD_MAX_BYTES`.
 >
 > With the queue off (`QUEUE_ENABLED=false`), every webhook delivery that is running, parked or waiting out a retry backoff also holds its event's payload, including inline media up to `WEBHOOK_MEDIA_INLINE_MAX_BYTES` (1 MiB by default) as base64. Up to `WEBHOOK_DISPATCH_CONCURRENCY` + `WEBHOOK_DISPATCH_MAX_QUEUED` deliveries (1016 by default) wait this way, so receivers that stop answering during a media burst can hold about 1.3 GiB per process at the defaults. Lower either dispatch setting or `WEBHOOK_MEDIA_INLINE_MAX_BYTES`, or enable the queue, which keeps those payloads in Redis instead.
 
@@ -1537,7 +1611,8 @@ A media message also carries `media: { mimetype, filename?, data?, omitted?, siz
 
 ### Error Body Shape
 
-There are no machine-readable WhatsApp error codes. Errors use the NestJS default shape, so match on
+There are no machine-readable WhatsApp error codes. Errors use the NestJS default shape (the readiness probe,
+the plugin ingress and the `/mcp` endpoint answer in their own, described with the route in docs/06), so match on
 `statusCode` (above) and read `message` for the human-readable cause. A few refusals also carry a stable
 `code` (see the error response section of docs/06):
 

@@ -274,8 +274,10 @@ export class CreateExampleDto {
 
 `@Global()` makes a module's exported providers injectable everywhere without an import, which is
 convenient exactly until two modules both assume they own a name and the injector silently picks
-one. The sanctioned set is therefore frozen at these ten — every one of them a cross-cutting
-concern that nearly every module would otherwise have to import:
+one. The sanctioned set is therefore frozen at these eleven — ten of them cross-cutting
+concerns that nearly every module would otherwise have to import, and `SearchModule`, which is global
+only so that the tool registry can take `SearchService` as an optional dependency without importing a
+module that `SEARCH_ENABLED=false` leaves out:
 
 | Module             | Path                                         | Why it is global                                      |
 | ------------------ | -------------------------------------------- | ----------------------------------------------------- |
@@ -289,8 +291,9 @@ concern that nearly every module would otherwise have to import:
 | `StorageModule`    | `src/common/storage/storage.module.ts`       | File/media storage used across modules                |
 | `LoggerModule`     | `src/common/services/logger.module.ts`       | The logger is needed literally everywhere             |
 | `AgentToolsModule` | `src/core/agent-tools/agent-tools.module.ts` | The tool registry is shared by MCP and the REST layer |
+| `SearchModule`     | `src/modules/search/search.module.ts`        | Optional `SearchService` for the MessageSearch tool   |
 
-Do not add an eleventh. A new global needs an ADR-level justification — written down and reviewed
+Do not add a twelfth. A new global needs an ADR-level justification — written down and reviewed
 with the same weight as an architecture decision record — because the cost (implicit coupling,
 order-dependent provider resolution, tests that pass only because the whole app booted) is paid by
 every future module, not by the one that opts out of an explicit `imports` entry. The default for a
@@ -536,7 +539,11 @@ export class SessionController {
 
 There is **no custom exception base class and no global exception filter**. Handlers throw NestJS's
 built-in HTTP exceptions and NestJS's own `BaseExceptionFilter` renders them, so responses carry the
-framework default shape `{ statusCode, message, error }`.
+framework default shape `{ statusCode, message, error? }`. The `error` field is optional: DTO validation
+with detail disabled (the production default) returns `{ statusCode: 400, message: "Bad Request" }`
+without it. The `ErrorResponse` schema in `openapi.json` lists the other bodies that omit it. A handler
+that throws a built-in exception with an object body sends that object unchanged: the readiness probe's
+`503` is `{ status, details }`, with no `statusCode` or `message`.
 
 ```typescript
 throw new BadRequestException('Session is not started');
@@ -572,9 +579,12 @@ Add a new one only when the condition is engine-agnostic and recurs; a one-off s
 
 ### Prerequisites
 
+The shipped `better-sqlite3` Linux x64/arm64 glibc prebuild requires glibc 2.34+. Use a newer host (Ubuntu 22.04+, Debian 12+, RHEL 9+) or the published Docker image on an older host. `npm rebuild better-sqlite3 --build-from-source` does not help while the prebuild exists: the build skips it and the loader prefers that prebuild. See [startup troubleshooting](./12-troubleshooting-faq.md#issue-source-install-fails-with-a-glibc_2xx-not-found-error).
+
 ```bash
 # Required
 - Node.js 22.19 or newer (22 LTS)
+- glibc 2.34+ for Linux glibc source installs on x64/arm64 (including PostgreSQL deployments)
 - npm 10+
 - Docker & Docker Compose
 - Git
