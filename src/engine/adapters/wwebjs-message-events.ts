@@ -9,7 +9,14 @@ import {
   type PollVoteEvent,
 } from '../interfaces/whatsapp-engine.interface';
 import { readWid, type SerializedWid } from '../types/whatsapp-web-js.types';
-import { buildEditedMessage, buildIncomingMessageBase, mapContactFields } from './message-mapper';
+import {
+  boundPollOptions,
+  boundPollText,
+  buildEditedMessage,
+  buildIncomingMessageBase,
+  mapContactFields,
+  mapWwebjsMessageType,
+} from './message-mapper';
 import { extractWwebjsCall, plannedInboundDownload, wwebjsAckToDeliveryStatus } from './wwebjs-messaging';
 import { admitInboundSafely, inboundMediaTimeoutMs, withInboundDownloadTimeout } from './inbound-media-cap';
 import { type WwebjsEngineHost } from './wwebjs-host';
@@ -54,9 +61,10 @@ const NOT_KEPT: Processing = { handOver: () => true, end: () => undefined };
 
 /**
  * The bubbles WhatsApp Web draws in a chat by itself: a changed security code, the encryption notice, a business or
- * broadcast notice. When it adds one as a new message, whatsapp-web.js hands it over like any other, though nobody
- * sent it, so mapped it would reach the session as an `unknown` message no one wrote. `gp2` group notices never get
- * here (the library turns them into group events), and a `call_log` is a message the history lists, so it stays.
+ * broadcast notice, a `gp2` group notice. Nobody sent one, so mapped it would reach the session as an `unknown`
+ * message no one wrote, whether it arrives live or is read from the chat's history, the status feed or a chat
+ * preview. The library turns a live `gp2` notice into a group event; the history still lists it. A `call_log` is a
+ * message the history lists, so it stays.
  */
 const NOTICE_TYPES: ReadonlySet<string> = new Set<string>([
   MessageTypes.E2E_NOTIFICATION,
@@ -66,7 +74,70 @@ const NOTICE_TYPES: ReadonlySet<string> = new Set<string>([
   MessageTypes.GROUP_NOTIFICATION,
   MessageTypes.PROTOCOL,
   MessageTypes.DEBUG,
+  MessageTypes.GP2,
+  // The header of an album. Its photos and videos are entries of their own, so the header carries nothing,
+  // and mapped it reached the session as an empty `unknown` message. The Baileys adapter leaves it out too.
+  MessageTypes.ALBUM,
 ]);
+
+const LISTED_MESSAGE_TYPES: ReadonlySet<string> = new Set<string>(Object.values(MessageTypes));
+
+export interface WwebjsDropLogger {
+  debug: (message: string, meta?: Record<string, unknown>) => void;
+}
+
+/** What the two checks below read. A chat's `lastMessage` carries less than a Message, so each field is optional. */
+export interface WwebjsEntryProbe {
+  id?: SerializedWid | string;
+  type: string;
+  body?: string;
+  hasMedia?: boolean;
+}
+
+/**
+ * Whether an entry is a bubble WhatsApp Web drew by itself rather than something a participant sent. One check for
+ * the live events, the chat history, the status seed and the chat previews, so they cannot disagree.
+ */
+export function isNotice(msg: WwebjsEntryProbe, logger?: WwebjsDropLogger): boolean {
+  if (!NOTICE_TYPES.has(msg.type)) return false;
+  logger?.debug('Dropping a system notice WhatsApp Web drew in a chat', {
+    action: 'wwebjs_drop_notice',
+    msgId: readWid(msg.id),
+    type: msg.type,
+  });
+  return true;
+}
+
+/**
+ * Whether an entry is of a kind whatsapp-web.js does not list (`MessageTypes`) and carries neither text nor media:
+ * something WhatsApp Web added to the chat that is not a message anyone can read, which mapped would be an `unknown`
+ * message with an empty body. The raw type is logged so the kind can be named later. A listed type (`interactive`,
+ * `hsm`, `unknown`, `revoked`, ...) stays whatever it carries, and so does an unlisted one with a body or media; the
+ * raw type of a listed one that stays with nothing in it and maps to `unknown` is logged as well.
+ */
+export function isUnlistedContentless(msg: WwebjsEntryProbe, logger?: WwebjsDropLogger): boolean {
+  if (Boolean(msg.body) || Boolean(msg.hasMedia)) {
+    return false;
+  }
+  if (LISTED_MESSAGE_TYPES.has(msg.type)) {
+    // Kept: the library lists the kind, so a participant sent it. One the gateway maps to nothing reaches
+    // the session as an empty `unknown` message, and the raw type is the only way to tell which kind it was.
+    if (mapWwebjsMessageType(msg.type) === 'unknown') {
+      logger?.debug('Keeping a contentless entry of a kind the gateway does not map', {
+        action: 'wwebjs_keep_unmapped',
+        msgId: readWid(msg.id),
+        type: msg.type,
+      });
+    }
+    return false;
+  }
+  logger?.debug('Dropping a contentless entry of a type whatsapp-web.js does not list', {
+    action: 'wwebjs_drop_contentless',
+    msgId: readWid(msg.id),
+    type: msg.type,
+  });
+  return true;
+}
 
 /**
  * Message-domain client events (message, message_create, ack, revoke, reaction, edit, vote) extracted
@@ -76,18 +147,6 @@ const NOTICE_TYPES: ReadonlySet<string> = new Set<string>([
  * latches this file never touches.
  */
 export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHost): void {
-  // Checked before anything is built for the message, so a notice is admitted nowhere: no ticket, no room held in the
-  // chat's order and no page lookup.
-  const isNotice = (msg: Message): boolean => {
-    if (!NOTICE_TYPES.has(msg.type)) return false;
-    host.logger.debug('Dropping a system notice WhatsApp Web drew in a chat', {
-      action: 'wwebjs_drop_notice',
-      msgId: readWid(msg.id),
-      type: msg.type,
-    });
-    return true;
-  };
-
   // Where the session holds a message until its row is written (PostgreSQL), each arrival is admitted
   // synchronously, before anything awaits, so its chat's order and its room follow arrival. The
   // ticket keeps the room until the processing settles, and is dropped when nothing was emitted.
@@ -238,8 +297,10 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
     if (decryptedLater.size > MAX_MESSAGES_IN_PROCESSING) decryptedLater.delete(decryptedLater.keys().next().value!);
   });
 
+  // Checked before anything is built for the message, so a notice or unlisted contentless entry is
+  // admitted nowhere: no ticket, no room held in the chat's order and no page lookup.
   client.on('message', msg => {
-    if (isNotice(msg)) return;
+    if (isNotice(msg, host.logger) || isUnlistedContentless(msg, host.logger)) return;
     let base: IncomingMessage;
     try {
       base = buildIncomingMessageBase(msg);
@@ -263,8 +324,8 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
     if (!msg.fromMe) {
       return;
     }
-    // After the gate, so a notice that is not the account's own is dropped, and logged, once: by `message`.
-    if (isNotice(msg)) return;
+    // After the gate, so an entry that is not the account's own is dropped, and logged, once: by `message`.
+    if (isNotice(msg, host.logger) || isUnlistedContentless(msg, host.logger)) return;
 
     let ticket: InboundTicket | undefined;
     let processing = NOT_KEPT;
@@ -337,7 +398,7 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
     // renamed the field (#747) can leave it unreadable, and dropping there strands real acks at SENT.
     if (msg.fromMe === false) return;
     // The account's own notice was never handed over as a sent message, so its ack would point at nothing.
-    if (isNotice(msg)) return;
+    if (isNotice(msg, host.logger)) return;
     // Map the whatsapp-web.js MessageAck integer to the neutral DeliveryStatus here, at the
     // adapter boundary, so no downstream consumer ever sees engine-specific ack codes. The chat is
     // derived as Message._getChatId derives it (the same direction flag the revoked handler uses),
@@ -425,10 +486,10 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
       // Without the creation message whatsapp-web.js keeps only the local option ids, which no route
       // of this API takes, so an option it could not name is left out. A selection with no nameable
       // option is no report of what was chosen, and `[]` means a cleared vote, so it is skipped.
-      const selectedOptions = (vote.selectedOptions ?? [])
+      const rawSelected = (vote.selectedOptions ?? [])
         .map(option => option.name)
         .filter((name): name is string => typeof name === 'string');
-      if ((vote.selectedOptions?.length ?? 0) > 0 && selectedOptions.length === 0) {
+      if ((vote.selectedOptions?.length ?? 0) > 0 && rawSelected.length === 0) {
         host.logger.debug('Ignoring a poll vote whose options WhatsApp Web cannot name', {
           pollMessageId: readWid(pollId) ?? readWid(raw.parentMsgKey),
         });
@@ -441,8 +502,8 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
         // Direction flag, as Message._getChatId (see message_revoke_everyone).
         chatId: (poll?.from ? (poll.fromMe ? poll.to : poll.from) : readWid(raw.parentMsgKey?.remote)) ?? '',
         voterId: readWid(raw.voter) ?? '',
-        selectedOptions,
-        ...(poll?.pollName ? { pollName: poll.pollName } : {}),
+        selectedOptions: boundPollOptions(rawSelected),
+        ...(poll?.pollName ? { pollName: boundPollText(poll.pollName) } : {}),
         timestamp: Math.floor(interactedAtMs / 1000),
         timestampMs: interactedAtMs,
       };

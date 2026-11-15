@@ -587,6 +587,8 @@
       "reachout_timelock": "Neue Chats blockiert",
       "tos_block": "Von WhatsApp gesperrt",
       "proxy_block": "Verbindung gesperrt",
+      "passkey_required": "Passkey erforderlich",
+      "passkey_required_note": "WhatsApp hat einen Passkey verlangt, um dieses Gerät zu verknüpfen. OpenWA kann diese Anfrage nicht beantworten, daher schließt ein neuer Versuch mit einem neuen Code die Verknüpfung nicht ab.",
       "until": "bis {{date}}"
     }
   },
@@ -688,7 +690,7 @@
       "session.restriction": "Wenn WhatsApp das Konto einschränkt oder eine Einschränkung aufhebt",
       "presence.update": "Wenn ein abonnierter Chat online geht, tippt oder offline geht",
       "event.response": "Wenn ein Gast auf eine WhatsApp-Veranstaltung antwortet (Zusage, Absage, Vielleicht)",
-      "poll.vote": "Wenn jemand bei einer Umfrage Optionen auswählt oder abwählt (whatsapp-web.js)",
+      "poll.vote": "Wenn jemand bei einer Umfrage Optionen auswählt oder abwählt",
       "group.join": "Wenn Teilnehmer einer Gruppe beitreten oder hinzugefügt werden",
       "group.leave": "Wenn Teilnehmer eine Gruppe verlassen oder entfernt werden",
       "group.update": "Wenn sich Name, Beschreibung oder Einstellungen einer Gruppe ändern",

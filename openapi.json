@@ -988,7 +988,7 @@
         ]
       },
       "patch": {
-        "description": "Merges the supplied keys into the session config; omitted keys are left unchanged and an explicit null clears a key back to its default. No restart is required or performed. `autoRejectCalls` is re-read on every incoming call, so it applies immediately; the two reconnect settings are read once per start and therefore apply on the next start.",
+        "description": "Merges the supplied keys into the session config; omitted keys are left unchanged and an explicit null clears a key back to its default. No restart is required or performed. `autoRejectCalls` is re-read on every incoming call and `linkPreview` on every `send-text` or `send-template`, so both apply immediately; the two reconnect settings are read once per start and therefore apply on the next start.",
         "operationId": "SessionController_updateConfig",
         "parameters": [
           {
@@ -18594,7 +18594,7 @@
   "info": {
     "title": "OpenWA API",
     "description": "Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API\n\n**Gateway-wide responses.** Three statuses are returned by middleware before routing, so any operation can emit them:\n\n- `415 Unsupported Media Type` — the request body carries a `Content-Encoding` other than `identity`. The aggregate in-flight body cap counts wire bytes, so a compressed body would be admitted on its compressed size and then inflated past the memory it is meant to bound. Send the body uncompressed.\n- `413 Payload Too Large`: the declared `Content-Length` is more than the gateway could hold in flight for this caller even when idle. The body is not read; retrying it unchanged cannot succeed.\n- `503 Service Unavailable` with `Retry-After` — the gateway already has too much request body data in flight (the body is not read; retry after the given delay), or, without `Retry-After`, shutdown teardown has begun: every route except `/api/health` and `/api/health/*` then answers it with `Connection: close`.\n\nEvery operation that takes an API key can also answer `429 Too Many Requests` (the per-IP rate-limit windows; with send pacing on, a send can also be refused with `code: SEND_PACING_LIMITED` and `retryAfterSeconds`) and `500 Internal Server Error` (an unexpected failure, or `code: ENGINE_PAGE_ERROR` when WhatsApp Web threw inside the page during a whatsapp-web.js send or status post). Error bodies follow the `ErrorResponse` schema.",
-    "version": "0.29.1",
+    "version": "0.30.2",
     "contact": {
       "name": "OpenWA",
       "url": "https://github.com/rmyndharis/OpenWA",
@@ -19134,7 +19134,7 @@
           },
           "config": {
             "type": "object",
-            "description": "Session configuration. Only three keys are read: autoRejectCalls (boolean, default false, Baileys engine only) rejects incoming calls as soon as they ring, and the call.received event is still emitted first; maxReconnectAttempts (0-20, default unlimited) caps consecutive reconnects (the count restarts once the session has stayed READY for 5 minutes) and reconnectBaseDelay (1000-300000 ms, default 5000) sets the backoff base, both for the gateway's own reconnect only (on Baileys the engine retries a transient drop itself, with a fixed backoff and no cap). Anything else is stored but ignored, up to 16384 bytes for the whole object serialised as JSON (a larger one is refused with 400). All three can be changed later with PATCH /api/sessions/{sessionId}/config without a restart: autoRejectCalls applies from the next incoming call, the two reconnect settings from the next session start.",
+            "description": "Session configuration. Only four keys are read: autoRejectCalls (boolean, default false, Baileys engine only) rejects incoming calls as soon as they ring, and the call.received event is still emitted first; maxReconnectAttempts (0-20, default unlimited) caps consecutive reconnects (the count restarts once the session has stayed READY for 5 minutes); reconnectBaseDelay (1000-300000 ms, default 5000) sets the backoff base, both for the gateway's own reconnect only (on Baileys the engine retries a transient drop itself, with a fixed backoff and no cap); and linkPreview (boolean, default unset) is the link preview of a send-text or send-template that sets neither linkPreview nor customLinkPreview. Anything else is stored but ignored, up to 16384 bytes for the whole object serialised as JSON (a larger one is refused with 400). All four can be changed later with PATCH /api/sessions/{sessionId}/config without a restart: autoRejectCalls applies from the next incoming call, linkPreview from the next send, the two reconnect settings from the next session start.",
             "example": {
               "autoRejectCalls": false,
               "maxReconnectAttempts": 5,
@@ -19170,9 +19170,10 @@
             "enum": [
               "reachout_timelock",
               "tos_block",
-              "proxy_block"
+              "proxy_block",
+              "passkey_required"
             ],
-            "description": "What WhatsApp is restricting. `reachout_timelock` leaves the session connected and existing chats working, blocking only the start of new conversations. `tos_block` and `proxy_block` are connection-level refusals — the session cannot stay linked while one is in force, so seeing either alongside a `ready` status is not possible.",
+            "description": "What WhatsApp is restricting. `reachout_timelock` leaves the session connected and existing chats working, blocking only the start of new conversations. `tos_block` and `proxy_block` are connection-level refusals — the session cannot stay linked while one is in force, so seeing either alongside a `ready` status is not possible. `passkey_required` means WhatsApp asked for a passkey to finish linking a device, which the Baileys engine cannot answer; the session stays at its QR and the kind is dropped once a link completes.",
             "example": "reachout_timelock"
           },
           "code": {
@@ -19299,12 +19300,19 @@
             "type": "number",
             "description": "Base reconnect backoff in milliseconds, on the same engine scope as `maxReconnectAttempts`",
             "example": 5000
+          },
+          "linkPreview": {
+            "type": "boolean",
+            "description": "Link preview default of a `send-text` or `send-template` that sets none; `null` means the engine's own default (a preview on whatsapp-web.js, none on Baileys)",
+            "example": false,
+            "nullable": true
           }
         },
         "required": [
           "autoRejectCalls",
           "maxReconnectAttempts",
-          "reconnectBaseDelay"
+          "reconnectBaseDelay",
+          "linkPreview"
         ]
       },
       "UpdateSessionConfigDto": {
@@ -19330,6 +19338,12 @@
             "minimum": 1000,
             "maximum": 300000,
             "example": 5000,
+            "nullable": true
+          },
+          "linkPreview": {
+            "type": "boolean",
+            "description": "Link preview for a send-text or send-template that sets neither `linkPreview` nor `customLinkPreview`; a value in the request always wins. `false` sends without a preview on both engines. `true` asks for one: on whatsapp-web.js that is already the default, on Baileys it makes the gateway fetch the page before every such send. Send `null` to go back to the engine's default. Takes effect from the next send, and the session is not restarted.",
+            "example": false,
             "nullable": true
           }
         }

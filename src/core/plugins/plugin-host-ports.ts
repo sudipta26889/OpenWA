@@ -1,4 +1,4 @@
-import type { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
+import type { IncomingMessage, IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
 // Type-only, on purpose: they keep the port signatures aligned with the real services without
 // creating any runtime module edge from core back into a feature module.
 import type { MessageResponseDto } from '../../modules/message/dto';
@@ -34,6 +34,8 @@ export interface PluginMessagePort {
     sessionId: string,
     dto: { chatId: string; latitude: number; longitude: number; description?: string },
   ): Promise<MessageResponseDto>;
+  /** Report the deleted messages of an engine history page under the ids their stored rows have, in place. */
+  nameDeletedByStoredId(sessionId: string, chatId: string, page: IncomingMessage[]): Promise<void>;
 }
 
 /** Live-engine resolution + the deleted-session probe the capability gates rely on. */
@@ -70,6 +72,10 @@ export interface PluginConversationMappingPort {
     instanceId: string,
     providerConversationId: string,
   ): Promise<PluginConversationMappingRow | null>;
+  /** Effective handover held by this instance across all known ID aliases (lid and phone) of the row's chat. */
+  effectiveHandover(
+    row: Pick<PluginConversationMappingRow, 'sessionId' | 'chatId' | 'pluginId' | 'instanceId' | 'handoverState'>,
+  ): Promise<HandoverState>;
   upsert(key: PluginMappingKey, providerConversationId: string): Promise<void>;
   delete(id: string): Promise<void>;
   setHandover(id: string, state: HandoverState): Promise<void>;

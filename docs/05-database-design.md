@@ -414,7 +414,8 @@ clears it, and so does a gateway restart.
 {
   "maxReconnectAttempts": 5,
   "reconnectBaseDelay": 5000,
-  "autoRejectCalls": false
+  "autoRejectCalls": false,
+  "linkPreview": false
 }
 ```
 
@@ -423,6 +424,7 @@ clears it, and so does a gateway restart.
 | `maxReconnectAttempts` | unlimited | Reconnect attempt cap, clamped to 0-20 (`0` disables reconnect entirely). Bounds the gateway's own reconnect: every reconnect on whatsapp-web.js, and on Baileys only the one after a logged-out close |
 | `reconnectBaseDelay`   | `5000` ms | Base delay of the reconnect backoff, clamped to 1000-300000 ms. Same engine scope as `maxReconnectAttempts`                                                                                            |
 | `autoRejectCalls`      | `false`   | Auto-reject an incoming call as soon as it rings (Baileys only)                                                                                                                                        |
+| `linkPreview`          | unset     | Link preview of a `send-text` or `send-template` that sets neither `linkPreview` nor `customLinkPreview`. Unset keeps the engine's default: a preview on whatsapp-web.js, none on Baileys              |
 
 The gateway's reconnect attempt count restarts only once the session has stayed READY for 5 minutes,
 so a session that keeps dropping sooner than that spends a finite `maxReconnectAttempts` and ends
@@ -438,11 +440,12 @@ Anything else in `config` is stored as sent and never read, but `POST /api/sessi
 stored row above it, restored or created earlier, still loads and still takes the patch.
 
 When each takes effect differs, because each is read at a different moment: `autoRejectCalls` is
-re-read from this row on every incoming call, so a patch applies to the next call. The two reconnect
+re-read from this row on every incoming call, so a patch applies to the next call, and `linkPreview` on every
+text send that leaves the preview to the session, so a patch applies to the next send. The two reconnect
 keys are read once per `start()` into the in-memory reconnect state, so a patch applies on the next
 start and leaves a reconnect sequence already in flight alone.
 
-`GET /api/sessions/{sessionId}/config` reports the effective values. It reports only these three keys and
+`GET /api/sessions/{sessionId}/config` reports the effective values. It reports only these four keys and
 never the raw column — `config` is stripped from `SessionResponseDto` alongside the
 credential-bearing `proxyUrl`, and echoing an opaque blob back would defeat that.
 
@@ -995,7 +998,7 @@ export class AddMessagesWaMessageIdUnique1781300000000 implements MigrationInter
 
 ### Retention Policies
 
-Seven tables have an automated _time-based_ retention job, across six services: **`audit_logs`**, **`status_updates`**, **`webhook_delivery_failures`**, **`webhook_outbox_events`** (settled rows only), **`ingress_events`**, **`integration_delivery_failures`** and **`send_idempotency_keys`**. Separately, **`baileys_stored_messages`** is capped per session rather than by age: each write keeps the newest `BAILEYS_MESSAGE_STORE_LIMIT` rows (default 5000) for that session and deletes the rest. Everything else is kept indefinitely (api keys, sessions, webhooks, pending and processing batches, templates, conversation mappings, plugin instances, lid mappings, chat states, automation rules) and is removed only by user action (e.g. deleting a session) or operational backup/restore. Two more, `messages` and finished `message_batches`, have an opt-in time-based job (`MESSAGE_RETENTION_DAYS`, off by default); until it is set they are kept indefinitely too.
+Seven tables have an automated _time-based_ retention job, across six services: **`audit_logs`**, **`status_updates`**, **`webhook_delivery_failures`**, **`webhook_outbox_events`** (settled rows only), **`ingress_events`**, **`integration_delivery_failures`** and **`send_idempotency_keys`**. Separately, **`baileys_stored_messages`** is capped per session rather than by age: each write keeps the newest `BAILEYS_MESSAGE_STORE_LIMIT` rows (default 5000) for that session and deletes the rest. Everything else is kept indefinitely (api keys, sessions, webhooks, pending and processing batches, templates, conversation mappings, plugin instances, lid mappings, chat states, automation rules) and is removed only by user action (e.g. deleting a session) or operational backup/restore. An unlink of a Baileys session's account, through `POST /api/sessions/:sessionId/logout` or initiated by WhatsApp, also deletes that session's `baileys_stored_messages` and `chat_states` rows (see that route in [06 - API Specification](./06-api-specification.md)). Two more, `messages` and finished `message_batches`, have an opt-in time-based job (`MESSAGE_RETENTION_DAYS`, off by default); until it is set they are kept indefinitely too.
 
 | Data Type                     | Default Retention | Configurable                                                    |
 | ----------------------------- | ----------------- | --------------------------------------------------------------- |

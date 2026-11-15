@@ -14,7 +14,8 @@ import { Session } from './entities/session.entity';
  * account rather than about our attempt, so losing it on restart would matter — except that both
  * engines re-report it on the next connection (Baileys is asked directly on every connect, and
  * whatsapp-web.js re-blocks the very next link attempt), so the state re-seeds itself within one
- * session start. That self-healing is what makes the column unnecessary.
+ * session start. That self-healing is what makes the column unnecessary. A passkey request is the exception:
+ * it comes back only when WhatsApp asks again on the next link attempt.
  *
  * Only ACTIVE restrictions are held: a lift removes the entry rather than storing a negative, so the
  * map's size is the count of restricted sessions and `get` returning nothing means "not restricted".
@@ -93,10 +94,10 @@ export class SessionRestrictionStore {
   /**
    * Drop the restriction only if reaching READY disproves it.
    *
-   * `tos_block` and `proxy_block` are refusals of the connection itself, so a session that is now
-   * linked and ready cannot still be under one. A `reachout_timelock` is not connection-scoped — the
-   * account is fully connected while it applies — so READY says nothing about it and it survives
-   * here, waiting for the engine's explicit lift.
+   * `tos_block`, `proxy_block` and `passkey_required` all stop a link or a connection, so a session
+   * that is now linked and ready cannot still be under one. A `reachout_timelock` is not
+   * connection-scoped — the account is fully connected while it applies — so READY says nothing about
+   * it and it survives here, waiting for the engine's explicit lift.
    */
   clearIfDisprovedByReady(sessionId: string): AccountRestriction | undefined {
     const previous = this.restrictions.get(sessionId);

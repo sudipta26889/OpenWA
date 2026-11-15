@@ -35,6 +35,23 @@ describe('MessageSearch tool', () => {
     expect(search).toHaveBeenCalledWith(input, ['s1'], undefined);
   });
 
+  it('forwards the type filter and refuses one longer than a stored type token', async () => {
+    const key = { id: 'k1', allowedSessions: null, allowedChats: null };
+
+    await call(key, { q: 'invoice', match: 'word', type: 'image' });
+    expect(search).toHaveBeenCalledWith({ q: 'invoice', match: 'word', type: 'image' }, undefined, undefined);
+
+    await expect(call(key, { q: 'invoice', type: 'x'.repeat(51) })).rejects.toBeInstanceOf(BadRequestException);
+    expect(search).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a sender filter longer than a chat id', async () => {
+    const key = { id: 'k1', allowedSessions: null, allowedChats: null };
+
+    await expect(call(key, { q: 'invoice', from: '6'.repeat(256) })).rejects.toBeInstanceOf(BadRequestException);
+    expect(search).not.toHaveBeenCalled();
+  });
+
   it('requires OPERATOR: a below-role key is refused before the search runs', async () => {
     expect(tool.requiredRole).toBe(ApiKeyRole.OPERATOR);
 

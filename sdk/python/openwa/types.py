@@ -238,11 +238,13 @@ class AccountRestriction(TypedDict):
     """A restriction WhatsApp has in force on a session's account.
 
     'reachout_timelock' leaves the session connected and existing chats working -- only starting new
-    conversations is blocked -- whereas 'tos_block' and 'proxy_block' refuse the connection itself
-    and therefore cannot coexist with a 'ready' status.
+    conversations is blocked -- whereas 'tos_block', 'proxy_block' and 'passkey_required' stop a link
+    or the connection itself and therefore cannot coexist with a 'ready' status. 'passkey_required'
+    means WhatsApp asked for a passkey to finish linking a device, which the Baileys engine cannot
+    answer.
     """
 
-    kind: Literal["reachout_timelock", "tos_block", "proxy_block"]
+    kind: Literal["reachout_timelock", "tos_block", "proxy_block", "passkey_required"]
     # The engine's own token for the cause, verbatim (TOS_BLOCK, BIZ_QUALITY, ...).
     code: str
     # ISO timestamp when enforcement ends, when WhatsApp states one.
@@ -292,13 +294,15 @@ class UpdateSessionProxyRequest(TypedDict, total=False):
 class SessionConfig(TypedDict):
     """A session's effective runtime configuration.
 
-    ``None`` on ``maxReconnectAttempts`` means unlimited -- not unset. ``autoRejectCalls`` works on
+    ``None`` on ``maxReconnectAttempts`` means unlimited -- not unset; ``None`` on ``linkPreview``
+    means the engine's own default. ``autoRejectCalls`` works on
     Baileys only: whatsapp-web.js stores the flag but cannot reject a call, so calls keep ringing there.
     """
 
     autoRejectCalls: bool
     maxReconnectAttempts: int | None
     reconnectBaseDelay: int
+    linkPreview: bool | None
 
 
 class UpdateSessionConfigRequest(TypedDict, total=False):
@@ -306,12 +310,14 @@ class UpdateSessionConfigRequest(TypedDict, total=False):
 
     Send ``None`` for ``maxReconnectAttempts`` to restore unlimited retries, which no in-range number
     can express. ``autoRejectCalls`` works on Baileys only: whatsapp-web.js stores the flag but cannot
-    reject a call, so calls keep ringing there.
+    reject a call, so calls keep ringing there. ``linkPreview`` is the preview of a send-text or
+    send-template that sets neither ``linkPreview`` nor ``customLinkPreview``.
     """
 
     autoRejectCalls: bool | None
     maxReconnectAttempts: int | None
     reconnectBaseDelay: int | None
+    linkPreview: bool | None
 
 
 class CreateSessionRequest(TypedDict):

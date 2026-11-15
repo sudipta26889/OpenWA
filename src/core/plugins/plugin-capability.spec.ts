@@ -201,9 +201,17 @@ describe('PluginLoaderService capability facade — ctx.engine', () => {
   let loader: PluginLoaderService;
   let moduleRef: { get: jest.Mock };
 
-  function build(getEngineReturn: unknown): { sessionService: { getEngine: jest.Mock } } {
+  function build(getEngineReturn: unknown): {
+    sessionService: { getEngine: jest.Mock };
+    messagePort: { nameDeletedByStoredId: jest.Mock };
+  } {
     const sessionService = { getEngine: jest.fn().mockReturnValue(getEngineReturn) };
-    moduleRef = { get: jest.fn().mockReturnValue(sessionService) };
+    const messagePort = { nameDeletedByStoredId: jest.fn().mockResolvedValue(undefined) };
+    moduleRef = {
+      get: jest
+        .fn()
+        .mockImplementation((token: unknown) => (token === PLUGIN_MESSAGE_PORT ? messagePort : sessionService)),
+    };
     const configService = { get: jest.fn().mockReturnValue(undefined) } as unknown as ConfigService;
     const pluginStorage = {
       createPluginStorage: jest.fn().mockReturnValue({}),
@@ -214,7 +222,7 @@ describe('PluginLoaderService capability facade — ctx.engine', () => {
       pluginStorage,
       moduleRef as unknown as ModuleRef,
     );
-    return { sessionService };
+    return { sessionService, messagePort };
   }
 
   function contextFor(plugin: PluginInstance): PluginContext {
@@ -276,6 +284,54 @@ describe('PluginLoaderService capability facade — ctx.engine', () => {
     const ctx = contextFor(makePlugin(['*'], ['engine:read']));
     await ctx.engine.getChatHistory('sess-1', 'c@c.us', 500, true);
     expect(engine.getChatHistory).toHaveBeenCalledWith('c@c.us', 100, true); // 500 clamped to 100
+  });
+
+  it('engine.getChatHistory names a deleted message as the REST history does, by the id of its stored row', async () => {
+    const page = [{ id: 'false_628999111@c.us_AAA', type: 'revoked' }];
+    const engine = { getChatHistory: jest.fn().mockResolvedValue(page) };
+    const { messagePort } = build(engine);
+    messagePort.nameDeletedByStoredId.mockImplementation(
+      (_session: string, _chat: string, entries: { id: string }[]) => {
+        entries[0].id = 'false_148000111@lid_AAA';
+        return Promise.resolve();
+      },
+    );
+    const ctx = contextFor(makePlugin(['*'], ['engine:read']));
+
+    const out = await ctx.engine.getChatHistory('sess-1', '148000111@lid');
+
+    expect(messagePort.nameDeletedByStoredId).toHaveBeenCalledWith('sess-1', '148000111@lid', page);
+    expect(out).toBe(page);
+    expect(out.map(m => m.id)).toEqual(['false_148000111@lid_AAA']);
+  });
+
+  it('engine.getChatHistory reads history on a host that cannot name deleted messages by their stored rows', async () => {
+    const deleted = [{ id: 'false_628999111@c.us_AAA', type: 'revoked' }];
+    const plain = [{ id: 'false_628999111@c.us_BBB', type: 'text' }];
+    const engine = { getChatHistory: jest.fn() };
+    const { sessionService, messagePort } = build(engine);
+    const ctx = contextFor(makePlugin(['*'], ['engine:read']));
+
+    // A page with no deleted message does not reach for the message port at all.
+    engine.getChatHistory.mockResolvedValueOnce(plain);
+    expect(await ctx.engine.getChatHistory('sess-1', '628999111@c.us')).toBe(plain);
+    expect(moduleRef.get).not.toHaveBeenCalledWith(PLUGIN_MESSAGE_PORT, { strict: false });
+
+    // The port fails, is bound to something that has no such method, or is not provided: the page still comes back.
+    messagePort.nameDeletedByStoredId.mockRejectedValueOnce(new Error('database is locked'));
+    engine.getChatHistory.mockResolvedValueOnce(deleted);
+    expect(await ctx.engine.getChatHistory('sess-1', '628999111@c.us')).toBe(deleted);
+
+    moduleRef.get.mockImplementation((token: unknown) => (token === PLUGIN_MESSAGE_PORT ? {} : sessionService));
+    engine.getChatHistory.mockResolvedValueOnce(deleted);
+    expect(await ctx.engine.getChatHistory('sess-1', '628999111@c.us')).toBe(deleted);
+
+    moduleRef.get.mockImplementation((token: unknown) => {
+      if (token === PLUGIN_MESSAGE_PORT) throw new Error('Nest could not find PLUGIN_MESSAGE_PORT element');
+      return sessionService;
+    });
+    engine.getChatHistory.mockResolvedValueOnce(deleted);
+    expect(await ctx.engine.getChatHistory('sess-1', '628999111@c.us')).toBe(deleted);
   });
 
   it('engine.getChatHistory defaults the limit and clamps a non-positive value to 1', async () => {
@@ -349,11 +405,21 @@ describe('PluginLoaderService capability facade — ctx.net', () => {
 
 describe('PluginLoaderService capability facade — ctx.conversations', () => {
   let loader: PluginLoaderService;
-  let mappingService: { getByProvider: jest.Mock; get: jest.Mock; setHandover: jest.Mock };
+  let mappingService: {
+    getByProvider: jest.Mock;
+    get: jest.Mock;
+    setHandover: jest.Mock;
+    effectiveHandover: jest.Mock;
+  };
   let messageService: { sendText: jest.Mock; reply: jest.Mock };
 
   beforeEach(() => {
-    mappingService = { getByProvider: jest.fn(), get: jest.fn(), setHandover: jest.fn() };
+    mappingService = {
+      getByProvider: jest.fn(),
+      get: jest.fn(),
+      setHandover: jest.fn(),
+      effectiveHandover: jest.fn(),
+    };
     messageService = {
       sendText: jest.fn().mockResolvedValue({ messageId: 'wamid', timestamp: 1 }),
       reply: jest.fn().mockResolvedValue({ messageId: 'wamid', timestamp: 1 }),
@@ -442,6 +508,46 @@ describe('PluginLoaderService capability facade — ctx.conversations', () => {
     await ctx.conversations.send({ type: 'text', text: 'hi', sessionId: 'sess-1', chatId: '628@c.us' });
     expect(mappingService.getByProvider).not.toHaveBeenCalled();
     expect(messageService.sendText).toHaveBeenCalledWith('sess-1', { chatId: '628@c.us', text: 'hi' });
+  });
+
+  it('mappings.get resolves effective handoverState while keeping providerConversationId from requested row', async () => {
+    const ctx = contextFor(makePlugin(['*'], ['conversation:send']));
+    const key = { sessionId: 'sess-1', chatId: '111@lid', instanceId: 'inst-1' };
+
+    mappingService.get.mockResolvedValue({ ...mapping('sess-1'), chatId: '111@lid', handoverState: 'closed' });
+    mappingService.effectiveHandover.mockResolvedValueOnce('human');
+    expect(await ctx.mappings.get(key)).toEqual({ providerConversationId: 'conv-42', handoverState: 'human' });
+
+    mappingService.get.mockResolvedValue({ ...mapping('sess-1'), chatId: '111@lid', handoverState: 'bot' });
+    mappingService.effectiveHandover.mockResolvedValueOnce('closed');
+    expect(await ctx.mappings.get(key)).toEqual({ providerConversationId: 'conv-42', handoverState: 'closed' });
+
+    mappingService.effectiveHandover.mockResolvedValueOnce('bot');
+    expect(await ctx.mappings.get(key)).toEqual({ providerConversationId: 'conv-42', handoverState: 'bot' });
+  });
+
+  it('mappings.getByProvider resolves effective handoverState and keeps requested sessionId and chatId', async () => {
+    const ctx = contextFor(makePlugin(['*'], ['conversation:send'], ['sess-1']));
+    const row = { ...mapping('sess-1'), chatId: '111@lid', handoverState: 'closed' };
+    mappingService.getByProvider.mockResolvedValue(row);
+    mappingService.effectiveHandover.mockResolvedValue('human');
+
+    expect(await ctx.mappings.getByProvider('inst-1', 'conv-42')).toEqual({
+      sessionId: 'sess-1',
+      chatId: '111@lid',
+      handoverState: 'human',
+    });
+    expect(mappingService.effectiveHandover).toHaveBeenCalledWith(row);
+  });
+
+  it('mappings.getByProvider refuses a mapping of a session the plugin is not activated for', async () => {
+    const ctx = contextFor(makePlugin(['*'], ['conversation:send'], ['sess-2']));
+    mappingService.getByProvider.mockResolvedValue(mapping('sess-1'));
+
+    await expect(ctx.mappings.getByProvider('inst-1', 'conv-42')).rejects.toThrow(
+      'Plugin test-ext is not activated for session sess-1',
+    );
+    expect(mappingService.effectiveHandover).not.toHaveBeenCalled();
   });
 });
 

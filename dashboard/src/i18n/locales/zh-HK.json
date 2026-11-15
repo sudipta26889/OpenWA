@@ -587,6 +587,8 @@
       "reachout_timelock": "新對話被封鎖",
       "tos_block": "被 WhatsApp 封鎖",
       "proxy_block": "連線被封鎖",
+      "passkey_required": "需要通行密鑰",
+      "passkey_required_note": "WhatsApp 要求使用通行密鑰來完成此裝置的連結。OpenWA 無法回應該要求，因此使用新的代碼重試也無法完成連結。",
       "until": "至 {{date}}"
     }
   },
@@ -688,7 +690,7 @@
       "session.restriction": "WhatsApp 限制帳戶或解除限制時",
       "presence.update": "已訂閱的聊天上線、正在輸入或離線時",
       "event.response": "嘉賓回覆 WhatsApp 活動邀請時（參加、不參加、可能參加）",
-      "poll.vote": "有人在投票中選擇或取消選項時（whatsapp-web.js）",
+      "poll.vote": "有人在投票中選擇或取消選項時",
       "group.join": "有成員加入或被加入群組時",
       "group.leave": "有成員退出或被移出群組時",
       "group.update": "群組名稱、描述或設定變更時",

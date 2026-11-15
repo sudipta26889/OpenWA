@@ -6,8 +6,10 @@
 >
 > OpenWA can expose a curated set of its capabilities to AI agents over the
 > [Model Context Protocol](https://modelcontextprotocol.io). The server is **off by
-> default** and **purely additive**: when disabled, none of its code (or the MCP SDK)
-> is loaded and every REST route behaves exactly as before.
+> default** and **purely additive**: when disabled, the MCP module and the MCP SDK
+> are not loaded and every REST route behaves exactly as before. The protocol-neutral tool
+> registry (`AgentToolsModule`) is built either way, and nothing reads it until the server is
+> enabled.
 
 | Component                                                                 | Status         | Location                                             |
 | ------------------------------------------------------------------------- | -------------- | ---------------------------------------------------- |
@@ -20,13 +22,13 @@
 | **Per-key rate limiter**                                                  | ✅ Implemented | `src/modules/mcp/mcp-rate-limit.ts`                  |
 | **Result shaping (smart/json)**                                           | ✅ Implemented | `src/modules/mcp/tool-result.ts`                     |
 
-| Capability                        | Status         | Notes                                                                 |
-| --------------------------------- | -------------- | --------------------------------------------------------------------- |
-| **Read-only mode**                | ✅ Implemented | **Default read-only**; set `MCP_READONLY=false` to expose write tools |
-| **OAuth 2.1 (public exposure)**   | 🔜 Planned     | Static API key is used today (suitable for self-hosted/internal)      |
-| **Agent-action audit provenance** | 🔜 Planned     | Mark audited actions as agent-initiated                               |
-| **Env-tunable rate limits**       | ✅ Implemented | `MCP_RATE_LIMIT_MAX` / `MCP_RATE_LIMIT_WINDOW_MS`                     |
-| **Additional tool domains**       | 🔜 Planned     | templates / channels / catalog / status (labels/automation now ship)  |
+| Capability                        | Status         | Notes                                                                          |
+| --------------------------------- | -------------- | ------------------------------------------------------------------------------ |
+| **Read-only mode**                | ✅ Implemented | **Default read-only**; set `MCP_READONLY=false` to expose write tools          |
+| **OAuth 2.1 (public exposure)**   | 🔜 Planned     | Static API key is used today (suitable for self-hosted/internal)               |
+| **Agent-action audit provenance** | 🔜 Planned     | Mark audited actions as agent-initiated                                        |
+| **Env-tunable rate limits**       | ✅ Implemented | `MCP_RATE_LIMIT_MAX` / `MCP_RATE_LIMIT_WINDOW_MS`                              |
+| **Additional tool domains**       | 🔜 Planned     | template management / channels / catalog / status (labels/automation now ship) |
 
 ---
 
@@ -108,8 +110,13 @@ dashboard), and no MCP method runs.
 Past the gate, the MCP SDK first checks the arguments against the tool's Zod input schema. Arguments it
 refuses come back as an `isError` tool result whose text reads `MCP error -32602: Input validation
 error: ...`, without reaching authentication: a key that lacks the tool's role or session gets that
-error rather than a `403`, and no audit row is written. A call whose arguments pass flows through five
-steps, in this order:
+error rather than a `403`, and no audit row is written. That includes an argument the tool does not name
+(`Unrecognized key: "x"`, at most five names listed, each cut at 64 characters), which a tool call used to
+drop silently and is now refused, as REST refuses a body property its DTO does not declare; the published
+input schema says `additionalProperties: false`. Before the schema, the SDK counts the array items and object
+keys of the arguments, nested ones included, and refuses a call with more than 10,000 (`arguments contain
+more than the maximum of 10000 elements`); the widest input a tool takes is a list of a few hundred ids. A
+call whose arguments pass flows through five steps, in this order:
 
 1. **Key extraction.** The adapter reads the API key from the `X-API-Key` header or
    `Authorization: Bearer …`.
@@ -164,6 +171,11 @@ code is a transferable join capability, so it sits at OPERATOR like the QR endpo
 > and `MessageGetReactions` need whatsapp-web.js; on Baileys use `MessageList` for stored messages.
 > `GroupCreate` needs Baileys; whatsapp-web.js cannot create a group.
 
+`MessageList` takes the filters of `GET /sessions/{sessionId}/messages`: `chatId`, `from`, `direction`, `type`,
+`since` and `until` (message time in epoch milliseconds), `orderBy`, an exact `messageId`, and `after`, the id of
+the last message of the previous page, which keeps a walk stable while messages arrive. `MessageSearch` takes
+`type` as well as `chatId`, `from`, `direction` and a date range.
+
 **Deliberately excluded from the surface** (not exposed as tools): session lifecycle
 (create/delete/start/stop/logout/force-kill), chat delete, bulk send, message delete, message edit,
 group
@@ -178,6 +190,43 @@ The server is **read-only by default** — it mounts **only** `tier: 'read'` too
 opt in to write tools with `MCP_READONLY=false`. Any other value (or leaving it unset) keeps the safe
 read-only posture, so enabling MCP never silently exposes state-changing tools. Set `MCP_READONLY=false`
 only when an agent genuinely needs to send messages / mutate state.
+
+### Result and error sizes
+
+A result whose JSON is up to 32768 bytes (32 KiB) of UTF-8 is returned as text. A larger one is not
+placed in the text block: the text block reads `Received resource mcp://toolResult/<id>.json with <n> bytes`
+and the payload follows as an embedded base64 `resource` block. The server has no `resources`
+capability, so that URI cannot be fetched, and how a client presents the block to the model is the
+client's choice. Claude Code 2.1.321 saves it to a file on its own machine and tells the model only
+the path, so the model sees the data only if it has a file-reading tool; a client that forwards text
+alone shows it nothing. Page a tool that can return many rows (`SessionGetChats`, `GroupFindAll`,
+`MessageList`) with `limit` and `offset` to stay under the limit. `MessageList` also carries each
+message's media inline as base64, up to a per-response budget
+(`MESSAGE_LIST_INLINE_MEDIA_BUDGET_BYTES`, 8 MiB by default), which is far over the limit; pass
+`inlineMedia: false` to get the rows without it.
+
+The text of a tool error is cut at 4096 characters and ends with
+`... [truncated, <n> characters in all]`. Several services name the id the caller sent in their
+refusals, and a tool call can carry a far longer id than a REST path allows. The same cut applies to
+the server log line. The cut covers the errors a tool raises. An argument the input schema refuses is
+answered earlier, with the SDK's own text, which names the offending argument and is not cut: a
+template `vars` name sent with a value that is not a string comes back in the answer, as long as the
+caller made it. That text is not logged.
+
+### Retrying a send
+
+Each send tool (`MessageSendText`, `MessageSendImage`, `MessageSendVideo`, `MessageSendAudio`,
+`MessageSendDocument`, `MessageSendLocation`, `MessageSendContact`, `MessageSendSticker`,
+`MessageSendTemplate`, `MessageReply`, `MessageForward`) takes an optional `idempotencyKey`, 1 to 255
+visible ASCII characters, which works as the `Idempotency-Key` header does on the matching REST route. The
+first call with a key sends and keeps its result for 24 hours. A retry with the same key and the same
+arguments returns that result and sends nothing, with nothing in the answer to tell it from a first send (REST sets
+`Idempotent-Replayed: true`). The same key with other arguments is refused, and so is a
+retry while the first call still runs or after a failure that may have sent the message. Each refusal
+carries a `code` (`IDEMPOTENCY_KEY_REUSED`, `IDEMPOTENCY_KEY_IN_PROGRESS` or `IDEMPOTENCY_OUTCOME_UNKNOWN`)
+beside its message. A send refused before it reached WhatsApp frees the key. A key belongs to its session, and
+a key used over REST is not matched by a tool call: it is refused as reused. A call without a key behaves as
+before.
 
 ## 24.5 Authentication & Security
 
@@ -311,8 +360,12 @@ Guidelines:
   intended for self-hosted/internal use).
 - **Agent-action audit provenance** — record that an audited action was agent-initiated
   and by which key.
-- **Expansion-pack tool domains** — templates, channels, catalog, and status are not in the
-  default surface yet. Labels and automation-rule reads already are.
+- **Expansion-pack tool domains** — template management (create, list, update, delete),
+  channels, catalog, and status are not in the default surface yet. Sending from a template
+  (`MessageSendTemplate`), labels, and automation-rule reads already are.
+- **Multi-node.** A tool call runs on the node that received it. REST session routes are forwarded
+  to the node that owns the session; tool calls are not. See
+  [13 - Horizontal Scaling](13-horizontal-scaling.md).
 - **Stateful MCP sessions / SSE reconnect, prompts, elicitation** — out of scope; the
   transport is intentionally stateless.
 

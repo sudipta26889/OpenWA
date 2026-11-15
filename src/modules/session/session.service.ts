@@ -78,6 +78,12 @@ import type { PluginSessionPort } from '../../core/plugins/plugin-host-ports';
 /** Stagger before the single transient-launch retry; short - the claim is held while it waits. */
 const SESSION_START_RETRY_DELAY_MS = 2_000;
 
+/** `config.linkPreview` when it is a boolean; anything else left in the opaque blob means no default. */
+export function linkPreviewDefault(config: unknown): boolean | null {
+  const value = (config as Record<string, unknown> | null)?.linkPreview;
+  return typeof value === 'boolean' ? value : null;
+}
+
 /**
  * A launch failure worth one retry: infrastructure said "not now" (a 5xx, a transport death, a
  * database error while persisting status), not the session or the caller being refused. HTTP 4xx
@@ -291,7 +297,13 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // same way and must keep its lease alive.
     this.ownership?.startHeartbeat();
 
-    if (!resolveFeatureFlags(this.configService).autoStartSessions) return;
+    if (!resolveFeatureFlags(this.configService).autoStartSessions) {
+      // Off by default for multi-replica safety, and silent otherwise: a restart leaves linked sessions
+      // disconnected with no error on them, so the boot names the setting once. Detached, and not kept
+      // on autoStartRun: nothing is launching, so a shutdown has nothing to wait for.
+      void this.noteSessionsLeftDown();
+      return;
+    }
 
     // DETACHED, deliberately. Nest binds the HTTP listener only after every onApplicationBootstrap
     // hook has settled, and this loop's duration is unbounded: one engine initialization is at least
@@ -311,25 +323,54 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   }
 
   /**
+   * The rows boot auto-start launches: linked, disconnected, not stopped by an operator, and claimable
+   * by this node. Without the claim every replica scans the same rows and races to launch the same
+   * engines, which is a WhatsApp account being opened twice, not merely duplicated work. A session an
+   * operator stopped (desiredState 'stopped') stays down until an explicit start.
+   */
+  private autoStartWhere(): FindOptionsWhere<Session>[] {
+    const claimable = this.ownership?.claimableWhere() ?? [{}];
+    return claimable.map(clause => ({
+      ...clause,
+      phone: Not(IsNull()),
+      status: SessionStatus.DISCONNECTED,
+      desiredState: IsNull(),
+    }));
+  }
+
+  /**
+   * Say how many linked sessions stay disconnected because AUTO_START_SESSIONS is off, and how to start
+   * them. Called at boot, and by the takeover sweep when it corrects a session a vanished node left
+   * behind, which was not down yet when the boot counted. Never rejects: a failed count only costs the
+   * hint, and neither the hint nor that failure is worth a line once the gateway is shutting down.
+   */
+  async noteSessionsLeftDown(): Promise<void> {
+    if (this.stopping) return;
+    try {
+      const count = await this.sessionRepository.count({ where: this.autoStartWhere() });
+      if (!count || this.stopping) return;
+      this.logger.log(
+        `${count} previously authenticated session(s) left disconnected: AUTO_START_SESSIONS is off. ` +
+          'Start each with POST /api/sessions/{sessionId}/start, or set AUTO_START_SESSIONS=true on a single-instance deployment',
+        { action: 'auto_start_disabled', count },
+      );
+    } catch (error) {
+      if (this.stopping) return;
+      this.logger.warn('Could not count the sessions auto-start would have started', {
+        action: 'auto_start_disabled_scan_failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
    * Launch every previously authenticated session this node may claim, one at a time.
    *
    * Sequential with a throttle by design — these are Chromium launches — which is exactly why it
    * cannot run inside the bootstrap hook. See onApplicationBootstrap.
    */
   private async autoStartSessions(): Promise<void> {
-    // Restricted to sessions this node may claim. Without it every replica scans the same rows and
-    // races to launch the same engines, which is a WhatsApp account being opened twice, not merely
-    // duplicated work.
-    // A session an operator stopped (desiredState 'stopped') stays down until an explicit start.
-    const claimable = this.ownership?.claimableWhere() ?? [{}];
-    const sessions = await this.sessionRepository.find({
-      where: claimable.map(clause => ({
-        ...clause,
-        phone: Not(IsNull()),
-        status: SessionStatus.DISCONNECTED,
-        desiredState: IsNull(),
-      })),
-    });
+    const sessions = await this.sessionRepository.find({ where: this.autoStartWhere() });
 
     if (sessions.length === 0) return;
 
@@ -548,7 +589,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   }
 
   /**
-   * Project the opaque `config` column onto the three keys the engine actually reads, resolved
+   * Project the opaque `config` column onto the four keys the gateway actually reads, resolved
    * through the same clamp the engine uses — so a legacy row holding an out-of-range value reports
    * what will really happen rather than what someone once wrote.
    */
@@ -560,6 +601,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       autoRejectCalls: config?.autoRejectCalls === true,
       maxReconnectAttempts: Number.isFinite(maxAttempts) ? maxAttempts : null,
       reconnectBaseDelay: baseDelay,
+      linkPreview: linkPreviewDefault(config),
     };
   }
 
@@ -578,9 +620,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * the request — leaves the stored value alone.
    *
    * No restart, and deliberately no engine call: `autoRejectCalls` is re-read from this row on
-   * every incoming call, so the write alone is what takes effect. The reconnect pair is read once
-   * per start() into reconnectStates, so it lands on the next start; that asymmetry is documented
-   * on the DTO rather than papered over by forcing a reconnect nobody asked for.
+   * every incoming call and `linkPreview` on every text send, so the write alone is what takes
+   * effect. The reconnect pair is read once per start() into reconnectStates, so it lands on the
+   * next start; that asymmetry is documented on the DTO rather than papered over by forcing a
+   * reconnect nobody asked for.
    */
   async updateConfig(id: string, dto: UpdateSessionConfigDto): Promise<SessionConfigResponseDto> {
     // Compare-and-swap on the stored text: the write lands only while the column still holds the blob
@@ -599,7 +642,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       const stored = row.config;
       const config = { ...((stored ? JSON.parse(stored) : null) as Record<string, unknown> | null) };
 
-      for (const key of ['autoRejectCalls', 'maxReconnectAttempts', 'reconnectBaseDelay'] as const) {
+      for (const key of ['autoRejectCalls', 'maxReconnectAttempts', 'reconnectBaseDelay', 'linkPreview'] as const) {
         const value = dto[key];
         if (value === undefined) continue;
         if (value === null) {

@@ -25,7 +25,7 @@ if (API_ORIGIN) warnIfInsecureHttpUrl(API_ORIGIN, 'VITE_API_URL');
 // =============================================================================
 
 /**
- * The three tunable keys, as the gateway resolves them — not the raw stored column, which the API
+ * The four tunable keys, as the gateway resolves them — not the raw stored column, which the API
  * never returns. `maxReconnectAttempts` is null when reconnects are unlimited, which is the default
  * and which no number in the accepted 0-20 range can express.
  */
@@ -33,6 +33,7 @@ export interface SessionConfig {
   autoRejectCalls: boolean;
   maxReconnectAttempts: number | null;
   reconnectBaseDelay: number;
+  linkPreview: boolean | null;
 }
 
 export type SessionProxyType = 'http' | 'https' | 'socks4' | 'socks5';
@@ -112,10 +113,12 @@ export interface ChatPresence {
  *
  * `reachout_timelock` leaves the session connected and existing chats working — only starting new
  * conversations is blocked — which is why it can appear on a perfectly `ready` session. `tos_block`
- * and `proxy_block` refuse the connection itself and so cannot.
+ * and `proxy_block` refuse the connection itself and so cannot. `passkey_required` is WhatsApp asking
+ * for a passkey before it completes a link, which the Baileys engine cannot answer; the session stays
+ * at its QR, so it appears on a session that is not yet linked and never on a `ready` one.
  */
 export interface AccountRestriction {
-  kind: 'reachout_timelock' | 'tos_block' | 'proxy_block';
+  kind: 'reachout_timelock' | 'tos_block' | 'proxy_block' | 'passkey_required';
   /** The engine's own token for the cause, verbatim (`TOS_BLOCK`, `BIZ_QUALITY`, …). */
   code: string;
   /** ISO timestamp when enforcement ends, when WhatsApp states one. */

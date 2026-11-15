@@ -587,6 +587,8 @@
       "reachout_timelock": "새 대화 차단됨",
       "tos_block": "WhatsApp에 의해 차단됨",
       "proxy_block": "연결 차단됨",
+      "passkey_required": "패스키 필요",
+      "passkey_required_note": "WhatsApp이 이 기기 연결을 완료하기 위해 패스키를 요청했습니다. OpenWA는 이 요청에 응답할 수 없으므로 새 코드로 다시 시도해도 연결이 완료되지 않습니다.",
       "until": "{{date}}까지"
     }
   },
@@ -688,7 +690,7 @@
       "session.restriction": "WhatsApp이 계정을 제한하거나 제한을 해제했을 때",
       "presence.update": "구독한 채팅이 온라인이 되거나 입력 중이거나 오프라인이 되었을 때",
       "event.response": "게스트가 WhatsApp 이벤트 초대에 응답했을 때 (참석, 불참, 미정)",
-      "poll.vote": "누군가 투표에서 옵션을 선택하거나 해제했을 때 (whatsapp-web.js)",
+      "poll.vote": "누군가 투표에서 옵션을 선택하거나 해제했을 때",
       "group.join": "참여자가 그룹에 참여하거나 추가되었을 때",
       "group.leave": "참여자가 그룹을 나가거나 내보내졌을 때",
       "group.update": "그룹 이름, 설명 또는 설정이 바뀌었을 때",

@@ -273,6 +273,7 @@ initialization deadline, without it.
 - The phone shows "Create a passkey to log in" or "Continue on your other device" during linking, by QR or by pairing code
 - The session stays `qr_ready` on both engines; on Baileys the log shows `408` or `428` close loops, and a pairing code never appears
 - On whatsapp-web.js the page shows a "Quick security check with Passkey" modal that never succeeds
+- On Baileys the session says so, without a status change: `restriction` on `GET /api/sessions/{sessionId}` is `{ "kind": "passkey_required", "code": "passkey_prologue_request", ... }`, a `session.restriction` webhook announces it, the dashboard card shows "Passkey required" and the QR dialog explains it, and the log carries a warning once per connection (`action=baileys_passkey_required`). Reaching `ready` on a later link lifts it
 
 **Cause:** WhatsApp added a passkey (WebAuthn) step to its companion linking handshake for some
 accounts. That step is enforced server-side inside the linking frames, which live in the engine
@@ -285,6 +286,10 @@ and did not hold; the block returned on its own within days. Background in
 [#560](https://github.com/rmyndharis/OpenWA/issues/560), upstream work in
 [WhiskeySockets/Baileys#2672](https://github.com/WhiskeySockets/Baileys/issues/2672); the only durable
 change will come from the engine libraries implementing the step.
+
+The request arrives before the link completes, so a session that hits it is never linked. A link
+that is accepted and then never becomes `ready` is a different failure: see _Linking succeeds but the
+session never becomes `ready`_ below.
 
 ### Issue: Phone-number pairing fails with "Couldn't link device" (Baileys)
 
@@ -301,6 +306,52 @@ restart OpenWA itself (the name is read at boot, so stopping and starting the se
 and request a fresh code. The name applies to new pairings only; a session that is already linked
 keeps the name it was paired with until it is re-linked. See the phone-number pairing example in
 `docs/examples/session-phone-number-pairing.md`.
+
+### Issue: Linking succeeds but the session never becomes `ready` (Baileys)
+
+**Symptoms:**
+
+- The scan or pairing code is accepted: the log shows `Baileys link accepted; restarting the connection as WhatsApp asked`
+- `Session ready` never follows. `Baileys connection dropped; reconnecting` repeats with `stage=login_unconfirmed` or `stage=login_confirmed`, and `aliveMs` says how long each attempt lasted; `stage=connecting` is a different problem, the connection never reached WhatsApp, so look at the network, DNS and any proxy
+- From the fifth attempt, `lastError` on `GET /api/sessions/{sessionId}` names the same stage
+
+**What a first login does:** once the link is accepted the device logs in on a new connection.
+WhatsApp confirms the login, and the engine then generates its pre-keys (812 with Baileys 7.0.0-rc14),
+writes each one to the session's auth directory with a flush to disk, uploads them in one request of
+about 40 KB and activates the connection. Only then is the session `ready`. On a healthy host all of
+that takes a few seconds; Baileys gives the pre-key step 30. The `stage` on the drop line says how far
+an attempt got.
+
+**`login_confirmed`:** WhatsApp accepted the login and the step after it did not finish. Each attempt
+that gets this far leaves another 812 `pre-key-*` files behind, so the auth directory of a session
+stuck here grows into the thousands, where a linked session holds about 800 or fewer:
+
+```bash
+docker compose exec openwa-api sh -c 'ls /app/data/baileys/<session id> | grep -c "^pre-key-"'
+```
+
+That step needs two things from the host, and both can be measured from inside the container:
+
+```bash
+# 812 small files, each flushed to disk, in the data volume
+docker compose exec openwa-api node -e "const fs=require('fs'),d='/app/data/.flush-probe';fs.mkdirSync(d,{recursive:true});const t=Date.now();Promise.all(Array.from({length:812},async(_,i)=>{const h=await fs.promises.open(d+'/'+i,'w');await h.writeFile('x'.repeat(150));await h.sync();await h.close()})).then(()=>{console.log('812 flushed files in',Date.now()-t,'ms');fs.rmSync(d,{recursive:true})})"
+
+# one request of 100 KB to the host the engine talks to; any HTTP status means it got through
+docker compose exec openwa-api node -e "fetch('https://web.whatsapp.com/',{method:'POST',body:Buffer.alloc(100000),signal:AbortSignal.timeout(20000)}).then(r=>console.log('answered with HTTP',r.status),e=>console.log('no answer:',e.name))"
+```
+
+A write that takes tens of seconds points at the storage behind the volume (network storage, an SD
+card, a throttled cloud disk). A request that gets no answer while the gateway otherwise reaches
+WhatsApp points at a path that drops large outbound packets, typically an MTU below the Docker
+network's 1500 on a VPN, a tunnel or a cloud network. The second probe leaves the container directly,
+so it says nothing about a session that uses a proxy.
+
+**`login_unconfirmed`:** WhatsApp did not confirm the login. Nothing on the gateway's side is known to
+cause this. Whether a different number links on the same host, and whether this number links from a
+different network, separates the account from the host.
+
+For the frames themselves, set `BAILEYS_LOG_LEVEL=trace`, recreate the container and read the
+`baileys-wire` lines between `logging in...` and the drop. They contain the phone number.
 
 ### Issue: No QR code appears, or `POST /api/sessions/:sessionId/start` returns `504`
 
@@ -520,7 +571,7 @@ custom container that drops the `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` setup or th
 
 **Cause D — Debian 12 OS Chromium SIGTRAP in non-root Pods.**
 If `Code: null` happens on Kubernetes, and the host kernel logs or `dmesg` shows `Trace/breakpoint trap (core dumped)` with exit code 133, the underlying Debian 12 OS `chromium` package has crashed due to strict non-root or seccomp constraints (even with `--no-zygote` or `Unconfined` seccomp).
-_Fix:_ On amd64, do not use the `chromium` package from Debian's `apt` — it SIGTRAPs under strict non-root/seccomp. Instead, download Chrome for Testing via Puppeteer during the Docker build (`./node_modules/.bin/puppeteer browsers install 'chrome@157.0.8103.38'`) and point `PUPPETEER_EXECUTABLE_PATH` to it. (arm64 keeps Debian's `chromium`, which ships a native arm64 binary, by choice: Chrome for Testing publishes linux-arm64 builds only from 153, and the image has not moved arm64 to one.) The official `Dockerfile` implements this mixed approach.
+_Fix:_ On amd64, do not use the `chromium` package from Debian's `apt` — it SIGTRAPs under strict non-root/seccomp. Instead, download Chrome for Testing via Puppeteer during the Docker build (`./node_modules/.bin/puppeteer browsers install 'chrome@157.0.8103.78'`) and point `PUPPETEER_EXECUTABLE_PATH` to it. (arm64 keeps Debian's `chromium`, which ships a native arm64 binary, by choice: Chrome for Testing publishes linux-arm64 builds only from 153, and the image has not moved arm64 to one.) The official `Dockerfile` implements this mixed approach.
 
 **Quick triage:** run `docker stats openwa-api`, click **Start**, and watch which resource spikes toward its
 limit the instant before the failure — that tells you A vs B. If neither moves and you see the crashpad
@@ -694,6 +745,26 @@ other drop is retried inside the engine, with a fixed 1s to 60s backoff and no a
 session behind an unreachable network keeps retrying there whatever these keys say. Subscribe to the
 `session.reconnect_loop` webhook to be alerted on every 5th consecutive attempt.
 
+On Baileys, each of those drops writes one log line, `Baileys connection dropped; reconnecting`
+(`action=baileys_connection_dropped`), and the close code on it does not say what failed: `428` ends a
+wait for a QR scan, a login WhatsApp never answered and a session that had been open for a day alike.
+The line therefore also carries `stage`, how far that connection had got, and `aliveMs`, how long it
+had existed:
+
+| `stage`             | The connection closed                                                                                                                                                  |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `connecting`        | before the connection to WhatsApp opened (no network, a failing DNS or proxy, a refused upgrade, the connecting deadline); the login was never sent                    |
+| `registration`      | while the session waited for a QR scan or a pairing code                                                                                                               |
+| `linked`            | right after the link was accepted                                                                                                                                      |
+| `login_unconfirmed` | before WhatsApp confirmed a linked device's login                                                                                                                      |
+| `login_confirmed`   | after WhatsApp confirmed the login and before the session opened; in between the engine stores and uploads its pre-keys (812 on a first login with Baileys 7.0.0-rc14) |
+| `open`              | after the session had opened                                                                                                                                           |
+
+The restart WhatsApp asks for once it has accepted a link (close `515`) is expected, and is logged on
+its own as `Baileys link accepted; restarting the connection as WhatsApp asked`
+(`action=baileys_link_restart`). From the fifth consecutive attempt, `lastError` on
+`GET /api/sessions/{sessionId}` ends with a sentence naming the same stage.
+
 On a slow host, raise the first-boot init wait with `WWEBJS_AUTH_TIMEOUT_MS` (see _QR generation
 times out on slow first boot_ above).
 
@@ -792,8 +863,16 @@ rm -rf node_modules/whatsapp-web.js && npm ci
 - One capability fails while everything around it works: an unnamed `500` from a single route,
   block/unblock refusing every id, a status media send that never arrives, a group description that
   cannot be set, an app-state resync that never settles
+- On Baileys, the process exits with `TypeError: terminated` some seconds after an
+  `Inbound media download passed MEDIA_DOWNLOAD_TIMEOUT_MS` warning (the media-stream patch is missing)
+- On Baileys, the log repeats `Baileys connection dropped; reconnecting` with `statusCode=500` and
+  `reason=Stream Errored (ack)` about every 50 minutes, and the account may stop receiving until the
+  session is restarted (the status-ack patch is missing)
+- On Baileys, contact statuses never reach the status list of an account that receives them as
+  `<status>` stanzas (the status-ack patch is missing, or is the 0.30.1 revision, which only
+  acknowledged them)
 
-**Cause:** OpenWA applies fourteen exact source transforms to its engine libraries at install time
+**Cause:** OpenWA applies fifteen exact source transforms to its engine libraries at install time
 (docs/29 §29.3). The Docker image runs them without `--best-effort`, so a source shape a patcher
 cannot recognise fails the image build. Source installs run the Puppeteer compatibility transform
 without best-effort too, because browser teardown depends on it. The other transforms use
@@ -821,8 +900,13 @@ was cut short: an interrupted install left it half applied, and reinstalling `@w
 > `patch-wwebjs-201832.js` is not in that list. It carries its own startup check and its own entry
 > above, because a partially applied backport needs different advice than one that never ran.
 
-> A patch that never applied is not fatal on its own: only the capability it repairs is affected and
-> the rest of the gateway runs normally, which is why this is easy to misread as a bug in one route.
+> A patch that never applied is not fatal on its own, with two exceptions: without
+> `patch-baileys-media-stream.js`, a Baileys media download abandoned at `MEDIA_DOWNLOAD_TIMEOUT_MS` or
+> the byte cap can end the process with `TypeError: terminated`, and without
+> `patch-baileys-status-ack.js`, an account that WhatsApp sends contact statuses to as `<status>`
+> stanzas drops its connection about every 50 minutes and stores none of them. Every other patch
+> affects only the capability it repairs and the rest of the gateway runs normally, which is why this
+> is easy to misread as a bug in one route.
 
 ### Issue: Reads on a large account fail with `did not answer ... in time` or `Runtime.callFunctionOn timed out`
 
@@ -1548,7 +1632,7 @@ available_events:
   - session.restriction # WhatsApp restricted the account, or lifted it (payload: sessionId, active, kind, code, expiresAt)
   - presence.update # A subscribed chat's presence changed (Baileys only; the subscribe route answers 501 on whatsapp-web.js; payload: sessionId, chatId, participants, groupOnlineCount)
   - event.response # A guest answered a WhatsApp event invitation (Baileys only; payload: sessionId, eventMessageId, chatId, responderId, response, responseMessageId, timestamp)
-  - poll.vote # A voter selected or cleared options on a poll (whatsapp-web.js only; payload: sessionId, pollMessageId, chatId, voterId, selectedOptions, pollName, timestamp, timestampMs)
+  - poll.vote # A voter selected or cleared options on a poll (Baileys requires the poll creation message in the session store; payload: sessionId, pollMessageId, chatId, voterId, selectedOptions, pollName, timestamp, timestampMs)
   - call.accepted # A ringing call was answered (Baileys only; payload: sessionId, callId, from, outcome, isVideo, isGroup, timestamp)
   - call.rejected # A ringing call was declined (Baileys only)
   - call.missed # A ringing call was never picked up (Baileys only)

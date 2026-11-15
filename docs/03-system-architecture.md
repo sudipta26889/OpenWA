@@ -945,12 +945,12 @@ export interface EngineEventCallbacks {
   onMessageReaction?: (event: ReactionEvent) => void;
   onMessageEdited?: (message: EditedMessage) => void;
   onEventResponse?: (event: EventResponseEvent) => void; // an RSVP to a WhatsApp event; Baileys only
-  onPollVote?: (event: PollVoteEvent) => void; // a voter's new selection on a poll; whatsapp-web.js only
+  onPollVote?: (event: PollVoteEvent) => void; // a voter's new selection on a poll
   onGroupEvent?: (event: GroupEvent) => void; // kind selects group.join / group.leave / group.update / group.join_request
   onCall?: (event: IncomingCallEvent) => void; // incoming call ringing; Baileys can rejectCall() while it rings
   onHistoryMessages?: (messages: IncomingMessage[]) => void | Promise<IncomingMessage[] | void>; // bulk initial sync; persist, don't dispatch
   onDisconnected?: (reason: string) => void; // recoverable -> reconnect
-  onReconnecting?: (attempt: number, nextDelayMs: number) => void; // engines that retry internally (Baileys)
+  onReconnecting?: (attempt: number, nextDelayMs: number, context?: ReconnectContext) => void; // engines that retry internally (Baileys); context: how far the closed connection had got
   onStateChanged?: (state: EngineStatus) => void;
   onActionRequired?: (reason: string) => void; // engine alive, but an operator must act
   onAccountRestriction?: (restriction: AccountRestriction | null) => void; // null = restriction lifted

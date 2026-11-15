@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { KeyedMutationQueue } from '../../common/utils/keyed-mutation-queue';
 import type * as BaileysLib from '@whiskeysockets/baileys';
 import type { WACallEvent, WAMessage, WAMessageKey, WASocket } from '@whiskeysockets/baileys';
@@ -11,6 +12,7 @@ import {
   InboundReceipt,
   InboundTicket,
   ParticipantPresence,
+  PollVoteEvent,
   PresenceState,
   CallOutcome,
   IncomingMessage,
@@ -29,6 +31,7 @@ import {
   extractBaileysButtons,
   extractBaileysCommerce,
   extractBaileysPoll,
+  extractBaileysRawPoll,
   extractBaileysContext,
   extractBaileysLocation,
   isBaileysCatalogShare,
@@ -37,9 +40,16 @@ import {
   mapBaileysStatus,
   setBaileysText,
 } from './baileys-message-mapper';
-import { buildEditedMessage } from './message-mapper';
+import { boundPollOptions, boundPollText, buildEditedMessage } from './message-mapper';
 import { toUnixSeconds } from './baileys-history';
-import { bytesOf, decryptSecretPayload, messageSecretOf, senderForms, withoutDevice } from './baileys-secret-payload';
+import {
+  bytesOf,
+  decryptSecretPayload,
+  hasSecretPayloadBounds,
+  messageSecretOf,
+  senderForms,
+  withoutDevice,
+} from './baileys-secret-payload';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { CallNotFoundError } from '../../common/errors/call-not-found.error';
 import {
@@ -115,6 +125,9 @@ const PROTOCOL_NOISE_KEYS: ReadonlySet<string> = new Set([
   'messageHistoryNotice',
   'messageHistoryBundle',
 ]);
+
+/** Wire value of `proto.WebMessageInfo.StubType.CIPHERTEXT`, set when part of a stanza failed to decrypt. */
+const CIPHERTEXT_STUB_TYPE = 2 as BaileysLib.proto.WebMessageInfo.StubType;
 
 /**
  * Whether two ids provably name different chats or people. Each side is a jid plus the other-dialect twin WhatsApp may
@@ -309,10 +322,14 @@ export interface BaileysEventsHost {
   peekGroupMembers?(groupId: string): GroupMember[] | null;
   /** The phone user part the session knows for a lid, or null; no network read. */
   resolvePhone?(jid: string): string | null;
+  /** The lid jid the session knows for a phone jid or lid, or null; no network read. */
+  lidOf?(jid: string): string | null;
   /** The currently-registered onGroupEvent callback, if any (assigned at initialize()). */
   getOnGroupEvent(): EngineEventCallbacks['onGroupEvent'];
   /** The currently-registered onEventResponse callback, if any (assigned at initialize()). */
   getOnEventResponse(): EngineEventCallbacks['onEventResponse'];
+  /** The currently-registered onPollVote callback, if any (assigned at initialize()). */
+  getOnPollVote(): EngineEventCallbacks['onPollVote'];
   /** A contact from the session's own store, by any id dialect; no network read. */
   findContact(contactId: string): Contact | null;
   /** The currently-registered onCall callback, if any (assigned at initialize()). */
@@ -571,11 +588,30 @@ export class BaileysEvents {
     return original;
   }
 
+  /**
+   * Marks a `status@broadcast` delivery posted by this account as `fromMe: true` on a shallow copy when
+   * Baileys left `fromMe` off (its broadcast decoder compares `participant` only against the phone jid,
+   * not the account's lid). Recognises `selfMatcher()` (`user.id` and `user.lid`) plus a lid whose phone
+   * number the session already resolved; on `status@broadcast` Baileys also writes the sender's alternate
+   * dialect to `remoteJidAlt`. Never mutates Baileys' message or key.
+   */
+  private withOwnStatusDirection(msg: WAMessage): WAMessage {
+    if (msg.key.fromMe === true || msg.key.remoteJid !== 'status@broadcast') return msg;
+    const isSelf = this.selfMatcher();
+    const ownPhone = userPart(this.host.normalizedSelfJid());
+    const isOwn = (jid: string | null | undefined): boolean =>
+      !!jid &&
+      (isSelf(jid) || (ownPhone !== '' && parseWaId(jid).kind === 'lid' && this.host.resolvePhone?.(jid) === ownPhone));
+    if (![msg.key.participant, msg.key.participantAlt, msg.key.remoteJidAlt].some(isOwn)) return msg;
+    return { ...msg, key: { ...msg.key, fromMe: true } };
+  }
+
   handleMessagesUpsert(event: { messages: WAMessage[]; type: string }): void {
-    for (const msg of event.messages) {
-      if (!msg.message || !msg.key?.remoteJid) {
+    for (const rawMsg of event.messages) {
+      if (!rawMsg.message || !rawMsg.key?.remoteJid) {
         continue; // protocol/empty messages carry no neutral content
       }
+      const msg = this.withOwnStatusDirection(rawMsg);
       // A receipt that arrives while this message's own upsert is still in Baileys' event buffer is merged
       // into the upsert and raised as no message-receipt.update, which the echo skip below would then drop
       // with the rest of the echo.
@@ -913,6 +949,12 @@ export class BaileysEvents {
       // They only point at another message, so mapped they would reach consumers, in either
       // direction, as a bodyless `unknown` message (see BAILEYS_NON_CONTENT_TYPES).
       if (contentType && BAILEYS_NON_CONTENT_TYPES.has(contentType)) {
+        if (contentType === 'pollUpdateMessage') {
+          const pollId = normalizedRoot?.pollUpdateMessage?.pollCreationMessageKey?.id;
+          await this.prepareMessageChange(pollId, opts, () =>
+            this.processPollVote(b, msg, remoteJid, chatJid, normalizedRoot, opts.generation),
+          );
+        }
         this.host.logger.debug('Dropping a message that carries no content of its own', {
           action: 'baileys_drop_non_content',
           msgId: msg.key.id,
@@ -935,13 +977,21 @@ export class BaileysEvents {
       // messageContextInfo }: nothing records which part the context info came from or that a field was
       // skipped, and a messageContextInfo field such as messageSecret is not proof of content either,
       // since the sending client decides what it carries. It stops once the proto knows the type.
+      // A stanza with a CIPHERTEXT stub lost part of its payload to a decryption failure; if what
+      // survived holds only protocol noise (even a lone messageContextInfo), drop it before storing
+      // so a redelivery carrying the real body is not skipped as a duplicate.
       const keys = Object.keys(normalizedRoot ?? {});
-      if (keys.every(k => PROTOCOL_NOISE_KEYS.has(k)) && keys.some(k => k !== 'messageContextInfo')) {
+      const ciphertextStub = msg.messageStubType === CIPHERTEXT_STUB_TYPE;
+      if (
+        keys.every(k => PROTOCOL_NOISE_KEYS.has(k)) &&
+        (ciphertextStub || keys.some(k => k !== 'messageContextInfo'))
+      ) {
         this.host.logger.debug('Dropping contentless protocol message', {
           action: 'baileys_drop_protocol_noise',
           msgId: msg.key.id,
           remoteJid,
           keys,
+          ...(ciphertextStub ? { ciphertextStub: true } : {}),
         });
         return;
       }
@@ -1575,25 +1625,15 @@ export class BaileysEvents {
         });
         return undefined;
       }
-      const user = this.host.getSocketOrNull()?.user;
-      const own = [user?.id, user?.lid].filter((jid): jid is string => !!jid).map(withoutDevice);
-      // The account's own lid is also tried as its phone number: a message written under phone addressing can
-      // be edited under lid addressing, and the key names each party the way its own client did. Only that lid
-      // resolves here (host.toNeutralJid keeps a contact's lid as a lid); a contact's phone form is tried only
-      // when the key carries it as remoteJidAlt or participantAlt (senderForms).
-      const withPhone = (forms: string[]): string[] =>
-        forms.flatMap(jid => {
-          const neutral = jid.endsWith('@lid') ? this.host.toNeutralJid(jid) : '';
-          return neutral.endsWith('@c.us') ? [jid, `${userPart(neutral)}@s.whatsapp.net`] : [jid];
-        });
+      const own = this.ownBareJids();
       const plaintext = decryptSecretPayload({
         kind: isEdit ? 'edit' : 'reaction',
         secret,
         iv,
         payload,
         targetId,
-        targetAuthors: withPhone(senderForms(original.key, own)),
-        modifiers: withPhone(senderForms(msg.key, own)),
+        targetAuthors: this.decryptionSenderForms(original.key, own),
+        modifiers: this.decryptionSenderForms(msg.key, own),
       });
       if (!plaintext) {
         this.host.logger.debug('An encrypted edit or reaction did not authenticate against its target', {
@@ -2090,6 +2130,7 @@ export class BaileysEvents {
     const callback = this.host.getOnEventResponse();
     const envelope = rsvp.eventResponseMessageKey;
     if (!callback || !eventKey?.id || !eventKey.remoteJid || !envelope?.id) return;
+    const generation = this.storeGeneration;
     // Learned before any id below is canonicalized, as an inbound message does, so a guest answering
     // for the first time is not reported by lid once and by phone number afterwards.
     this.host.recordKeyLidMappings(envelope);
@@ -2099,6 +2140,7 @@ export class BaileysEvents {
     // revoke or reaction aimed at a message of another chat is. Fails open like those: a store that
     // cannot be read, or ids that cannot be compared, report the RSVP as before.
     const stored = await this.readStoredMessage(eventKey.id, 'reading the event an RSVP answers');
+    if (generation !== this.storeGeneration) return;
     if (stored && differentWaIds(keyChatIds(stored.key), keyChatIds(envelope), jid => this.host.toNeutralJid(jid))) {
       this.host.logger.warn('Dropping an event response sent in a chat other than its event', {
         msgId: eventKey.id,
@@ -2140,6 +2182,7 @@ export class BaileysEvents {
     }
     if (stored?.message) {
       const b = await this.host.loadLib();
+      if (generation !== this.storeGeneration) return;
       const name = b.normalizeMessageContent(stored.message)?.eventMessage?.name;
       if (name) event.eventName = name;
     }
@@ -2905,6 +2948,218 @@ export class BaileysEvents {
       },
       jid => this.host.toNeutralJid(jid),
     );
+  }
+
+  /**
+   * Report a poll vote. The library exports `decryptPollVote` and no longer reads a vote itself, so the
+   * adapter does, with the secret of the stored poll creation message, and names each selected option by
+   * its SHA-256 hash. A vote it cannot read is skipped; the caller drops the message either way.
+   */
+  private async processPollVote(
+    b: typeof BaileysLib,
+    msg: WAMessage,
+    remoteJid: string,
+    chatJid: string,
+    content: WAMessage['message'],
+    generation: number,
+  ): Promise<void> {
+    try {
+      const pollUpdate = content?.pollUpdateMessage;
+      const targetId = pollUpdate?.pollCreationMessageKey?.id;
+      const encPayload = bytesOf(pollUpdate?.vote?.encPayload);
+      const encIv = bytesOf(pollUpdate?.vote?.encIv);
+      if (
+        !targetId ||
+        !encPayload ||
+        !encIv ||
+        !hasSecretPayloadBounds(encIv, encPayload, { allowEmptyPlaintext: true })
+      ) {
+        this.host.logger.debug('Cannot read poll vote: missing creation key or ciphertext', {
+          action: 'baileys_poll_vote_unreadable',
+          msgId: msg.key.id ?? 'unknown',
+          targetId: targetId ?? 'unknown',
+        });
+        return;
+      }
+
+      const original = await this.readTarget(targetId, 'reading the poll a vote targets');
+      if (generation !== this.storeGeneration) return;
+      const secret = messageSecretOf(original?.message);
+      const normalizedPoll = original?.message
+        ? (b.normalizeMessageContent(original.message) ?? original.message)
+        : undefined;
+      const rawPoll = extractBaileysRawPoll(normalizedPoll);
+      if (
+        !original ||
+        !secret ||
+        !hasSecretPayloadBounds(encIv, encPayload, { secret, allowEmptyPlaintext: true }) ||
+        !rawPoll
+      ) {
+        this.host.logger.debug('Cannot read poll vote: target poll is missing, not a poll, or has no secret', {
+          action: 'baileys_poll_vote_unreadable',
+          msgId: msg.key.id ?? 'unknown',
+          targetId,
+        });
+        return;
+      }
+
+      const decrypted = this.decryptPollVoteWithCandidates(
+        b,
+        { encPayload, encIv },
+        { pollMsgId: targetId, pollEncKey: secret },
+        original.key,
+        msg.key,
+      );
+      if (!decrypted) {
+        this.host.logger.debug('A poll vote did not authenticate against its poll', {
+          action: 'baileys_poll_vote_unauthentic',
+          msgId: msg.key.id ?? 'unknown',
+          targetId,
+        });
+        return;
+      }
+
+      if (this.readsAsForeign(original.key, msg.key, false, 'reaction')) {
+        this.host.logger.warn('Dropping a poll vote sent in a chat other than its poll', {
+          action: 'baileys_poll_vote_cross_chat',
+          msgId: msg.key.id ?? 'unknown',
+          targetId,
+        });
+        return;
+      }
+
+      const selectedOptions = this.resolvePollVoteOptions(rawPoll.options, decrypted.selectedOptions);
+      if (!selectedOptions) {
+        this.host.logger.debug('Skipping poll vote carrying an unrecognized option hash', {
+          action: 'baileys_poll_vote_unknown_option',
+          msgId: msg.key.id ?? 'unknown',
+          targetId,
+        });
+        return;
+      }
+
+      const timestampMs = this.toPollVoteTimestampMs(pollUpdate?.senderTimestampMs, msg.messageTimestamp);
+      const voterRaw = keyParticipant(msg.key) ?? (msg.key.fromMe === true ? this.host.normalizedSelfJid() : remoteJid);
+      const voterId = this.host.toNeutralJid(voterRaw);
+      if (!voterId) {
+        this.host.logger.debug('Skipping poll vote with empty voter id', {
+          action: 'baileys_poll_vote_empty_voter',
+          msgId: msg.key.id ?? 'unknown',
+          targetId,
+        });
+        return;
+      }
+      const pollName = rawPoll.name ? boundPollText(rawPoll.name) : '';
+      const event: PollVoteEvent = {
+        pollMessageId: targetId,
+        chatId: this.host.toNeutralJid(chatJid),
+        voterId,
+        selectedOptions,
+        ...(pollName ? { pollName } : {}),
+        timestamp: Math.floor(timestampMs / 1000),
+        timestampMs,
+      };
+      this.announceWhenHandedOn(targetId, undefined, () => this.host.getOnPollVote()?.(event));
+    } catch (error) {
+      this.host.logger.debug('Could not process poll vote', {
+        action: 'baileys_poll_vote_failed',
+        msgId: msg.key.id ?? 'unknown',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private ownBareJids(): string[] {
+    const user = this.host.getSocketOrNull()?.user;
+    return [user?.id, user?.lid].filter((jid): jid is string => !!jid).map(withoutDevice);
+  }
+
+  /**
+   * The id forms to try for one party of a payload encrypted under a message secret: `senderForms`, with
+   * each lid also tried as its session-known phone number (`toNeutralJid` for the account's own lid or
+   * `host.resolvePhone` for a contact) and each phone form also tried as its session-known lid
+   * (`host.lidOf`). A message written under phone addressing can be edited, reacted to or voted on under
+   * lid addressing (or vice versa), even when the key omits `remoteJidAlt` or `participantAlt`.
+   */
+  private decryptionSenderForms(key: WAMessageKey, own: readonly string[]): string[] {
+    const expanded = senderForms(key, own).flatMap(jid => {
+      const { kind } = parseWaId(jid);
+      if (kind === 'lid') {
+        const neutral = this.host.toNeutralJid(jid);
+        const phone = neutral.endsWith('@c.us') ? userPart(neutral) : this.host.resolvePhone?.(jid);
+        return phone ? [jid, `${userPart(phone)}@s.whatsapp.net`] : [jid];
+      }
+      if (kind === 'user') {
+        const lid = this.host.lidOf?.(jid);
+        return lid ? [jid, `${userPart(lid)}@lid`] : [jid];
+      }
+      return [jid];
+    });
+    return [...new Set(expanded)];
+  }
+
+  private decryptPollVoteWithCandidates(
+    b: typeof BaileysLib,
+    vote: { encPayload: Buffer; encIv: Buffer },
+    ctx: { pollMsgId: string; pollEncKey: Buffer },
+    pollKey: WAMessageKey,
+    voteKey: WAMessageKey,
+  ): BaileysLib.proto.Message.IPollVoteMessage | undefined {
+    const own = this.ownBareJids();
+    const creators = this.decryptionSenderForms(pollKey, own);
+    const voters = this.decryptionSenderForms(voteKey, own);
+    for (const pollCreatorJid of creators) {
+      for (const voterJid of voters) {
+        try {
+          return b.decryptPollVote(vote, { ...ctx, pollCreatorJid, voterJid });
+        } catch {
+          // Not this JID pair or secret: AES-GCM authentication did not verify.
+        }
+      }
+    }
+    return undefined;
+  }
+
+  private resolvePollVoteOptions(
+    rawOptions: readonly string[],
+    selectedHashes: Uint8Array[] | null | undefined,
+  ): string[] | undefined {
+    if (!selectedHashes?.length) return [];
+    const byHash = new Map<string, string>();
+    for (const option of rawOptions) {
+      const digest = createHash('sha256').update(option).digest('hex');
+      if (!byHash.has(digest)) byHash.set(digest, option);
+    }
+    const resolved: string[] = [];
+    const seen = new Set<string>();
+    for (const bytes of selectedHashes) {
+      const hex = Buffer.from(bytes).toString('hex');
+      const matched = byHash.get(hex);
+      if (matched === undefined) return undefined;
+      if (seen.has(hex)) continue;
+      seen.add(hex);
+      resolved.push(matched);
+    }
+    return boundPollOptions(resolved);
+  }
+
+  private toPollVoteTimestampMs(
+    senderTimestampMs: number | string | { toNumber?: () => number } | null | undefined,
+    fallbackSeconds: number | string | { toNumber(): number } | null | undefined,
+  ): number {
+    if (senderTimestampMs != null) {
+      const ms =
+        typeof senderTimestampMs === 'number'
+          ? senderTimestampMs
+          : typeof senderTimestampMs === 'object'
+            ? typeof senderTimestampMs.toNumber === 'function'
+              ? senderTimestampMs.toNumber()
+              : Number.NaN
+            : Number(senderTimestampMs);
+      if (Number.isFinite(ms) && ms > 0) return Math.floor(ms);
+    }
+    const msgSeconds = toUnixSeconds(fallbackSeconds);
+    return msgSeconds > 0 ? msgSeconds * 1000 : Date.now();
   }
 
   /** Protocol-message edit timestamps are milliseconds; the enclosing message timestamp is seconds. */

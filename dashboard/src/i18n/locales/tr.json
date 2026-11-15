@@ -587,6 +587,8 @@
       "reachout_timelock": "Yeni sohbetler engellendi",
       "tos_block": "WhatsApp tarafından engellendi",
       "proxy_block": "Bağlantı engellendi",
+      "passkey_required": "Geçiş anahtarı gerekli",
+      "passkey_required_note": "WhatsApp, bu cihazın bağlanmasını tamamlamak için bir geçiş anahtarı istedi. OpenWA bu isteğe yanıt veremez, bu yüzden yeni bir kodla yeniden denemek bağlantıyı tamamlamaz.",
       "until": "{{date}} tarihine kadar"
     }
   },
@@ -688,7 +690,7 @@
       "session.restriction": "WhatsApp hesabı kısıtladığında veya bir kısıtlamayı kaldırdığında",
       "presence.update": "Abone olunan bir sohbet çevrimiçi olduğunda, yazdığında veya çevrimdışı olduğunda",
       "event.response": "Bir davetli bir WhatsApp etkinliğine yanıt verdiğinde (katılıyor, katılmıyor, belki)",
-      "poll.vote": "Biri bir ankette seçenek işaretlediğinde veya kaldırdığında (whatsapp-web.js)",
+      "poll.vote": "Biri bir ankette seçenek işaretlediğinde veya kaldırdığında",
       "group.join": "Katılımcılar bir gruba katıldığında veya eklendiğinde",
       "group.leave": "Katılımcılar bir gruptan ayrıldığında veya çıkarıldığında",
       "group.update": "Bir grubun adı, açıklaması veya ayarları değiştiğinde",

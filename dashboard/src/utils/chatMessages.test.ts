@@ -122,6 +122,7 @@ import {
   findRevokedIndex,
   applyMessageEdit,
   senderKey,
+  isRenderableMessage,
   type ChatMessageView,
 } from './chatMessages.ts';
 
@@ -858,4 +859,512 @@ test('unacknowledgedIncomingIds names the newest incoming messages that no read 
   // Past the cap it is the newest that are named, in the order they were sent.
   assert.deepEqual(unacknowledgedIncomingIds(thread, new Set(), 2), ['wamid.3', 'wamid.6']);
   assert.deepEqual(unacknowledgedIncomingIds([], new Set(), 100), []);
+});
+
+test('mergeChatMessages: a tombstone the history lists twice still leaves one deleted row', () => {
+  // Two pages of engine history can overlap, so the same tombstone can arrive twice.
+  const storedRevoked = db({
+    id: 'row-orig',
+    waMessageId: 'true_15550001111@c.us_ORIG',
+    chatId: '15550001111@c.us',
+    from: '15559990000@c.us',
+    to: '15550001111@c.us',
+    body: '',
+    type: 'revoked',
+    direction: 'outgoing',
+    status: 'delivered',
+    timestamp: 1782054000,
+    createdAt: '2026-06-23T11:20:00.000Z',
+  });
+  const tombstone = () =>
+    mapEngineHistoryMessage(
+      hist({
+        id: 'true_15550001111@c.us_PROTO',
+        chatId: '15550001111@c.us',
+        from: '15559990000@c.us',
+        to: '15550001111@c.us',
+        body: '',
+        type: 'revoked',
+        fromMe: true,
+        isGroup: false,
+        kind: 'individual',
+        timestamp: 1782054000,
+      }),
+    );
+  const merged = mergeChatMessages([storedRevoked], [tombstone(), tombstone()]);
+  assert.deepEqual(
+    merged.map(m => [m.waMessageId, m.status]),
+    [['true_15550001111@c.us_ORIG', 'delivered']],
+  );
+});
+
+test('mergeChatMessages: a tombstone that pairs with its stored row by id does not use up another row twin', () => {
+  // Two messages deleted in the same second by the same sender. The history names one by the id the
+  // stored row has and the other by the id of its delete notice.
+  const stored = (waMessageId: string) =>
+    db({
+      id: `row-${waMessageId}`,
+      waMessageId,
+      chatId: '15550001111@c.us',
+      from: '15550001111@c.us',
+      to: '15559990000@c.us',
+      body: '',
+      type: 'revoked',
+      direction: 'incoming',
+      status: 'delivered',
+      timestamp: 1782054000,
+      createdAt: '2026-06-23T11:20:00.000Z',
+    });
+  const tombstone = (id: string) =>
+    mapEngineHistoryMessage(
+      hist({
+        id,
+        chatId: '15550001111@c.us',
+        from: '15550001111@c.us',
+        to: '15559990000@c.us',
+        body: '',
+        type: 'revoked',
+        fromMe: false,
+        isGroup: false,
+        kind: 'individual',
+        timestamp: 1782054000,
+      }),
+    );
+  const merged = mergeChatMessages(
+    [stored('false_15550001111@c.us_SAME'), stored('false_15550001111@c.us_ORIG')],
+    [tombstone('false_15550001111@c.us_SAME'), tombstone('false_15550001111@c.us_NOTICE')],
+  );
+  assert.deepEqual(merged.map(m => m.waMessageId).sort(), [
+    'false_15550001111@c.us_ORIG',
+    'false_15550001111@c.us_SAME',
+  ]);
+});
+
+test('mergeChatMessages: deduplicates a history revoked twin in a 1:1 chat and keeps stored status', () => {
+  const storedRevoked = db({
+    id: 'row-orig',
+    waMessageId: 'true_15550001111@c.us_ORIG',
+    chatId: '15550001111@c.us',
+    from: '15559990000@c.us',
+    to: '15550001111@c.us',
+    author: undefined,
+    body: '',
+    type: 'revoked',
+    direction: 'outgoing',
+    status: 'sent',
+    timestamp: 1782054000,
+    createdAt: '2026-06-23T11:20:00.000Z',
+  });
+  const historyRevoked = mapEngineHistoryMessage(
+    hist({
+      id: 'true_15550001111@c.us_PROTO',
+      chatId: '15550001111@c.us',
+      from: '15559990000@c.us',
+      to: '15550001111@c.us',
+      author: undefined,
+      body: '',
+      type: 'revoked',
+      fromMe: true,
+      isGroup: false,
+      kind: 'individual',
+      timestamp: 1782054000,
+    }),
+  );
+  const merged = mergeChatMessages([storedRevoked], [historyRevoked]);
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].waMessageId, 'true_15550001111@c.us_ORIG');
+  assert.equal(merged[0].status, 'sent');
+
+  // Incoming 1:1 deleted message uses `from` in the same dialect.
+  const incomingStored = db({
+    id: 'row-in-orig',
+    waMessageId: 'false_15550001111@c.us_ORIG',
+    chatId: '15550001111@c.us',
+    from: '15550001111@c.us',
+    to: '15559990000@c.us',
+    author: undefined,
+    body: '',
+    type: 'revoked',
+    direction: 'incoming',
+    status: 'delivered',
+    timestamp: 1782054010,
+  });
+  const incomingHist = mapEngineHistoryMessage(
+    hist({
+      id: 'false_15550001111@c.us_PROTO',
+      chatId: '15550001111@c.us',
+      from: '15550001111@c.us',
+      to: '15559990000@c.us',
+      author: undefined,
+      body: '',
+      type: 'revoked',
+      fromMe: false,
+      isGroup: false,
+      kind: 'individual',
+      timestamp: 1782054010,
+    }),
+  );
+  const mergedIn = mergeChatMessages([incomingStored], [incomingHist]);
+  assert.equal(mergedIn.length, 1);
+  assert.equal(mergedIn[0].waMessageId, 'false_15550001111@c.us_ORIG');
+  assert.equal(mergedIn[0].status, 'delivered');
+});
+
+test('mergeChatMessages: deduplicates a history revoked twin in a group chat by author, direction, and timestamp', () => {
+  const storedGroup = db({
+    id: 'row-g-orig',
+    waMessageId: 'false_g@g.us_ORIG_Alice',
+    chatId: 'g@g.us',
+    from: 'g@g.us',
+    to: 'me@c.us',
+    author: 'alice@c.us',
+    body: '',
+    type: 'revoked',
+    direction: 'incoming',
+    status: 'delivered',
+    timestamp: 1782054100,
+  });
+  const historyGroup = mapEngineHistoryMessage(
+    hist({
+      id: 'false_g@g.us_PROTO_Alice',
+      chatId: 'g@g.us',
+      from: 'g@g.us',
+      to: 'me@c.us',
+      author: 'alice@c.us',
+      body: '',
+      type: 'revoked',
+      fromMe: false,
+      isGroup: true,
+      kind: 'group',
+      timestamp: 1782054100,
+    }),
+  );
+  const merged = mergeChatMessages([storedGroup], [historyGroup]);
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].waMessageId, 'false_g@g.us_ORIG_Alice');
+  assert.equal(merged[0].status, 'delivered');
+});
+
+test('mergeChatMessages: keeps unmatched history revoked rows and matches twins 1-to-1', () => {
+  const histOnly = mapEngineHistoryMessage(
+    hist({ id: 'false_g@g.us_HIST_ONLY', author: 'alice@c.us', type: 'revoked', timestamp: 1782054200 }),
+  );
+  assert.equal(mergeChatMessages([], [histOnly]).length, 1);
+  assert.equal(mergeChatMessages([], [histOnly])[0].type, 'revoked');
+
+  const storedOne = db({
+    id: 'row-one',
+    waMessageId: 'false_g@g.us_ORIG_1',
+    author: 'alice@c.us',
+    type: 'revoked',
+    direction: 'incoming',
+    status: 'delivered',
+    timestamp: 1782054200,
+  });
+  // Different direction, sender, or timestamp do not merge.
+  assert.equal(mergeChatMessages([{ ...storedOne, direction: 'outgoing' }], [histOnly]).length, 2);
+  assert.equal(mergeChatMessages([{ ...storedOne, author: 'bob@c.us' }], [histOnly]).length, 2);
+  assert.equal(mergeChatMessages([{ ...storedOne, timestamp: 1782054201 }], [histOnly]).length, 2);
+
+  // Two history revoked rows in the same second vs one unmatched stored row consumes only one history twin.
+  const histSecond = mapEngineHistoryMessage(
+    hist({ id: 'false_g@g.us_HIST_2', author: 'alice@c.us', type: 'revoked', timestamp: 1782054200 }),
+  );
+  const twoHistVsOneStored = mergeChatMessages([storedOne], [histOnly, histSecond]);
+  assert.equal(twoHistVsOneStored.length, 2);
+  assert.deepEqual(twoHistVsOneStored.map(m => m.waMessageId).sort(), ['false_g@g.us_HIST_2', 'false_g@g.us_ORIG_1']);
+
+  // A stored row already matched by ID (Baileys path) cannot also swallow a second history-only revoked row.
+  const histSameId = mapEngineHistoryMessage(
+    hist({ id: 'false_g@g.us_ORIG_1', author: 'alice@c.us', type: 'revoked', timestamp: 1782054200 }),
+  );
+  const idMatchedPlusExtra = mergeChatMessages([storedOne], [histSameId, histSecond]);
+  assert.equal(idMatchedPlusExtra.length, 2);
+});
+
+test('mergeChatMessages: a deleted message listed under another form of the chat id is drawn once', () => {
+  // Measured on a live session: the stored row is under the chat's lid and the history entry under the phone
+  // number, with the same stanza. The sender can be in the other form too, and the time a second apart.
+  const stored = db({
+    id: 'row-lid',
+    waMessageId: 'false_148@lid_3EB0FE6B',
+    chatId: '148@lid',
+    from: '148@lid',
+    type: 'revoked',
+    direction: 'incoming',
+    status: 'read',
+    timestamp: 1793549202,
+    body: '',
+  });
+  const entry = (id: string, over: Partial<EngineHistoryMessage> = {}) =>
+    mapEngineHistoryMessage(
+      hist({ id, chatId: '148@lid', from: '628@c.us', type: 'revoked', timestamp: 1793549203, body: '', ...over }),
+    );
+  const drawn = (rows: ChatMessage[], history: ReturnType<typeof entry>[]) =>
+    mergeChatMessages(rows, history).map(m => m.waMessageId);
+
+  const merged = mergeChatMessages([stored], [entry('false_628@c.us_3EB0FE6B')]);
+  assert.deepEqual(
+    merged.map(m => [m.waMessageId, m.status]),
+    [['false_148@lid_3EB0FE6B', 'read']],
+  );
+  // The other way round: a row stored while the chat was known by phone number, an entry under the lid.
+  assert.deepEqual(
+    drawn([db({ ...stored, waMessageId: 'false_628@c.us_3EB0FE6B' })], [entry('false_148@lid_3EB0FE6B')]),
+    ['false_628@c.us_3EB0FE6B'],
+  );
+  // A group id has a fourth part, the author, and that part can be in the other form as well.
+  assert.deepEqual(
+    drawn([db({ ...stored, waMessageId: 'false_g@g.us_3EB0FE6B_148@lid' })], [entry('false_g@g.us_3EB0FE6B_628@c.us')]),
+    ['false_g@g.us_3EB0FE6B_148@lid'],
+  );
+  // A row the delete never reached is the same message all the same: it is shown deleted, without its text.
+  assert.deepEqual(
+    mergeChatMessages([{ ...stored, type: 'text', body: 'secret' }], [entry('false_628@c.us_3EB0FE6B')]).map(m => [
+      m.waMessageId,
+      m.type,
+      m.body,
+    ]),
+    [['false_148@lid_3EB0FE6B', 'revoked', '']],
+  );
+  // An entry listed twice, once from before the delete, is still that one message.
+  assert.deepEqual(
+    drawn([stored], [entry('false_628@c.us_3EB0FE6B', { type: 'text', body: 'hi' }), entry('false_628@c.us_3EB0FE6B')]),
+    ['false_148@lid_3EB0FE6B'],
+  );
+  // A stored row the page lists under its own id is not deleted by an entry that only shares its stanza.
+  assert.deepEqual(
+    mergeChatMessages(
+      [db({ ...stored, waMessageId: 'false_g@g.us_3EB0FE6B_111@c.us', type: 'text', body: 'still here' })],
+      [
+        entry('false_g@g.us_3EB0FE6B_111@c.us', { type: 'text', body: 'still here' }),
+        entry('false_g@g.us_3EB0FE6B_222@c.us'),
+      ],
+    )
+      .map(m => [m.waMessageId, m.type, m.body])
+      .sort(),
+    [
+      ['false_g@g.us_3EB0FE6B_111@c.us', 'text', 'still here'],
+      ['false_g@g.us_3EB0FE6B_222@c.us', 'revoked', ''],
+    ],
+  );
+  // An entry that has a stored row under its own id belongs to that row, whatever else shares the stanza.
+  assert.deepEqual(
+    mergeChatMessages(
+      [
+        db({ ...stored, id: 'row-b', waMessageId: 'false_628@c.us_3EB0FE6B', type: 'text', body: 'gone' }),
+        db({ ...stored, id: 'row-a', waMessageId: 'false_148@lid_3EB0FE6B', type: 'text', body: 'kept' }),
+      ],
+      [entry('false_628@c.us_3EB0FE6B')],
+    )
+      .map(m => [m.waMessageId, m.type, m.body])
+      .sort(),
+    [
+      ['false_148@lid_3EB0FE6B', 'text', 'kept'],
+      ['false_628@c.us_3EB0FE6B', 'revoked', ''],
+    ],
+  );
+
+  // The same stanza sent the other way is another message, and so is an entry that is not deleted.
+  assert.equal(drawn([stored], [entry('true_628@c.us_3EB0FE6B', { fromMe: true })]).length, 2);
+  assert.equal(drawn([stored], [entry('false_628@c.us_3EB0FE6B', { type: 'text', body: 'hi' })]).length, 2);
+  // Only a full whatsapp-web.js id has a stanza to go by: not a bare key, not an id of some other make with
+  // underscores in it, not one whose first part is no direction, and not a stanza that holds an underscore.
+  for (const [storedId, entryId] of [
+    ['3EB0FE6B', '3EB0FE6B_X'],
+    ['msg_2026_01', 'msg_2025_01'],
+    ['maybe_148@lid_3EB0FE6B', 'maybe_628@c.us_3EB0FE6B'],
+    ['false_148@lid_MSG_1_111@lid', 'false_628@c.us_MSG_2_222@lid'],
+    ['false_148@lid_v1_9f8a7b6c', 'false_628@c.us_v1_1a2b3c4d'],
+    ['false_148@lid_3EB0FE6B_111@lid_out', 'false_628@c.us_3EB0FE6B_111@lid_out'],
+  ]) {
+    assert.equal(drawn([db({ ...stored, waMessageId: storedId })], [entry(entryId)]).length, 2, entryId);
+  }
+
+  // A stanza match is decided before a match by sender and time: here the first entry is another deleted
+  // message of the same sender and second, and it must not take the row that the second entry is.
+  const sameSecond = entry('false_148@lid_OTHER', { from: '148@lid', timestamp: 1793549202 });
+  assert.deepEqual(drawn([stored], [sameSecond, entry('false_628@c.us_3EB0FE6B')]).sort(), [
+    'false_148@lid_3EB0FE6B',
+    'false_148@lid_OTHER',
+  ]);
+});
+
+test('mergeChatMessages: a match by sender and time needs a known time, and an entry listed twice takes one row', () => {
+  const row = (waMessageId: string, timestamp?: number) =>
+    db({
+      id: waMessageId,
+      waMessageId,
+      author: 'alice@c.us',
+      type: 'revoked',
+      direction: 'incoming',
+      timestamp,
+      body: '',
+    });
+  const entry = (id: string, timestamp?: number) =>
+    mapEngineHistoryMessage(
+      hist({ id, author: 'alice@c.us', type: 'revoked', timestamp: timestamp as number, body: '' }),
+    );
+  const drawn = (rows: ChatMessage[], history: ReturnType<typeof entry>[]) =>
+    mergeChatMessages(rows, history)
+      .map(m => m.waMessageId)
+      .sort();
+
+  // Neither side knows the time, so nothing says the two are one message.
+  assert.deepEqual(drawn([row('false_g@g.us_A1')], [entry('false_g@g.us_N1')]), ['false_g@g.us_A1', 'false_g@g.us_N1']);
+
+  // Two messages deleted in the same second, the first listed twice: the repeat must not take the second row.
+  assert.deepEqual(
+    drawn(
+      [row('false_g@g.us_A1', 1782054500), row('false_g@g.us_A2', 1782054500)],
+      [
+        entry('false_g@g.us_N1', 1782054500),
+        entry('false_g@g.us_N1', 1782054500),
+        entry('false_g@g.us_N2', 1782054500),
+      ],
+    ),
+    ['false_g@g.us_A1', 'false_g@g.us_A2'],
+  );
+});
+
+test('mergeChatMessages: never merges two stored revoked rows with each other', () => {
+  const s1 = db({
+    id: 'row-1',
+    waMessageId: 'true_g@g.us_A',
+    author: 'alice@c.us',
+    type: 'revoked',
+    direction: 'outgoing',
+    status: 'sent',
+    timestamp: 1782054300,
+    body: '',
+  });
+  const s2 = db({
+    id: 'row-2',
+    waMessageId: 'true_g@g.us_B',
+    author: 'alice@c.us',
+    type: 'revoked',
+    direction: 'outgoing',
+    status: 'sent',
+    timestamp: 1782054300,
+    body: '',
+  });
+  const merged = mergeChatMessages([s1, s2], []);
+  assert.equal(merged.length, 2);
+});
+
+test('mergeChatMessages: never matches non-revoked rows by direction, sender, and timestamp', () => {
+  const storedText = db({
+    id: 'row-txt',
+    waMessageId: 'true_g@g.us_TXT',
+    author: 'alice@c.us',
+    type: 'text',
+    direction: 'incoming',
+    timestamp: 1782054400,
+  });
+  const histRevoked = mapEngineHistoryMessage(
+    hist({
+      id: 'false_g@g.us_REV',
+      author: 'alice@c.us',
+      type: 'revoked',
+      fromMe: false,
+      timestamp: 1782054400,
+    }),
+  );
+  assert.equal(mergeChatMessages([storedText], [histRevoked]).length, 2);
+
+  const storedRevoked = { ...storedText, type: 'revoked' as const, body: '' };
+  const histText = mapEngineHistoryMessage(
+    hist({
+      id: 'false_g@g.us_TXT2',
+      author: 'alice@c.us',
+      type: 'text',
+      fromMe: false,
+      timestamp: 1782054400,
+    }),
+  );
+  assert.equal(mergeChatMessages([storedRevoked], [histText]).length, 2);
+  assert.equal(mergeChatMessages([storedText], [histText]).length, 2);
+});
+
+test('mapEngineHistoryMessage: leaves status undefined while mergeChatMessages preserves stored status', () => {
+  const outHist = mapEngineHistoryMessage(hist({ id: 'true_g@g.us_H1', fromMe: true }));
+  const inHist = mapEngineHistoryMessage(hist({ id: 'false_g@g.us_H2', fromMe: false }));
+  assert.equal(outHist.status, undefined);
+  assert.equal(inHist.status, undefined);
+
+  const stored = db({ waMessageId: 'true_g@g.us_H1', status: 'sent' });
+  const merged = mergeChatMessages([stored], [outHist]);
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].status, 'sent');
+});
+
+test('isRenderableMessage: drops empty unknown rows and keeps rows ChatThread draws', () => {
+  assert.equal(isRenderableMessage(msg({ type: 'unknown', body: '', metadata: undefined })), false);
+  assert.equal(
+    isRenderableMessage(msg({ type: 'unknown', body: '', metadata: { edited: true, reactions: { a: '👍' } } })),
+    false,
+  );
+  assert.equal(
+    isRenderableMessage(
+      msg({ type: 'unknown', body: '', metadata: { media: { mimetype: 'application/octet-stream' } } }),
+    ),
+    false,
+  );
+  assert.equal(
+    isRenderableMessage(
+      msg({
+        type: 'unknown',
+        body: 'file.bin',
+        metadata: { media: { mimetype: 'application/octet-stream', filename: 'file.bin' } },
+      }),
+    ),
+    false,
+  );
+  assert.equal(
+    isRenderableMessage(
+      msg({ type: 'unknown', body: '', direction: 'outgoing', metadata: { buttons: [{ id: 'b1', text: 'Tap' }] } }),
+    ),
+    false,
+  );
+
+  // Unknown rows that carry renderable content stay visible.
+  assert.equal(isRenderableMessage(msg({ type: 'unknown', body: 'fallback text' })), true);
+  assert.equal(
+    isRenderableMessage(
+      msg({ type: 'unknown', body: '', metadata: { media: { mimetype: 'image/png', omitted: true } } }),
+    ),
+    true,
+  );
+  assert.equal(
+    isRenderableMessage(
+      msg({ type: 'unknown', body: '', metadata: { media: { mimetype: 'image/png', data: 'BASE64' } } }),
+    ),
+    true,
+  );
+  assert.equal(
+    isRenderableMessage(msg({ type: 'unknown', body: '', metadata: { quotedMessage: { id: 'q', body: 'hi' } } })),
+    true,
+  );
+  assert.equal(
+    isRenderableMessage(
+      msg({ type: 'unknown', body: '', direction: 'incoming', metadata: { buttons: [{ id: 'b1', text: 'Tap' }] } }),
+    ),
+    true,
+  );
+
+  // Non-unknown rows always render, including revoked, masked, location, call, poll, contact, and media.
+  for (const type of [
+    'revoked',
+    'masked',
+    'location',
+    'call',
+    'poll',
+    'contact',
+    'order',
+    'product',
+    'image',
+    'text',
+  ] as const) {
+    assert.equal(isRenderableMessage(msg({ type, body: '', metadata: undefined })), true, `type=${type}`);
+  }
 });

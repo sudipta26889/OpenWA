@@ -592,6 +592,8 @@
       "reachout_timelock": "Novas conversas bloqueadas",
       "tos_block": "Bloqueado pelo WhatsApp",
       "proxy_block": "Conexão bloqueada",
+      "passkey_required": "Chave de acesso necessária",
+      "passkey_required_note": "O WhatsApp pediu uma chave de acesso para concluir a conexão deste dispositivo. O OpenWA não consegue responder a esse pedido, então tentar de novo com um código novo não concluirá a conexão.",
       "until": "até {{date}}"
     }
   },
@@ -694,7 +696,7 @@
       "session.restriction": "Quando o WhatsApp restringe a conta ou remove uma restrição",
       "presence.update": "Quando um chat inscrito fica online, digita ou fica offline",
       "event.response": "Quando um convidado responde a um evento do WhatsApp (vai, não vai, talvez)",
-      "poll.vote": "Quando alguém marca ou desmarca opções de uma enquete (whatsapp-web.js)",
+      "poll.vote": "Quando alguém marca ou desmarca opções de uma enquete",
       "group.join": "Quando participantes entram em um grupo ou são adicionados",
       "group.leave": "Quando participantes saem de um grupo ou são removidos",
       "group.update": "Quando o nome, a descrição ou as configurações de um grupo mudam",
