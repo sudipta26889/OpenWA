@@ -82,7 +82,7 @@ The checklist items "reuse revokes the grant", "replay revokes the grant", "revo
 | `initialize` version negotiation | Done by the SDK (`server/index.js:266`) |
 | Unsupported `MCP-Protocol-Version` gives 400 | Done by the SDK (`webStandardStreamableHttp.js:780`) |
 | Foreign `Origin` gives 403 | Phase 1 (gateway) |
-| Bad input as a tool result with `isError` | **Gap, upstream:** schema failures come back as the SDK's -32602 error (`tool-invoker.ts:14-15`); handler errors are `isError` |
+| Bad input as a tool result with `isError` | **Done by the SDK** (corrected 2026-11-16): `@modelcontextprotocol/sdk` 1.32.2 catches the input-validation McpError in the `tools/call` handler and returns `{ isError: true }`, with the -32602 only as text (`dist/esm/server/mcp.js:175,187-192,204-211`). Verified with the real SDK over an in-memory transport |
 | Tool `title` and `openWorldHint` | **Gap, upstream** (`mcp.server.ts:125-129`) |
 | Result size cap (~150k chars) | **Gap, upstream:** results over 32 KB become an uncapped base64 resource (`tool-result.ts:15,28`) |
 | Tokens stored hashed | Not applicable: nothing token-shaped is stored. Tokens are AES-256-GCM sealed and checked by their auth tag; grants hold only a key fingerprint |
@@ -90,7 +90,7 @@ The checklist items "reuse revokes the grant", "replay revokes the grant", "revo
 | Anthropic egress (`160.79.104.0/21`, `153.61.208.0/20`) | Done in practice: the claude.ai connector works. Recheck after any NPM or WAF change |
 | No apex-to-www redirect | Done: the MCP URL is a subdomain with no redirect |
 
-The upstream gaps go into one PR to `rmyndharis/OpenWA`: tool `title`, `openWorldHint: true` on the send tools, a configurable result cap, and validation errors returned as `isError`.
+The upstream gaps go to `rmyndharis/OpenWA` as two focused PRs (its CONTRIBUTING asks for one logical change per PR): tool `title` + `openWorldHint`, and a configurable result cap. Validation errors already come back as `isError` (see the table).
 
 **Revised 2026-11-16 (owner's "finish everything"):** the result cap could not wait for upstream, so the gateway now caps it. This reverses v1's "no response rewriting":
 - Only answers to OAuth-token callers (the claude.ai and ChatGPT path) are touched. Static-key callers keep OpenWA's resource-blob answer, which Claude Code saves to a file.
