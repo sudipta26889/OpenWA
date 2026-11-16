@@ -32,6 +32,9 @@ client ──► :2785 mcp-oauth-gateway ──► openwa-api:2785 (not publishe
 - **Revocation (RFC 7009):** `POST /oauth/revoke` (form `token=`, CORS `*`, `OPTIONS` answers 204)
   revokes the grant behind an access or refresh token and always answers 200. AS metadata advertises
   `revocation_endpoint` and `revocation_endpoint_auth_methods_supported: ["none"]`.
+- **Consent CSRF:** `POST /oauth/authorize` (and the two connections POSTs) are refused with 403 and the
+  page again unless `Origin` equals the issuer origin, or `Origin` is absent and `Sec-Fetch-Site` is
+  `same-origin`. The consent page shows the redirect URI host beside the client name.
 - **Static keys** (`X-API-Key` or `Authorization: Bearer owa_k1_…`) pass through untouched.
 
 ## Fleet-checklist behaviours
@@ -42,6 +45,16 @@ client ──► :2785 mcp-oauth-gateway ──► openwa-api:2785 (not publishe
 4. **RFC 8707:** a `resource` on authorize or `/oauth/token` (both grants) that is not `${issuer}/mcp` is `invalid_target` (400); omitting it is allowed.
 5. **RFC 8252:** a registered `http://localhost` / `http://127.0.0.1` redirect URI matches any port (scheme, host, path, query equal), at authorize and at the token step; all other URIs are exact.
 6. **DCR schemes:** `cursor://` and `vscode://` redirect URIs are accepted (`CUSTOM_REDIRECT_SCHEMES` in `gateway.mjs`); other custom schemes are refused.
+
+## Connections
+
+`GET /oauth/connections` shows a form; the operator types an OpenWA API key, which is POSTed (never in a
+URL) and checked with `POST /api/auth/validate`. An `admin` key lists every grant; any other key lists the
+grants whose `keyFp` matches it. Each row shows client name, host, created, last used and status, with a
+revoke button. The button's form carries a sealed `owgv.` token bound to `{ keyFp, role, gid }` (5 minutes);
+`POST /oauth/connections/revoke` checks it and the same Origin rule, and an admin token covers any grant,
+any other key's token only its own. Pages send `frame-ancestors 'none'` and `cache-control: no-store`, and
+the key is never echoed back.
 
 ## Config (root `.env`, forwarded by `docker-compose.override.yml`)
 

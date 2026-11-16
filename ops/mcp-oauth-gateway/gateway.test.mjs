@@ -54,7 +54,7 @@ const form = (url, body) =>
   fetch(base + url, {
     method: 'POST',
     redirect: 'manual',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    headers: { 'content-type': 'application/x-www-form-urlencoded', origin: 'https://wa.example.test' },
     body: new URLSearchParams(body),
   });
 
@@ -338,7 +338,7 @@ const formAt = (b, url, body) =>
   fetch(b + url, {
     method: 'POST',
     redirect: 'manual',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    headers: { 'content-type': 'application/x-www-form-urlencoded', origin: ISSUER },
     body: new URLSearchParams(body),
   });
 const grantsOf = dir => JSON.parse(fs.readFileSync(path.join(dir, 'grants.json'), 'utf8'));
@@ -620,6 +620,199 @@ test('Revoke: another grant is not affected; the preflight answers 204; metadata
     const meta = await (await fetch(`${g.base}/.well-known/oauth-authorization-server`)).json();
     assert.equal(meta.revocation_endpoint, `${ISSUER}/oauth/revoke`);
     assert.deepEqual(meta.revocation_endpoint_auth_methods_supported, ['none']);
+  } finally {
+    await g.stop();
+  }
+});
+
+// ---- phase 2: consent CSRF, client host, connections view ----
+
+const rawPost = (b, url, body, headers = {}) =>
+  fetch(b + url, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers },
+    body: new URLSearchParams(body),
+  });
+const consentQuery = async (b, uri = 'https://claude.ai/cb', name = 'Claude') => {
+  const reg = await (
+    await fetch(`${b}/oauth/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ redirect_uris: [uri], client_name: name }),
+    })
+  ).json();
+  return authQuery(reg.client_id, uri, pkce().challenge);
+};
+
+test('Consent: a POST is refused with the consent page and 403 unless Origin is the issuer, or absent with Sec-Fetch-Site same-origin', async () => {
+  const g = await startGateway();
+  try {
+    const q = { ...(await consentQuery(g.base)), api_key: GOOD_KEY };
+    const refused = [
+      { origin: 'https://evil.example' },
+      { origin: 'null' },
+      { origin: 'https://wa.example.test.evil.com' },
+      { origin: 'https://evil.example', 'sec-fetch-site': 'same-origin' }, // Origin wins over Sec-Fetch-Site
+      { 'sec-fetch-site': 'cross-site' },
+      { 'sec-fetch-site': 'same-site' },
+      { 'sec-fetch-site': 'none' },
+      {}, // neither header
+    ];
+    for (const headers of refused) {
+      const res = await rawPost(g.base, '/oauth/authorize', q, headers);
+      assert.equal(res.status, 403, JSON.stringify(headers));
+      assert.equal(res.headers.get('location'), null, 'no redirect with a code');
+      const html = await res.text();
+      assert.match(html, /<form/, 'the consent page is shown again');
+      assert.ok(!html.includes(GOOD_KEY), 'the key is never echoed');
+    }
+    assert.equal(fs.existsSync(path.join(g.stateDir, 'grants.json')), false, 'a refused POST creates no grant');
+
+    assert.equal((await rawPost(g.base, '/oauth/authorize', q, { origin: ISSUER })).status, 302, 'issuer Origin');
+    assert.equal((await rawPost(g.base, '/oauth/authorize', q, { 'sec-fetch-site': 'same-origin' })).status, 302, 'same-origin, no Origin');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Consent: the page shows the client host beside the client name, both HTML-escaped', async () => {
+  const g = await startGateway();
+  try {
+    const q = await consentQuery(g.base, 'https://app.evil.example:8443/cb', '<b>Fake Claude</b>');
+    const html = await (await fetch(`${g.base}/oauth/authorize?${new URLSearchParams(q)}`)).text();
+    assert.match(html, /<code>app\.evil\.example:8443<\/code>/, 'redirect host (with port), visible beside the name');
+    assert.match(html, /&lt;b&gt;Fake Claude&lt;\/b&gt;/, 'name escaped');
+    assert.ok(!html.includes('<b>Fake Claude</b>'));
+
+    // The host is also on the page re-rendered after a wrong key.
+    const bad = await rawPost(g.base, '/oauth/authorize', { ...q, api_key: 'wrong' }, { origin: ISSUER });
+    assert.equal(bad.status, 401);
+    assert.match(await bad.text(), /<code>app\.evil\.example:8443<\/code>/);
+  } finally {
+    await g.stop();
+  }
+});
+
+const connectionsPost = (b, key, headers = { origin: ISSUER }) => rawPost(b, '/oauth/connections', { api_key: key }, headers);
+const tokensIn = html => [...html.matchAll(/name="vtoken" value="([^"]+)"/g)].map(m => m[1]);
+const gidOf = (dir, name) => Object.entries(grantsOf(dir)).find(([, g]) => g.clientName === name)[0];
+async function twoConnections() {
+  const g = await startGateway();
+  const admin = await connect(g.base, { key: GOOD_KEY, name: 'AdminClient', uri: 'https://admin.example.test/cb' });
+  const viewer = await connect(g.base, { key: VIEWER_KEY, name: 'ViewerClient', uri: 'https://viewer.example.test/cb' });
+  return { g, admin, viewer, adminGid: gidOf(g.stateDir, 'AdminClient'), viewerGid: gidOf(g.stateDir, 'ViewerClient') };
+}
+
+test('Connections: GET is a form that POSTs a key, with no key in any URL, and every page is framed-denied and uncached', async () => {
+  const g = await startGateway();
+  try {
+    const res = await fetch(`${g.base}/oauth/connections?api_key=${GOOD_KEY}`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    const html = await res.text();
+    assert.match(html, /<form[^>]*method="post"[^>]*action="\/oauth\/connections"/i);
+    assert.match(html, /<input[^>]*type="password"[^>]*name="api_key"/);
+    assert.ok(!html.includes(GOOD_KEY), 'a key in the query string is ignored and not echoed');
+    assert.ok(!/<tr/.test(html), 'a GET lists nothing');
+
+    const post = await connectionsPost(g.base, GOOD_KEY);
+    assert.match(post.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+    assert.equal(post.headers.get('cache-control'), 'no-store');
+    const bad = await connectionsPost(g.base, 'wrong');
+    assert.equal(bad.status, 401);
+    assert.match(bad.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+    assert.ok(!(await bad.text()).includes('wrong'), 'a bad key is not echoed either');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Connections: a key sees only its own grants, an admin key sees all, and the key is never echoed', async () => {
+  const { g, admin, viewer } = await twoConnections();
+  try {
+    const own = await (await connectionsPost(g.base, VIEWER_KEY)).text();
+    assert.match(own, /ViewerClient/);
+    assert.match(own, /viewer\.example\.test/);
+    assert.match(own, /active/);
+    assert.doesNotMatch(own, /AdminClient/);
+    assert.equal(tokensIn(own).length, 1);
+
+    const all = await (await connectionsPost(g.base, GOOD_KEY)).text();
+    assert.match(all, /AdminClient/);
+    assert.match(all, /ViewerClient/);
+    assert.equal(tokensIn(all).length, 2);
+    for (const html of [own, all]) {
+      assert.ok(!html.includes(GOOD_KEY) && !html.includes(VIEWER_KEY), 'no key in the page');
+      assert.match(html, /\d{4}-\d\d-\d\dT/, 'created and last used are shown');
+    }
+    assert.ok(admin.tok && viewer.tok);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Connections: revoke cuts off the grant; revoked rows show their status', async () => {
+  const { g, admin, viewer } = await twoConnections();
+  try {
+    const [token] = tokensIn(await (await connectionsPost(g.base, VIEWER_KEY)).text());
+    const res = await rawPost(g.base, '/oauth/connections/revoke', { vtoken: token }, { origin: ISSUER });
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    assert.equal((await mcpAt(g.base, viewer.tok.access_token)).status, 401);
+    assert.equal((await mcpAt(g.base, admin.tok.access_token)).status, 200, 'other grants untouched');
+    assert.match(await (await connectionsPost(g.base, VIEWER_KEY)).text(), /revoked/);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Connections: an admin token revokes any grant; a non-admin token only its own key\'s grants', async () => {
+  const { g, admin, viewer, adminGid, viewerGid } = await twoConnections();
+  try {
+    const vToken = (key, gid, role, exp = Date.now() + 60_000) =>
+      sealLegacy(g.stateDir, 'v', 'owgv.', { keyFp: sha16(key), role, gid, exp });
+    const revoke = token => rawPost(g.base, '/oauth/connections/revoke', { vtoken: token }, { origin: ISSUER });
+
+    // a viewer-key token aimed at the admin grant is refused
+    assert.equal((await revoke(vToken(VIEWER_KEY, adminGid, 'viewer'))).status, 403);
+    assert.equal((await mcpAt(g.base, admin.tok.access_token)).status, 200);
+    // a token claiming admin with the wrong key fingerprint is still only as good as its role claim; the
+    // sealed role comes from our own validate call, so a viewer token cannot carry it
+    // an admin token covers the viewer's grant
+    assert.equal((await revoke(vToken(GOOD_KEY, viewerGid, 'admin'))).status, 200);
+    assert.equal((await mcpAt(g.base, viewer.tok.access_token)).status, 401);
+    // an unknown gid is refused
+    assert.equal((await revoke(vToken(GOOD_KEY, 'no-such-gid', 'admin'))).status, 403);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Connections: revoke refuses a foreign Origin, a missing Origin, a bad, expired or wrong-kind token', async () => {
+  let t = 10_000_000;
+  const g = await startGateway({ now: () => t });
+  try {
+    const c = await connect(g.base, { name: 'Solo' });
+    const [token] = tokensIn(await (await connectionsPost(g.base, GOOD_KEY)).text());
+    const revoke = (vtoken, headers = { origin: ISSUER }) => rawPost(g.base, '/oauth/connections/revoke', { vtoken }, headers);
+
+    assert.equal((await revoke(token, { origin: 'https://evil.example' })).status, 403);
+    assert.equal((await revoke(token, { 'sec-fetch-site': 'cross-site' })).status, 403);
+    assert.equal((await revoke(token, {})).status, 403);
+    assert.equal((await revoke('owgv.AAAA')).status, 403, 'forged');
+    assert.equal((await revoke(c.tok.access_token)).status, 403, 'an access token is not a revoke token');
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200, 'still live after every refusal');
+
+    t += 5 * 60_000 + 1000;
+    assert.equal((await revoke(token)).status, 403, 'expired after 5 minutes');
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200);
+
+    t -= 5 * 60_000; // inside the TTL again: the same token works
+    assert.equal((await revoke(token)).status, 200);
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 401);
   } finally {
     await g.stop();
   }

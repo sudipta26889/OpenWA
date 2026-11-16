@@ -28,7 +28,8 @@ const SCOPE = 'mcp';
 const MAX_BODY = 64 * 1024; // OAuth form/JSON bodies are tiny
 // The prefix tells our tokens apart from OpenWA keys (owa_…); it is also the AES-GCM AAD, so a sealed
 // blob of one kind can never be replayed as another (e.g. a client id as an access token).
-const PREFIX = { access: 'owga.', refresh: 'owgr.', code: 'owgc.', client: 'owgk.' };
+const PREFIX = { access: 'owga.', refresh: 'owgr.', code: 'owgc.', client: 'owgk.', v: 'owgv.' };
+const VIEW_TTL_MS = 300_000; // 5m: a connections-page revoke token
 // Native-app redirect schemes DCR accepts besides https and http loopback. Any other custom scheme is refused.
 const CUSTOM_REDIRECT_SCHEMES = ['cursor', 'vscode'];
 const LOOPBACK_HOSTS = ['localhost', '127.0.0.1'];
@@ -71,10 +72,51 @@ label{display:block;font-size:13px;margin:0 0 6px}
 input[type=password]{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#e2e8f0;font-size:14px}
 button{margin-top:18px;width:100%;padding:11px;border:0;border-radius:8px;background:#22c55e;color:#04240f;font-weight:600;font-size:14px;cursor:pointer}
 code{color:#38bdf8}</style></head><body><form class="card" method="post" action="/oauth/authorize">
-<h1>Authorize connection</h1><p class="sub"><code>${esc(q.client_name || 'An MCP client')}</code> is requesting access to your OpenWA MCP tools.</p>
+<h1>Authorize connection</h1><p class="sub"><code>${esc(q.client_name || 'An MCP client')}</code>${q.client_host ? ` at <code>${esc(q.client_host)}</code>` : ''} is requesting access to your OpenWA MCP tools.</p>
 ${errHtml}<label for="k">Enter an OpenWA API key to approve</label>
 <input id="k" type="password" name="api_key" placeholder="owa_k1_… or your master key" autocomplete="off" required>
 ${hidden}<button type="submit">Approve</button></form></body></html>`;
+}
+
+const PAGE_CSS = `body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
+.card{background:#1e293b;padding:28px 32px;border-radius:12px;max-width:380px;width:100%;box-shadow:0 10px 40px rgba(0,0,0,.4)}
+.card.wide{max-width:920px;overflow-x:auto}h1{font-size:18px;margin:0 0 4px}p.sub{color:#94a3b8;font-size:13px;margin:0 0 20px}
+label{display:block;font-size:13px;margin:0 0 6px}
+input[type=password]{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#e2e8f0;font-size:14px}
+button{padding:9px 14px;border:0;border-radius:8px;background:#22c55e;color:#04240f;font-weight:600;font-size:13px;cursor:pointer}
+button.danger{background:#ef4444;color:#fff}.card>form>button{margin-top:18px;width:100%}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #334155}
+a{color:#38bdf8}code{color:#38bdf8}`;
+const pageShell = (title, inner, wide = false) => `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(title)} — OpenWA</title><style>${PAGE_CSS}</style></head><body><div class="card${wide ? ' wide' : ''}">${inner}</div></body></html>`;
+const errorHtml = error => (error ? `<p style="color:#c0392b;margin:0 0 12px">${esc(error)}</p>` : '');
+
+function connectionsLoginPage(error) {
+  return pageShell(
+    'Connections',
+    `<h1>Connections</h1><p class="sub">Enter an OpenWA API key to list and revoke the MCP connections it can manage.</p>
+${errorHtml(error)}<form method="post" action="/oauth/connections"><label for="k">OpenWA API key</label>
+<input id="k" type="password" name="api_key" autocomplete="off" required><button type="submit">Show connections</button></form>`,
+  );
+}
+
+function connectionsPage(rows, role, message) {
+  const body = rows
+    .map(
+      r => `<tr><td>${esc(r.name || '(unnamed)')}</td><td>${esc(r.host)}</td><td>${esc(r.created)}</td><td>${esc(r.lastUsed)}</td><td>${esc(r.status)}</td>
+<td>${r.revoked ? '' : `<form method="post" action="/oauth/connections/revoke"><input type="hidden" name="vtoken" value="${esc(r.vtoken)}"><button class="danger" type="submit">Revoke</button></form>`}</td></tr>`,
+    )
+    .join('\n');
+  const table = rows.length
+    ? `<table><thead><tr><th>Client</th><th>Host</th><th>Created</th><th>Last used</th><th>Status</th><th></th></tr></thead><tbody>
+${body}
+</tbody></table>`
+    : '<p class="sub">No connections.</p>';
+  return pageShell(
+    'Connections',
+    `<h1>Connections</h1><p class="sub">${role === 'admin' ? 'All connections (admin key).' : 'Connections approved with this key.'}</p>${message ? `<p>${esc(message)}</p>` : ''}${table}`,
+    true,
+  );
 }
 
 function looksLikeJwt(token) {
@@ -398,7 +440,32 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
       // form-action also governs the 302 the POST follows to the client's callback origin.
       'content-security-policy': `default-src 'self'; style-src 'unsafe-inline'; form-action 'self' ${origin}; base-uri 'none'; frame-ancestors 'none'`,
     });
-    res.end(consentPage({ ...q, client_name: client?.n }, error));
+    let client_host = '';
+    try {
+      client_host = new URL(q.redirect_uri).host;
+    } catch {}
+    res.end(consentPage({ ...q, client_name: client?.n, client_host }, error));
+  };
+  /** Self-contained HTML pages (connections view): never framed, never cached. */
+  const sendPage = (res, status, html) => {
+    res.writeHead(status, {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store',
+      'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    });
+    res.end(html);
+  };
+  /**
+   * CSRF / login-CSRF guard for the browser forms: Origin must be the issuer, or be absent with
+   * Sec-Fetch-Site: same-origin. Anything else (including `Origin: null`) is refused.
+   */
+  const sameOriginPost = req => {
+    const origin = req.headers.origin;
+    if (origin !== undefined) return origin === new URL(issuer).origin;
+    return req.headers['sec-fetch-site'] === 'same-origin';
+  };
+  const requireSameOrigin = req => {
+    if (!sameOriginPost(req)) throw new OAuthError('access_denied', 'Cross-site request refused', 403);
   };
   const fail = (res, e) => {
     if (e instanceof OAuthError) {
@@ -508,12 +575,59 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
     'POST /oauth/authorize': async (req, res) => {
       const b = await readBody(req);
       try {
+        requireSameOrigin(req);
         const location = await approve(b);
         log('authorize approved');
         res.writeHead(302, { location, 'cache-control': 'no-store' }).end();
       } catch (e) {
         if (!(e instanceof OAuthError) || e.status >= 500) throw e;
         sendConsent(res, b, e.status, e.description);
+      }
+    },
+    // Connections view: the key is typed into a form and POSTed, never put in a URL; it is not echoed back.
+    'GET /oauth/connections': (req, res) => sendPage(res, 200, connectionsLoginPage()),
+    'POST /oauth/connections': async (req, res) => {
+      const b = await readBody(req);
+      try {
+        requireSameOrigin(req);
+        const validated = await apiKeyIsValid(b.api_key);
+        if (!validated) throw new OAuthError('access_denied', 'Invalid OpenWA API key', 401);
+        const keyFp = crypto.createHash('sha256').update(b.api_key).digest('hex').slice(0, 16);
+        const iso = ms => (ms ? new Date(ms).toISOString() : 'never');
+        const rows = Object.entries(grants)
+          .filter(([, g]) => validated.role === 'admin' || g.keyFp === keyFp)
+          .sort(([, a], [, z]) => z.createdAt - a.createdAt)
+          .map(([gid, g]) => ({
+            name: g.clientName,
+            host: g.clientHost,
+            created: iso(g.createdAt),
+            lastUsed: iso(g.lastUsedAt),
+            status: g.revokedAt === undefined ? 'active' : `revoked ${iso(g.revokedAt)}`,
+            revoked: g.revokedAt !== undefined,
+            vtoken: seal('v', { keyFp, role: validated.role, gid, exp: now() + VIEW_TTL_MS }),
+          }));
+        sendPage(res, 200, connectionsPage(rows, validated.role));
+      } catch (e) {
+        if (!(e instanceof OAuthError) || e.status >= 500) throw e;
+        sendPage(res, e.status, connectionsLoginPage(e.description));
+      }
+    },
+    'POST /oauth/connections/revoke': async (req, res) => {
+      const b = await readBody(req);
+      try {
+        requireSameOrigin(req);
+        // The sealed token says which key listed the row and which grant the button belongs to. An admin
+        // token covers any grant; any other key's token only grants carrying its own fingerprint.
+        const v = unseal('v', b.vtoken);
+        const g = v && typeof v.gid === 'string' ? grants[v.gid] : undefined;
+        if (!g || (v.role !== 'admin' && v.keyFp !== g.keyFp)) {
+          throw new OAuthError('access_denied', 'Revoke link is invalid or expired — list the connections again', 403);
+        }
+        revokeGrant(v.gid);
+        sendPage(res, 200, pageShell('Connections', '<h1>Connection revoked</h1><p class="sub">Its tokens stop working at the next call.</p><p><a href="/oauth/connections">Back</a></p>'));
+      } catch (e) {
+        if (!(e instanceof OAuthError)) throw e;
+        sendPage(res, e.status, pageShell('Connections', `<h1>Not revoked</h1>${errorHtml(e.description)}<p><a href="/oauth/connections">Back</a></p>`));
       }
     },
     'POST /oauth/token': async (req, res) => {
