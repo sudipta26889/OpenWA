@@ -25,6 +25,12 @@ const MAX_BODY = 64 * 1024; // OAuth form/JSON bodies are tiny
 // The prefix tells our tokens apart from OpenWA keys (owa_…); it is also the AES-GCM AAD, so a sealed
 // blob of one kind can never be replayed as another (e.g. a client id as an access token).
 const PREFIX = { access: 'owga.', refresh: 'owgr.', code: 'owgc.', client: 'owgk.' };
+// Native-app redirect schemes DCR accepts besides https and http loopback. Any other custom scheme is refused.
+const CUSTOM_REDIRECT_SCHEMES = ['cursor', 'vscode'];
+const LOOPBACK_HOSTS = ['localhost', '127.0.0.1'];
+const LOOPBACK_ORIGIN = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+// Browser-side origins of hosted MCP connectors; matched exactly, never by suffix.
+const HOSTED_CLIENT_ORIGINS = ['https://claude.ai', 'https://chatgpt.com'];
 const AUTHORIZE_PARAMS = ['client_id', 'redirect_uri', 'response_type', 'code_challenge', 'code_challenge_method', 'state', 'scope', 'resource'];
 
 const log = (msg, extra = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), msg, ...extra }));
@@ -72,6 +78,19 @@ function looksLikeJwt(token) {
   if (parts.length !== 3) return false;
   try {
     return typeof JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8')).alg === 'string';
+  } catch {
+    return false;
+  }
+}
+
+/** RFC 8252: a registered http loopback URI matches any port; everything else is an exact match. */
+function redirectMatches(registered, given) {
+  if (registered === given) return true;
+  try {
+    const r = new URL(registered);
+    const g = new URL(given);
+    if (r.protocol !== 'http:' || !LOOPBACK_HOSTS.includes(r.hostname)) return false;
+    return g.protocol === r.protocol && g.hostname === r.hostname && g.pathname === r.pathname && g.search === r.search;
   } catch {
     return false;
   }
@@ -129,6 +148,12 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
     bearer_methods_supported: ['header'],
     resource_documentation: issuer,
   });
+  /** RFC 8707: a supplied resource must be this server's /mcp (trailing slash tolerated); omitting it is fine. */
+  const checkResource = r => {
+    if (r !== undefined && r !== '' && String(r).replace(/\/$/, '') !== resource) {
+      throw new OAuthError('invalid_target', `resource must be ${resource}`);
+    }
+  };
   const authorizationServerMetadata = () => ({
     issuer,
     authorization_endpoint: `${issuer}/oauth/authorize`,
@@ -139,13 +164,15 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
     code_challenge_methods_supported: ['S256'],
     token_endpoint_auth_methods_supported: ['none'],
     scopes_supported: [SCOPE],
+    authorization_response_iss_parameter_supported: true,
   });
 
   function registerClient(body) {
     const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris.map(String) : [];
     if (redirectUris.length === 0) throw new OAuthError('invalid_client_metadata', 'redirect_uris is required');
     for (const uri of redirectUris) {
-      if (!/^https:\/\//.test(uri) && !/^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(uri)) {
+      const custom = CUSTOM_REDIRECT_SCHEMES.some(s => uri.startsWith(`${s}://`));
+      if (!custom && !/^https:\/\//.test(uri) && !/^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(uri)) {
         throw new OAuthError('invalid_redirect_uri', `redirect_uri must be https (or http localhost): ${uri}`);
       }
     }
@@ -168,9 +195,10 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
   function validateAuthorizeParams(q) {
     const client = unseal('client', q.client_id);
     if (!client) throw new OAuthError('unauthorized_client', 'Unknown client_id');
-    if (!q.redirect_uri || !client.r.includes(q.redirect_uri)) {
+    if (!q.redirect_uri || !client.r.some(r => redirectMatches(r, q.redirect_uri))) {
       throw new OAuthError('invalid_request', 'redirect_uri does not match a registered value');
     }
+    checkResource(q.resource);
     if (q.response_type !== 'code') throw new OAuthError('unsupported_response_type', 'response_type must be code');
     if (!q.code_challenge) throw new OAuthError('invalid_request', 'PKCE code_challenge is required');
     if (q.code_challenge_method !== 'S256') throw new OAuthError('invalid_request', 'code_challenge_method must be S256');
@@ -204,6 +232,7 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
     const url = new URL(q.redirect_uri);
     url.searchParams.set('code', code);
     if (q.state) url.searchParams.set('state', q.state);
+    url.searchParams.set('iss', issuer); // RFC 9207
     return url.toString();
   }
 
@@ -218,13 +247,14 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
   }
 
   function token(b) {
+    if (b.grant_type === 'authorization_code' || b.grant_type === 'refresh_token') checkResource(b.resource);
     if (b.grant_type === 'authorization_code') {
       if (!b.code || !b.code_verifier || !b.redirect_uri || !b.client_id) {
         throw new OAuthError('invalid_request', 'code, code_verifier, redirect_uri, client_id are required');
       }
       const code = unseal('code', b.code);
       if (!code || usedCodes.has(code.jti)) throw new OAuthError('invalid_grant', 'Authorization code is invalid or expired');
-      if (code.c !== b.client_id || code.u !== b.redirect_uri) throw new OAuthError('invalid_grant', 'client_id / redirect_uri mismatch');
+      if (code.c !== b.client_id || !redirectMatches(code.u, b.redirect_uri)) throw new OAuthError('invalid_grant', 'client_id / redirect_uri mismatch');
       const challenge = crypto.createHash('sha256').update(b.code_verifier).digest('base64url');
       if (challenge.length !== code.ch.length || !crypto.timingSafeEqual(Buffer.from(challenge), Buffer.from(code.ch))) {
         throw new OAuthError('invalid_grant', 'PKCE verification failed');
@@ -282,7 +312,7 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
   };
   const unauthorized = (res, invalidToken) =>
     send(res, 401, { jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null }, {
-      'www-authenticate': `Bearer resource_metadata="${resourceMetadataUrl}"${invalidToken ? ', error="invalid_token"' : ''}`,
+      'www-authenticate': `Bearer resource_metadata="${resourceMetadataUrl}", scope="${SCOPE}"${invalidToken ? ', error="invalid_token"' : ''}`,
     });
 
   async function readBody(req) {
@@ -331,6 +361,17 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
 
   /** POST /mcp: swap our access token for the API key it carries; trigger the OAuth flow when missing. */
   function proxyMcp(req, res) {
+    // DNS-rebinding guard: a present Origin must be the issuer or a loopback origin. No Origin passes.
+    const origin = req.headers.origin;
+    if (
+      origin !== undefined &&
+      origin !== new URL(issuer).origin &&
+      !LOOPBACK_ORIGIN.test(origin) &&
+      !HOSTED_CLIENT_ORIGINS.includes(origin)
+    ) {
+      log('mcp origin refused', { origin: String(origin).slice(0, 200) });
+      return send(res, 403, { jsonrpc: '2.0', error: { code: -32000, message: 'Forbidden origin' }, id: null });
+    }
     const auth = req.headers.authorization;
     const bearer = typeof auth === 'string' && /^bearer /i.test(auth) ? auth.slice(7).trim() : undefined;
     if (!bearer && !req.headers['x-api-key']) return unauthorized(res, false);
