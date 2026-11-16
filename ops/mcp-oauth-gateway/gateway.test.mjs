@@ -4,6 +4,8 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import { Readable } from 'node:stream';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -325,8 +327,8 @@ test('DCR accepts cursor:// and vscode:// redirect URIs and refuses other custom
 const ISSUER = 'https://wa.example.test';
 const newStateDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'owg-'));
 /** A second (or third) gateway on the same stateDir simulates a restart. */
-async function startGateway({ stateDir = newStateDir(), now } = {}) {
-  const gw = createGateway({ issuer: ISSUER, upstream: `http://127.0.0.1:${upPort}`, stateDir, now });
+async function startGateway({ stateDir = newStateDir(), now, ...extra } = {}) {
+  const gw = createGateway({ issuer: ISSUER, upstream: `http://127.0.0.1:${upPort}`, stateDir, now, ...extra });
   const url = `http://127.0.0.1:${await listen(gw)}`;
   const stop = async () => {
     gw.closeAllConnections();
@@ -813,6 +815,380 @@ test('Connections: revoke refuses a foreign Origin, a missing Origin, a bad, exp
     t -= 5 * 60_000; // inside the TTL again: the same token works
     assert.equal((await revoke(token)).status, 200);
     assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 401);
+  } finally {
+    await g.stop();
+  }
+});
+
+// ---- phase 2: CIMD (client ID metadata documents) ----
+
+const PUBLIC_IP = '93.184.216.34';
+/**
+ * Stand-ins for dns.lookup and https.request, so no test touches the network. The fake request runs the
+ * `lookup` the gateway handed it (as Node's socket would) and "connects" to whatever address that returns.
+ */
+function cimdHarness() {
+  const docs = new Map(); // `${host}${path}` -> { status, headers, body | chunks, hold, never }
+  const h = {
+    docs,
+    answer: () => [{ address: PUBLIC_IP, family: 4 }], // what dns "resolves"; may change per call
+    lookups: 0,
+    requests: [], // every request that reached connect
+    connected: [], // the address each connection went to
+    pending: [], // responders for `hold` documents
+    useAll: true, // Node >= 20 calls lookup with { all: true }
+    add(url, doc) {
+      docs.set(url.replace('https://', ''), doc);
+      return url;
+    },
+  };
+  h.lookup = (host, opts, cb) => {
+    h.lookups++;
+    const list = h.answer(host, h.lookups);
+    if (list instanceof Error) return cb(list);
+    return opts?.all ? cb(null, list) : cb(null, list[0].address, list[0].family);
+  };
+  h.request = (opts, cb) => {
+    const req = new EventEmitter();
+    req.destroy = err => {
+      req.destroyed = true;
+      if (err) setImmediate(() => req.emit('error', err));
+    };
+    req.end = () => {
+      h.requests.push(`https://${opts.hostname}${opts.path}`);
+      const done = (err, address, family) => {
+        if (err) return setImmediate(() => req.emit('error', err));
+        const picked = h.useAll ? address[0].address : address;
+        h.connected.push(picked);
+        const doc = docs.get(`${opts.hostname}${opts.path}`) ?? { status: 404, body: {} };
+        const respond = () => {
+          if (req.destroyed) return;
+          const res = Readable.from(doc.chunks ?? [Buffer.from(JSON.stringify(doc.body))]);
+          res.statusCode = doc.status ?? 200;
+          res.headers = { 'content-type': 'application/json', ...doc.headers };
+          cb(res);
+        };
+        if (doc.hold) h.pending.push(respond);
+        else if (!doc.never) respond();
+      };
+      opts.lookup(opts.hostname, h.useAll ? { all: true } : {}, done);
+    };
+    return req;
+  };
+  return h;
+}
+const cimdGateway = (h, extra = {}) => startGateway({ cimdLookup: h.lookup, cimdRequest: h.request, ...extra });
+const CIMD_REDIRECT = 'https://cimd.example.test/cb';
+const cimdDoc = (url, extra = {}) => ({
+  client_id: url,
+  client_name: 'Cimd Client',
+  redirect_uris: [CIMD_REDIRECT],
+  token_endpoint_auth_method: 'none',
+  ...extra,
+});
+let cimdN = 0;
+const cimdUrl = () => `https://client.example.test/meta/${++cimdN}`;
+const cimdAuthorize = (b, clientId, redirect = CIMD_REDIRECT, challenge = pkce().challenge) =>
+  fetch(`${b}/oauth/authorize?${new URLSearchParams(authQuery(clientId, redirect, challenge))}`);
+
+test('CIMD: metadata advertises support, and a good document gives a consent page showing its name and URL host', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const meta = await (await fetch(`${g.base}/.well-known/oauth-authorization-server`)).json();
+    assert.equal(meta.client_id_metadata_document_supported, true);
+
+    const url = cimdUrl();
+    h.add(url, { body: cimdDoc(url, { client_name: 'Cimd <Client>' }) });
+    const res = await cimdAuthorize(g.base, url);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /<code>Cimd &lt;Client&gt;<\/code>/);
+    assert.match(html, /<code>client\.example\.test<\/code>/, 'the CIMD URL host, not the redirect host');
+    assert.deepEqual(h.connected, [PUBLIC_IP]);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: the full flow works with a URL client_id (authorize, token, /mcp, refresh) and records the client on the grant', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const url = cimdUrl();
+    h.add(url, { body: cimdDoc(url) });
+    const { verifier, challenge } = pkce();
+    const q = authQuery(url, CIMD_REDIRECT, challenge);
+    const approved = await rawPost(g.base, '/oauth/authorize', { ...q, api_key: GOOD_KEY }, { origin: ISSUER });
+    assert.equal(approved.status, 302);
+    const code = new URL(approved.headers.get('location')).searchParams.get('code');
+    const exchange = { grant_type: 'authorization_code', code, code_verifier: verifier, redirect_uri: CIMD_REDIRECT, client_id: url };
+    assert.equal((await formAt(g.base, '/oauth/token', { ...exchange, client_id: `${url}x` })).status, 400, 'another client_id');
+    const tok = await (await formAt(g.base, '/oauth/token', exchange)).json();
+    assert.equal((await mcpAt(g.base, tok.access_token)).status, 200);
+    const rt = await formAt(g.base, '/oauth/token', { grant_type: 'refresh_token', refresh_token: tok.refresh_token, client_id: url });
+    assert.equal(rt.status, 200);
+    const [grant] = Object.values(grantsOf(g.stateDir));
+    assert.equal(grant.clientName, 'Cimd Client');
+    assert.equal(grant.clientHost, 'client.example.test');
+    assert.equal(h.requests.length, 1, 'the document was fetched once and cached');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: a document may omit token_endpoint_auth_method, clips long names to 200 characters, and honours the loopback port rule', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const url = cimdUrl();
+    h.add(url, { body: { client_id: url, client_name: 'x'.repeat(300), client_uri: 'y'.repeat(300), redirect_uris: ['http://localhost/cb'] } });
+    const res = await cimdAuthorize(g.base, url, 'http://localhost:5555/cb');
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.ok(html.includes('x'.repeat(200)) && !html.includes('x'.repeat(201)));
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: documents that break the rules are refused', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const cases = {
+      'client_id differs from the URL': url => ({ body: cimdDoc(`${url}/other`) }),
+      'client_id missing': () => ({ body: { client_name: 'n', redirect_uris: [CIMD_REDIRECT] } }),
+      'redirect not listed': url => ({ body: cimdDoc(url, { redirect_uris: ['https://other.example.test/cb'] }) }),
+      'no redirect_uris': url => ({ body: cimdDoc(url, { redirect_uris: [] }) }),
+      'bad redirect scheme': url => ({ body: cimdDoc(url, { redirect_uris: ['myapp://cb'] }) }),
+      'client_secret_basic': url => ({ body: cimdDoc(url, { token_endpoint_auth_method: 'client_secret_basic' }) }),
+      'not JSON content-type': url => ({ headers: { 'content-type': 'text/html' }, body: cimdDoc(url) }),
+      'invalid JSON': () => ({ chunks: [Buffer.from('{nope')] }),
+      'JSON that is not an object': () => ({ body: ['x'] }),
+      '404': () => ({ status: 404, body: {} }),
+      '301 redirect': url => ({ status: 301, headers: { location: `${url}/moved` }, body: {} }),
+      '302 redirect': url => ({ status: 302, headers: { location: 'https://evil.example.test/x' }, body: cimdDoc(url) }),
+      // content-length claims 10 bytes, the stream sends 150 KB: the cap counts what arrives
+      'oversized streamed body': () => ({ headers: { 'content-length': '10' }, chunks: [Buffer.alloc(50_000, 97), Buffer.alloc(50_000, 97), Buffer.alloc(50_000, 97)] }),
+    };
+    for (const [name, make] of Object.entries(cases)) {
+      const url = cimdUrl();
+      h.add(url, make(url));
+      const res = await cimdAuthorize(g.base, url);
+      assert.equal(res.status, 400, name);
+      assert.ok(!(await res.text()).includes('Approve to'), name);
+    }
+    // and nothing was approvable: no grant exists
+    assert.equal(fs.existsSync(path.join(g.stateDir, 'grants.json')), false);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: URL rules are enforced before any lookup or connection', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const bad = [
+      'http://client.example.test/meta/1', // not https
+      'https://client.example.test:8443/meta/1',
+      'https://user@client.example.test/meta/1',
+      'https://user:pw@client.example.test/meta/1',
+      'https://client.example.test/meta/1#frag',
+      'https://client.example.test/meta/1#',
+      'https://client.example.test/a/../meta/1',
+      'https://client.example.test/a/./meta/1',
+      'https://client.example.test/%2e%2e/meta/1',
+      'https://client.example.test/%2E/meta/1',
+      'https://client.example.test',
+      'https://client.example.test/',
+      'https://client.example.test/?x=1',
+      'https://127.0.0.1/meta/1', // an IP literal skips the custom lookup, so it is refused outright
+      'https://[::1]/meta/1',
+      'https://2130706433/meta/1',
+      'https://[::ffff:127.0.0.1]/meta/1',
+    ];
+    for (const url of bad) {
+      const res = await cimdAuthorize(g.base, url);
+      assert.equal(res.status, 400, url);
+    }
+    assert.equal(h.lookups, 0, 'no DNS lookup');
+    assert.deepEqual(h.requests, [], 'no connection');
+
+    // the same rules at the token endpoint
+    const t = await formAt(g.base, '/oauth/token', { grant_type: 'refresh_token', refresh_token: 'owgr.x', client_id: 'https://user@client.example.test/meta/1' });
+    assert.equal(t.status, 400);
+    assert.equal((await t.json()).error, 'invalid_client');
+    assert.equal(h.lookups, 0);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: a host resolving to a private, loopback, mapped or NAT64 address is refused, and so is a mixed answer', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const blocked = [
+      '10.0.0.1', '172.16.0.1', '192.168.1.1', '127.0.0.1', '0.0.0.0', '169.254.169.254', '100.64.0.1', '224.0.0.1',
+      '::', '::1', 'fc00::1', 'fd12:3456::1', 'fe80::1', 'ff02::1',
+      '::ffff:127.0.0.1', '::ffff:10.0.0.1', '::ffff:7f00:1', '::ffff:a00:1',
+      '64:ff9b::a00:1', '64:ff9b::7f00:1',
+    ];
+    for (const address of blocked) {
+      const url = h.add(cimdUrl(), {});
+      h.add(url, { body: cimdDoc(url) });
+      h.answer = () => [{ address, family: address.includes(':') ? 6 : 4 }];
+      const res = await cimdAuthorize(g.base, url);
+      assert.equal(res.status, 400, address);
+    }
+    assert.deepEqual(h.connected, [], 'no connection was ever made to a blocked address');
+
+    // ANY blocked address in the answer refuses the whole name
+    const mixed = h.add(cimdUrl(), {});
+    h.add(mixed, { body: cimdDoc(mixed) });
+    h.answer = () => [{ address: PUBLIC_IP, family: 4 }, { address: '10.0.0.1', family: 4 }];
+    assert.equal((await cimdAuthorize(g.base, mixed)).status, 400);
+    assert.deepEqual(h.connected, []);
+
+    // a public address, including a mapped public v4, is fine; a failing lookup is refused
+    const ok = h.add(cimdUrl(), {});
+    h.add(ok, { body: cimdDoc(ok) });
+    h.answer = () => [{ address: '::ffff:5db8:d822', family: 6 }]; // ::ffff:93.184.216.34
+    assert.equal((await cimdAuthorize(g.base, ok)).status, 200);
+    const nx = cimdUrl();
+    h.answer = () => Object.assign(new Error('ENOTFOUND'), { code: 'ENOTFOUND' });
+    assert.equal((await cimdAuthorize(g.base, nx)).status, 400);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: the connection goes to the address the checked lookup returned (no DNS-rebinding gap)', async () => {
+  for (const useAll of [true, false]) {
+    const h = cimdHarness();
+    h.useAll = useAll;
+    const g = await cimdGateway(h);
+    try {
+      const url = h.add(cimdUrl(), {});
+      h.add(url, { body: cimdDoc(url) });
+      // The first answer is public; any later resolution would be loopback. A gap between "check" and
+      // "connect" (checking one lookup, connecting through another) would reach 127.0.0.1.
+      h.answer = (host, call) => (call === 1 ? [{ address: PUBLIC_IP, family: 4 }] : [{ address: '127.0.0.1', family: 4 }]);
+      assert.equal((await cimdAuthorize(g.base, url)).status, 200);
+      assert.deepEqual(h.connected, [PUBLIC_IP], `useAll=${useAll}`);
+      assert.equal(h.lookups, 1, 'resolved once');
+      assert.ok(h.requests[0].startsWith('https://client.example.test/'), 'the request keeps the real hostname for SNI and Host');
+    } finally {
+      await g.stop();
+    }
+  }
+});
+
+test('CIMD: a document is cached for 10 minutes, and a failure for 2 minutes', async () => {
+  let t = 20_000_000;
+  const h = cimdHarness();
+  const g = await cimdGateway(h, { now: () => t });
+  try {
+    const good = h.add(cimdUrl(), {});
+    h.add(good, { body: cimdDoc(good) });
+    const gone = h.add(cimdUrl(), { status: 404, body: {} });
+
+    assert.equal((await cimdAuthorize(g.base, good)).status, 200);
+    assert.equal((await cimdAuthorize(g.base, good)).status, 200);
+    assert.equal(h.requests.filter(u => u === good).length, 1, 'repeat served from cache');
+    assert.equal((await cimdAuthorize(g.base, gone)).status, 400);
+    assert.equal((await cimdAuthorize(g.base, gone)).status, 400);
+    assert.equal(h.requests.filter(u => u === gone).length, 1, 'the failure is cached too');
+
+    // the document appears after the failure; the negative cache still answers until 2 minutes pass
+    h.add(gone, { body: cimdDoc(gone) });
+    t += 119_000;
+    assert.equal((await cimdAuthorize(g.base, gone)).status, 400);
+    t += 2_000;
+    assert.equal((await cimdAuthorize(g.base, gone)).status, 200, 'fetched again after 2 minutes');
+    assert.equal(h.requests.filter(u => u === gone).length, 2);
+
+    t += 8 * 60_000; // 10 minutes after the first fetch of `good`
+    assert.equal((await cimdAuthorize(g.base, good)).status, 200);
+    assert.equal(h.requests.filter(u => u === good).length, 2, 'refetched after 10 minutes');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: at most 4 fetches run at once; the 5th is refused with 503 and not cached', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const urls = Array.from({ length: 5 }, () => h.add(cimdUrl(), {}));
+    for (const u of urls) h.add(u, { hold: true, body: cimdDoc(u) });
+    const running = urls.slice(0, 4).map(u => cimdAuthorize(g.base, u));
+    while (h.pending.length < 4) await new Promise(r => setImmediate(r));
+
+    const fifth = await cimdAuthorize(g.base, urls[4]);
+    assert.equal(fifth.status, 503);
+    assert.match(await fifth.text(), /temporar|try again/i);
+    assert.equal(h.requests.length, 4);
+
+    // the same URL asked again while it is in flight shares that fetch instead of using a slot
+    const shared = cimdAuthorize(g.base, urls[0]);
+    for (const release of h.pending.splice(0)) release();
+    assert.deepEqual((await Promise.all(running)).map(r => r.status), [200, 200, 200, 200]);
+    assert.equal((await shared).status, 200);
+    assert.equal(h.requests.length, 4, 'no extra fetch for the shared URL');
+
+    // slots are free again, and the refused URL was not cached as a failure
+    h.docs.get(urls[4].replace('https://', '')).hold = false;
+    assert.equal((await cimdAuthorize(g.base, urls[4])).status, 200);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: a server that never answers is cut off at the timeout and the slot is freed', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h, { cimdTimeoutMs: 40 });
+  try {
+    const url = h.add(cimdUrl(), { never: true });
+    const res = await cimdAuthorize(g.base, url);
+    assert.equal(res.status, 400);
+    const ok = h.add(cimdUrl(), {});
+    h.add(ok, { body: cimdDoc(ok) });
+    assert.equal((await cimdAuthorize(g.base, ok)).status, 200);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: DCR clients keep working beside CIMD ones', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const c = await connect(g.base, { name: 'Dcr Client' });
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200);
+    assert.deepEqual(h.requests, [], 'a sealed DCR id never triggers a fetch');
+    assert.equal((await cimdAuthorize(g.base, 'owgk.garbage')).status, 400);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: the document cache is bounded, so the oldest entry is evicted and fetched again', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const first = cimdUrl();
+    h.add(first, { body: cimdDoc(first) });
+    assert.equal((await cimdAuthorize(g.base, first)).status, 200);
+    for (let i = 0; i < 256; i++) {
+      const u = cimdUrl();
+      h.add(u, { body: cimdDoc(u) });
+      assert.equal((await cimdAuthorize(g.base, u)).status, 200);
+    }
+    assert.equal((await cimdAuthorize(g.base, first)).status, 200);
+    assert.equal(h.requests.filter(u => u === first).length, 2, 'evicted, then fetched again');
   } finally {
     await g.stop();
   }

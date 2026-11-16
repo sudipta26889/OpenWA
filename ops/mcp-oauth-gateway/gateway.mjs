@@ -11,7 +11,9 @@
 // keyed by the `gid` every code and token carries). It holds code use, the current refresh jti and
 // revocation, so reuse, replay and /oauth/revoke can cut a connection off. One process only.
 // Zero dependencies: Node 22 built-ins only.
+import dns from 'node:dns';
 import http from 'node:http';
+import https from 'node:https';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -36,6 +38,11 @@ const LOOPBACK_HOSTS = ['localhost', '127.0.0.1'];
 const LOOPBACK_ORIGIN = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
 // Browser-side origins of hosted MCP connectors; matched exactly, never by suffix.
 const HOSTED_CLIENT_ORIGINS = ['https://claude.ai', 'https://chatgpt.com'];
+const CIMD_MAX_BYTES = 64 * 1024; // a client metadata document is tiny
+const CIMD_MAX_INFLIGHT = 4;
+const CIMD_OK_TTL_MS = 600_000; // 10m
+const CIMD_FAIL_TTL_MS = 120_000; // 2m
+const CIMD_CACHE_MAX = 256;
 const AUTHORIZE_PARAMS = ['client_id', 'redirect_uri', 'response_type', 'code_challenge', 'code_challenge_method', 'state', 'scope', 'resource'];
 
 const log = (msg, extra = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), msg, ...extra }));
@@ -142,6 +149,51 @@ function redirectMatches(registered, given) {
   }
 }
 
+// Addresses a CIMD fetch may never connect to (SSRF guard). A host is refused when ANY address it resolves
+// to is in here. IPv4-mapped IPv6 addresses are checked as the IPv4 address they carry.
+const BLOCKED = new net.BlockList();
+for (const [addr, prefix] of [
+  ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12],
+  ['192.0.0.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['224.0.0.0', 4], ['240.0.0.0', 4],
+]) BLOCKED.addSubnet(addr, prefix, 'ipv4');
+for (const [addr, prefix] of [['::', 96], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8], ['64:ff9b::', 96], ['2002::', 16]]) {
+  BLOCKED.addSubnet(addr, prefix, 'ipv6');
+}
+
+/** Expand an IPv6 text address to its 8 hextets, or null when it is malformed. */
+function ipv6Hextets(text) {
+  let a = text;
+  const tail4 = /^(.*:)(\d+\.\d+\.\d+\.\d+)$/.exec(a);
+  if (tail4) {
+    const p = tail4[2].split('.').map(Number);
+    a = `${tail4[1]}${((p[0] << 8) | p[1]).toString(16)}:${((p[2] << 8) | p[3]).toString(16)}`;
+  }
+  const [head, rest, extra] = a.split('::');
+  if (extra !== undefined) return null;
+  const h = head ? head.split(':') : [];
+  let parts = h;
+  if (rest !== undefined) {
+    const t = rest ? rest.split(':') : [];
+    const fill = 8 - h.length - t.length;
+    if (fill < 1) return null;
+    parts = [...h, ...Array(fill).fill('0'), ...t];
+  }
+  if (parts.length !== 8 || parts.some(x => !/^[0-9a-f]{1,4}$/i.test(x))) return null;
+  return parts.map(x => parseInt(x, 16));
+}
+
+function isBlockedAddress(address) {
+  let a = String(address).toLowerCase();
+  const family = net.isIP(a);
+  if (!family) return true; // not an address: refuse
+  if (family === 6) {
+    const h = ipv6Hextets(a);
+    if (!h) return true;
+    if (h.slice(0, 5).every(x => x === 0) && h[5] === 0xffff) a = `${h[6] >> 8}.${h[6] & 255}.${h[7] >> 8}.${h[7] & 255}`;
+  }
+  return BLOCKED.check(a, net.isIP(a) === 4 ? 'ipv4' : 'ipv6');
+}
+
 class OAuthError extends Error {
   constructor(error, description, status = 400) {
     super(`${error}: ${description}`);
@@ -149,7 +201,15 @@ class OAuthError extends Error {
   }
 }
 
-export function createGateway({ issuer, upstream, stateDir, now = () => Date.now() }) {
+export function createGateway({
+  issuer,
+  upstream,
+  stateDir,
+  now = () => Date.now(),
+  cimdLookup = dns.lookup, // injectable so tests never touch the network
+  cimdRequest = https.request,
+  cimdTimeoutMs = 5000,
+}) {
   issuer = issuer.replace(/\/$/, '');
   const resource = `${issuer}/mcp`;
   const resourceMetadataUrl = `${issuer}/.well-known/oauth-protected-resource`;
@@ -243,17 +303,22 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
     authorization_response_iss_parameter_supported: true,
     revocation_endpoint: `${issuer}/oauth/revoke`,
     revocation_endpoint_auth_methods_supported: ['none'],
+    client_id_metadata_document_supported: true,
   });
 
-  function registerClient(body) {
-    const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris.map(String) : [];
-    if (redirectUris.length === 0) throw new OAuthError('invalid_client_metadata', 'redirect_uris is required');
+  function checkRedirectUris(redirectUris) {
     for (const uri of redirectUris) {
       const custom = CUSTOM_REDIRECT_SCHEMES.some(s => uri.startsWith(`${s}://`));
       if (!custom && !/^https:\/\//.test(uri) && !/^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(uri)) {
         throw new OAuthError('invalid_redirect_uri', `redirect_uri must be https (or http localhost): ${uri}`);
       }
     }
+  }
+
+  function registerClient(body) {
+    const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris.map(String) : [];
+    if (redirectUris.length === 0) throw new OAuthError('invalid_client_metadata', 'redirect_uris is required');
+    checkRedirectUris(redirectUris);
     const name = typeof body.client_name === 'string' ? body.client_name.slice(0, 200) : null;
     // Stateless client: the id IS the sealed registration, so nothing is stored.
     const clientId = seal('client', { r: redirectUris, n: name });
@@ -270,10 +335,196 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
     };
   }
 
-  function validateAuthorizeParams(q) {
-    const client = unseal('client', q.client_id);
-    if (!client) throw new OAuthError('unauthorized_client', 'Unknown client_id');
-    if (!q.redirect_uri || !client.r.some(r => redirectMatches(r, q.redirect_uri))) {
+  // ---- CIMD: an https URL as client_id points at a client metadata document ----
+
+  const hostOf = uri => {
+    try {
+      return new URL(uri).host;
+    } catch {
+      return '';
+    }
+  };
+
+  /** The URL rules of the design (§2). Returns the parsed URL or throws `invalid_client`. */
+  function parseCimdUrl(id) {
+    const refuse = why => new OAuthError('invalid_client', `client_id URL refused: ${why}`);
+    if (typeof id !== 'string' || id.length > 2048 || /[\\\s\x00-\x1f]/.test(id)) throw refuse('malformed');
+    const m = /^https:\/\/([^/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/i.exec(id);
+    if (!m) throw refuse('not an https URL');
+    const [, authority, pathPart, , fragment] = m;
+    if (fragment !== undefined) throw refuse('a fragment is not allowed');
+    if (authority.includes('@')) throw refuse('userinfo is not allowed');
+    if (pathPart === '' || pathPart === '/') throw refuse('the path must not be empty');
+    for (const seg of pathPart.split('/')) {
+      let decoded;
+      try {
+        decoded = decodeURIComponent(seg);
+      } catch {
+        throw refuse('malformed path');
+      }
+      if (decoded === '.' || decoded === '..') throw refuse('dot segments are not allowed');
+    }
+    let u;
+    try {
+      u = new URL(id);
+    } catch {
+      throw refuse('malformed');
+    }
+    if (u.port !== '') throw refuse('only port 443 is allowed');
+    // An IP literal skips the custom lookup (and so the block list); refuse it outright.
+    if (!u.hostname || u.hostname.startsWith('[') || net.isIP(u.hostname)) throw refuse('the host must be a name');
+    return u;
+  }
+
+  /** dns.lookup with the block list applied to every address, handing the checked address to the socket. */
+  const safeLookup = (hostname, options, cb) => {
+    if (typeof options === 'function') [options, cb] = [{}, options];
+    cimdLookup(hostname, { all: true }, (err, addrs) => {
+      if (err) return cb(err);
+      if (!Array.isArray(addrs) || addrs.length === 0) return cb(new Error('no address'));
+      if (addrs.some(a => isBlockedAddress(a.address))) return cb(Object.assign(new Error('blocked address'), { code: 'EBLOCKED' }));
+      if (options?.all) return cb(null, addrs);
+      cb(null, addrs[0].address, addrs[0].family);
+    });
+  };
+
+  function fetchCimdDocument(u) {
+    return new Promise((resolve, reject) => {
+      let req;
+      let settled = false;
+      const timer = setTimeout(() => fail('the document timed out'), cimdTimeoutMs);
+      const fail = why => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        req?.destroy();
+        reject(new OAuthError('invalid_client', `client metadata document: ${why}`));
+      };
+      req = cimdRequest(
+        {
+          protocol: 'https:',
+          hostname: u.hostname,
+          port: 443,
+          path: u.pathname + u.search,
+          method: 'GET',
+          headers: { accept: 'application/json' },
+          lookup: safeLookup,
+          agent: false,
+        },
+        res => {
+          const status = res.statusCode ?? 0;
+          if (status !== 200) {
+            res.destroy();
+            return fail(status >= 300 && status < 400 ? 'redirects are refused' : `HTTP ${status}`);
+          }
+          if (!/^application\/(?:[\w.+-]+\+)?json\s*(;|$)/i.test(String(res.headers['content-type'] ?? ''))) {
+            res.destroy();
+            return fail('not JSON');
+          }
+          const chunks = [];
+          let size = 0;
+          res.on('data', c => {
+            size += c.length; // counted as it streams: content-length is not trusted
+            if (size > CIMD_MAX_BYTES) {
+              res.destroy();
+              return fail('too large');
+            }
+            chunks.push(c);
+          });
+          res.on('end', () => {
+            if (settled) return;
+            try {
+              const doc = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+              settled = true;
+              clearTimeout(timer);
+              resolve(doc);
+            } catch {
+              fail('not valid JSON');
+            }
+          });
+          res.on('error', () => fail('read error'));
+          res.on('close', () => fail('truncated'));
+        },
+      );
+      req.on('error', e => fail(e?.code === 'EBLOCKED' ? 'the host resolves to a blocked address' : 'could not be fetched'));
+      req.end();
+    });
+  }
+
+  /** Turn a fetched document into `{ name, host, redirectUris }`, or throw `invalid_client`. */
+  function cimdClientFrom(id, u, doc) {
+    const refuse = why => new OAuthError('invalid_client', `client metadata document: ${why}`);
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) throw refuse('not a JSON object');
+    if (doc.client_id !== id) throw refuse('client_id does not match its URL');
+    const uris = doc.redirect_uris;
+    if (!Array.isArray(uris) || uris.length === 0 || !uris.every(x => typeof x === 'string')) throw refuse('redirect_uris is required');
+    try {
+      checkRedirectUris(uris);
+    } catch (e) {
+      throw refuse(e.description);
+    }
+    if (doc.token_endpoint_auth_method !== undefined && doc.token_endpoint_auth_method !== 'none') {
+      throw refuse('token_endpoint_auth_method must be none');
+    }
+    const clip = v => (typeof v === 'string' && v.trim() ? v.slice(0, 200) : null);
+    return { name: clip(doc.client_name), uri: clip(doc.client_uri), host: u.host, redirectUris: uris };
+  }
+
+  const cimdCache = new Map(); // url -> { exp, promise }; a failure is cached too (shorter)
+  let cimdActive = 0;
+
+  function loadCimdClient(id) {
+    const u = parseCimdUrl(id);
+    const hit = cimdCache.get(id);
+    if (hit && hit.exp > now()) return hit.promise; // also joins a fetch that is still in flight
+    if (cimdActive >= CIMD_MAX_INFLIGHT) {
+      throw new OAuthError('temporarily_unavailable', 'Too many client metadata fetches are running, try again shortly', 503);
+    }
+    cimdCache.delete(id);
+    // Bounded: the URL is attacker-chosen (an unauthenticated GET). Drop expired entries, then the oldest
+    // settled one; entries still in flight are never evicted.
+    if (cimdCache.size >= CIMD_CACHE_MAX) {
+      for (const [k, v] of cimdCache) if (v.exp <= now()) cimdCache.delete(k);
+    }
+    if (cimdCache.size >= CIMD_CACHE_MAX) {
+      for (const [k, v] of cimdCache) {
+        if (v.exp !== Infinity) {
+          cimdCache.delete(k);
+          break;
+        }
+      }
+    }
+    cimdActive++;
+    const entry = { exp: Infinity };
+    entry.promise = fetchCimdDocument(u)
+      .then(doc => cimdClientFrom(id, u, doc))
+      .then(
+        client => {
+          entry.exp = now() + CIMD_OK_TTL_MS;
+          return client;
+        },
+        e => {
+          entry.exp = now() + CIMD_FAIL_TTL_MS;
+          log('client metadata refused', { host: u.host, reason: e instanceof OAuthError ? e.description : String(e) });
+          throw e instanceof OAuthError ? e : new OAuthError('invalid_client', 'client metadata document could not be used');
+        },
+      )
+      .finally(() => cimdActive--);
+    cimdCache.set(id, entry);
+    return entry.promise;
+  }
+
+  /** The client behind a client_id: a CIMD document (https URL) or a sealed DCR registration. */
+  async function resolveClient(clientId, redirectUri) {
+    if (typeof clientId === 'string' && clientId.startsWith('https://')) return loadCimdClient(clientId);
+    const c = unseal('client', clientId);
+    if (!c) throw new OAuthError('unauthorized_client', 'Unknown client_id');
+    return { name: c.n ?? null, host: hostOf(redirectUri), redirectUris: c.r };
+  }
+
+  async function validateAuthorizeParams(q) {
+    const client = await resolveClient(q.client_id, q.redirect_uri);
+    if (!q.redirect_uri || !client.redirectUris.some(r => redirectMatches(r, q.redirect_uri))) {
       throw new OAuthError('invalid_request', 'redirect_uri does not match a registered value');
     }
     checkResource(q.resource);
@@ -301,14 +552,14 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
   }
 
   async function approve(q) {
-    const client = validateAuthorizeParams(q);
+    const client = await validateAuthorizeParams(q);
     const validated = await apiKeyIsValid(q.api_key);
     if (!validated) throw new OAuthError('access_denied', 'Invalid OpenWA API key', 401);
     const gid = crypto.randomUUID();
     const codeJti = crypto.randomUUID();
     grants[gid] = {
-      clientName: client.n ?? null,
-      clientHost: new URL(q.redirect_uri).host,
+      clientName: client.name ?? null,
+      clientHost: client.host,
       keyFp: crypto.createHash('sha256').update(q.api_key).digest('hex').slice(0, 16),
       keyRole: validated.role,
       createdAt: now(),
@@ -385,7 +636,11 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
   }
 
   async function token(b) {
-    if (b.grant_type === 'authorization_code' || b.grant_type === 'refresh_token') checkResource(b.resource);
+    if (b.grant_type === 'authorization_code' || b.grant_type === 'refresh_token') {
+      checkResource(b.resource);
+      // A URL client_id must still obey the URL rules. No fetch: the document was checked when the code was issued.
+      if (typeof b.client_id === 'string' && b.client_id.startsWith('https://')) parseCimdUrl(b.client_id);
+    }
     if (b.grant_type === 'authorization_code') {
       if (!b.code || !b.code_verifier || !b.redirect_uri || !b.client_id) {
         throw new OAuthError('invalid_request', 'code, code_verifier, redirect_uri, client_id are required');
@@ -428,23 +683,23 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
     });
     res.end(JSON.stringify(body));
   };
-  const sendConsent = (res, q, status, error) => {
+  const sendConsent = async (res, q, status, error) => {
     let origin = 'https:';
     try {
       origin = new URL(q.redirect_uri).origin;
     } catch {}
-    const client = unseal('client', q.client_id);
+    let client = null;
+    try {
+      client = await resolveClient(q.client_id, q.redirect_uri); // a cache hit when validation just ran
+    } catch {}
     res.writeHead(status, {
       'content-type': 'text/html; charset=utf-8',
       'cache-control': 'no-store',
       // form-action also governs the 302 the POST follows to the client's callback origin.
       'content-security-policy': `default-src 'self'; style-src 'unsafe-inline'; form-action 'self' ${origin}; base-uri 'none'; frame-ancestors 'none'`,
     });
-    let client_host = '';
-    try {
-      client_host = new URL(q.redirect_uri).host;
-    } catch {}
-    res.end(consentPage({ ...q, client_name: client?.n, client_host }, error));
+    const client_host = client?.host ?? hostOf(String(q.client_id).startsWith('https://') ? q.client_id : q.redirect_uri);
+    res.end(consentPage({ ...q, client_name: client?.name, client_host }, error));
   };
   /** Self-contained HTML pages (connections view): never framed, never cached. */
   const sendPage = (res, status, html) => {
@@ -562,14 +817,14 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
     'GET /.well-known/oauth-authorization-server': (req, res) => send(res, 200, authorizationServerMetadata()),
     'GET /.well-known/oauth-authorization-server/mcp': (req, res) => send(res, 200, authorizationServerMetadata()),
     'POST /oauth/register': async (req, res) => send(res, 201, registerClient(await readBody(req))),
-    'GET /oauth/authorize': (req, res) => {
+    'GET /oauth/authorize': async (req, res) => {
       const q = Object.fromEntries(new URL(req.url, issuer).searchParams);
       try {
-        validateAuthorizeParams(q);
-        sendConsent(res, q, 200);
+        await validateAuthorizeParams(q);
+        await sendConsent(res, q, 200);
       } catch (e) {
         if (!(e instanceof OAuthError)) throw e;
-        sendConsent(res, q, e.status, e.description);
+        await sendConsent(res, q, e.status, e.description);
       }
     },
     'POST /oauth/authorize': async (req, res) => {
@@ -581,7 +836,7 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
         res.writeHead(302, { location, 'cache-control': 'no-store' }).end();
       } catch (e) {
         if (!(e instanceof OAuthError) || e.status >= 500) throw e;
-        sendConsent(res, b, e.status, e.description);
+        await sendConsent(res, b, e.status, e.description);
       }
     },
     // Connections view: the key is typed into a form and POSTed, never put in a URL; it is not echoed back.

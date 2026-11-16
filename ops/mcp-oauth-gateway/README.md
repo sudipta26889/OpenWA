@@ -46,6 +46,28 @@ client ──► :2785 mcp-oauth-gateway ──► openwa-api:2785 (not publishe
 5. **RFC 8252:** a registered `http://localhost` / `http://127.0.0.1` redirect URI matches any port (scheme, host, path, query equal), at authorize and at the token step; all other URIs are exact.
 6. **DCR schemes:** `cursor://` and `vscode://` redirect URIs are accepted (`CUSTOM_REDIRECT_SCHEMES` in `gateway.mjs`); other custom schemes are refused.
 
+## CIMD (client ID metadata documents)
+
+An `https://` URL as `client_id` (at `/oauth/authorize`, GET and POST, and the token endpoint) is a pointer to
+a JSON document describing the client; AS metadata sets `client_id_metadata_document_supported: true`.
+Sealed DCR ids (`owgk.…`) keep working unchanged.
+
+- **URL rules:** https, port 443 only; no userinfo, fragment, dot segments (also percent-encoded), or empty
+  path; an IP-literal host is refused (it would skip the address check). At the token endpoint the same URL
+  rules apply, with no fetch.
+- **Fetch:** `https.request` with a `lookup` that resolves the host, refuses it if ANY address is blocked
+  (loopback, `0.0.0.0/8`, RFC 1918, CGNAT, link-local, multicast, reserved, `::/96`, ULA, link-local v6,
+  `64:ff9b::/96`, 6to4; IPv4-mapped v6 is checked as the IPv4 address) and hands back the checked address, so
+  the connection goes to what was checked. No redirects (any 3xx fails), 5 s timeout, body aborted at 64 KB as it
+  streams, `content-type` must be JSON.
+- **Document:** `client_id` equals the URL; the requested redirect URI must be in `redirect_uris` (same rules
+  as DCR, with the loopback-port rule); `token_endpoint_auth_method` is `none` or absent; `client_name` and
+  `client_uri` are clipped to 200 characters. The consent page and the grant show the URL's host.
+- **Limits:** at most 4 fetches at once (the next gets 503 `temporarily_unavailable`, not cached; the same
+  URL joins a fetch already running). A document is cached 10 min, a failure 2 min, at most 256 URLs.
+- **Tests:** `createGateway({ cimdLookup, cimdRequest, cimdTimeoutMs })` replaces `dns.lookup`,
+  `https.request` and the timeout, so no test touches the network.
+
 ## Connections
 
 `GET /oauth/connections` shows a form; the operator types an OpenWA API key, which is POSTed (never in a
