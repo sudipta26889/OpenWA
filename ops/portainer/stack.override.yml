@@ -11,6 +11,10 @@ services:
   openwa-api:
     build: !reset null
     image: ghcr.io/sudipta26889/openwa-api:latest
+    environment:
+      # Pinned in git, not left to the Portainer Stack Env: OpenWA's Redis ACL user may use DB 0 only, and
+      # the cache otherwise selects DB 1 (NOPERM), which shows Redis "Disconnected" on the dashboard.
+      - REDIS_CACHE_DB=0
     depends_on: !override
       docker-proxy:
         condition: service_started
