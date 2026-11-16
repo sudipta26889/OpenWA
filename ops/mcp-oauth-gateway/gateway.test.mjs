@@ -1,4 +1,4 @@
-// Run: node --test ops/mcp-oauth-gateway/
+// Run: node --test ops/mcp-oauth-gateway/*.test.mjs
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -10,17 +10,25 @@ import path from 'node:path';
 import { createGateway } from './gateway.mjs';
 
 const GOOD_KEY = 'owa_k1_good';
-let upstream, gateway, base, seen;
+const VIEWER_KEY = 'owa_k1_viewer';
+const ROLES = { [GOOD_KEY]: 'admin', [VIEWER_KEY]: 'viewer' };
+const liveKeys = new Set([GOOD_KEY, VIEWER_KEY]); // a test deletes a key here to "revoke it upstream"
+let validateDelayMs = 0; // a test raises it to make concurrent requests overlap
+let upstream, upPort, gateway, base, seen;
 
 const listen = srv => new Promise(r => srv.listen(0, '127.0.0.1', () => r(srv.address().port)));
 
 before(async () => {
-  // Fake OpenWA: validates GOOD_KEY, records what /mcp received, echoes a WebSocket-ish upgrade.
+  // Fake OpenWA: validates keys (with a role), records what /mcp received, echoes a WebSocket-ish upgrade.
   upstream = http.createServer((req, res) => {
     if (req.url === '/api/auth/validate') {
-      const ok = req.headers['x-api-key'] === GOOD_KEY;
-      res.writeHead(ok ? 200 : 401, { 'content-type': 'application/json' });
-      return res.end(JSON.stringify(ok ? { valid: true } : { message: 'Invalid API key' }));
+      const key = req.headers['x-api-key'];
+      const ok = liveKeys.has(key);
+      const answer = () => {
+        res.writeHead(ok ? 200 : 401, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(ok ? { valid: true, role: ROLES[key] ?? 'operator' } : { message: 'Invalid API key' }));
+      };
+      return validateDelayMs ? setTimeout(answer, validateDelayMs) : answer();
     }
     seen = { url: req.url, method: req.method, headers: req.headers };
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -30,7 +38,7 @@ before(async () => {
     seen = { url: req.url, headers: req.headers };
     socket.end('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\npong');
   });
-  const upPort = await listen(upstream);
+  upPort = await listen(upstream);
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owg-'));
   gateway = createGateway({ issuer: 'https://wa.example.test', upstream: `http://127.0.0.1:${upPort}`, stateDir });
   base = `http://127.0.0.1:${await listen(gateway)}`;
@@ -89,7 +97,6 @@ test('full OAuth flow: register → consent → code → token → /mcp with the
   assert.equal((await form('/oauth/token', { ...exchange, code_verifier: 'nope' })).status, 400, 'PKCE enforced');
   const tok = await (await form('/oauth/token', exchange)).json();
   assert.ok(tok.access_token.startsWith('owga.'));
-  assert.equal((await form('/oauth/token', exchange)).status, 400, 'a code is single-use');
 
   const mcp = await fetch(`${base}/mcp`, { method: 'POST', headers: { authorization: `Bearer ${tok.access_token}` }, body: '{}' });
   assert.equal(mcp.status, 200);
@@ -99,7 +106,13 @@ test('full OAuth flow: register → consent → code → token → /mcp with the
   const refresh = { grant_type: 'refresh_token', refresh_token: tok.refresh_token, client_id };
   const rotated = await form('/oauth/token', refresh);
   assert.equal(rotated.status, 200);
+  // The just-rotated token stays usable for a 30 s retry window (see the Refresh tests), so it is only
+  // dead once it is two rotations old.
+  const second = await form('/oauth/token', { ...refresh, refresh_token: (await rotated.json()).refresh_token });
+  assert.equal(second.status, 200);
   assert.equal((await form('/oauth/token', refresh)).status, 400, 'a rotated refresh token is dead');
+
+  assert.equal((await form('/oauth/token', exchange)).status, 400, 'a code is single-use');
 });
 
 test('/mcp without credentials, or with a foreign JWT, asks the client to run the OAuth flow', async () => {
@@ -305,4 +318,309 @@ test('DCR accepts cursor:// and vscode:// redirect URIs and refuses other custom
   const bad = await register(['myapp://cb']);
   assert.equal(bad.status, 400);
   assert.equal(bad.body.error, 'invalid_redirect_uri');
+});
+
+// ---- phase 2: grants, refresh, revoke ----
+
+const ISSUER = 'https://wa.example.test';
+const newStateDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'owg-'));
+/** A second (or third) gateway on the same stateDir simulates a restart. */
+async function startGateway({ stateDir = newStateDir(), now } = {}) {
+  const gw = createGateway({ issuer: ISSUER, upstream: `http://127.0.0.1:${upPort}`, stateDir, now });
+  const url = `http://127.0.0.1:${await listen(gw)}`;
+  const stop = async () => {
+    gw.closeAllConnections();
+    await new Promise(r => gw.close(r)); // 'close' flushes lastUsedAt
+  };
+  return { gw, stateDir, base: url, stop };
+}
+const formAt = (b, url, body) =>
+  fetch(b + url, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(body),
+  });
+const grantsOf = dir => JSON.parse(fs.readFileSync(path.join(dir, 'grants.json'), 'utf8'));
+const mcpAt = (b, token) => fetch(`${b}/mcp`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}' });
+/** Register, approve with `key`, and exchange the code. Returns everything a test needs to poke at it. */
+async function connect(b, { key = GOOD_KEY, uri = 'https://claude.ai/cb', name = 'Claude' } = {}) {
+  const reg = await (
+    await fetch(`${b}/oauth/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ redirect_uris: [uri], client_name: name }),
+    })
+  ).json();
+  const { verifier, challenge } = pkce();
+  const q = authQuery(reg.client_id, uri, challenge);
+  const approved = await formAt(b, '/oauth/authorize', { ...q, api_key: key });
+  assert.equal(approved.status, 302);
+  const code = new URL(approved.headers.get('location')).searchParams.get('code');
+  const exchange = { grant_type: 'authorization_code', code, code_verifier: verifier, redirect_uri: uri, client_id: reg.client_id };
+  const res = await formAt(b, '/oauth/token', exchange);
+  const tok = res.status === 200 ? await res.json() : null;
+  const refresh = rt => formAt(b, '/oauth/token', { grant_type: 'refresh_token', refresh_token: rt, client_id: reg.client_id });
+  return { client_id: reg.client_id, exchange, tok, refresh };
+}
+/** Seal a token the way the gateway does, to forge a pre-phase-2 token (no gid). */
+function sealLegacy(stateDir, kind, prefix, obj) {
+  const secret = Buffer.from(fs.readFileSync(path.join(stateDir, 'gateway-secret.key'), 'utf8').trim(), 'base64');
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', secret, iv).setAAD(Buffer.from(kind));
+  const ct = Buffer.concat([c.update(JSON.stringify(obj), 'utf8'), c.final()]);
+  return prefix + Buffer.concat([iv, c.getAuthTag(), ct]).toString('base64url');
+}
+const sha16 = k => crypto.createHash('sha256').update(k).digest('hex').slice(0, 16);
+
+test('Grants: approving writes a grant with the key fingerprint and role, never the key', async () => {
+  const g = await startGateway();
+  try {
+    const c = await connect(g.base, { key: VIEWER_KEY, name: 'Claude Desktop' });
+    const file = fs.readFileSync(path.join(g.stateDir, 'grants.json'), 'utf8');
+    assert.ok(!file.includes(VIEWER_KEY), 'the API key is not stored');
+    const grants = Object.values(JSON.parse(file));
+    assert.equal(grants.length, 1);
+    const [grant] = grants;
+    assert.equal(grant.keyFp, sha16(VIEWER_KEY));
+    assert.equal(grant.keyRole, 'viewer');
+    assert.equal(grant.clientName, 'Claude Desktop');
+    assert.equal(grant.clientHost, 'claude.ai');
+    assert.equal(grant.codeUsed, true);
+    assert.ok(grant.codeJti && grant.refreshJti && grant.createdAt);
+    assert.equal(grant.revokedAt, undefined);
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200);
+    assert.deepEqual(fs.readdirSync(g.stateDir).filter(f => f.endsWith('.tmp') || f === 'revoked-refresh.json'), []);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Grants: lastUsedAt is kept in memory and flushed when the server closes', async () => {
+  const dir = newStateDir();
+  let t = 5_000_000;
+  const g = await startGateway({ stateDir: dir, now: () => t });
+  const c = await connect(g.base);
+  const gid = Object.keys(grantsOf(dir))[0];
+  const before = grantsOf(dir)[gid].lastUsedAt;
+  t += 10_000;
+  assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200);
+  assert.equal(grantsOf(dir)[gid].lastUsedAt, before, 'a /mcp call does not write the file');
+  await g.stop();
+  assert.equal(grantsOf(dir)[gid].lastUsedAt, 5_010_000);
+});
+
+test('Grants: a code reused after a gateway restart revokes the grant, and the first access token gets 401', async () => {
+  const a = await startGateway();
+  const c = await connect(a.base);
+  assert.equal((await mcpAt(a.base, c.tok.access_token)).status, 200);
+  await a.stop();
+
+  const b = await startGateway({ stateDir: a.stateDir });
+  try {
+    const again = await formAt(b.base, '/oauth/token', c.exchange);
+    assert.equal(again.status, 400);
+    assert.equal((await again.json()).error, 'invalid_grant');
+    assert.ok(Object.values(grantsOf(b.stateDir))[0].revokedAt, 'grant revoked');
+    const res = await mcpAt(b.base, c.tok.access_token);
+    assert.equal(res.status, 401);
+    assert.match(res.headers.get('www-authenticate'), /resource_metadata="[^"]+", scope="mcp", error="invalid_token"$/);
+    const rt = await formAt(b.base, '/oauth/token', { grant_type: 'refresh_token', refresh_token: c.tok.refresh_token, client_id: c.client_id });
+    assert.equal(rt.status, 400, 'its refresh token is dead too');
+  } finally {
+    await b.stop();
+  }
+});
+
+test('Grants: a revoked grant stays revoked across a restart', async () => {
+  const a = await startGateway();
+  const c = await connect(a.base);
+  await formAt(a.base, '/oauth/revoke', { token: c.tok.access_token });
+  await a.stop();
+  const b = await startGateway({ stateDir: a.stateDir });
+  try {
+    assert.equal((await mcpAt(b.base, c.tok.access_token)).status, 401);
+  } finally {
+    await b.stop();
+  }
+});
+
+test('Grants: tokens from before phase 2 (no gid) are refused', async () => {
+  const g = await startGateway();
+  try {
+    const { client_id } = await connect(g.base); // also creates the secret
+    const old = {
+      access: sealLegacy(g.stateDir, 'access', 'owga.', { k: GOOD_KEY, c: client_id, aud: `${ISSUER}/mcp`, exp: Date.now() + 60_000 }),
+      refresh: sealLegacy(g.stateDir, 'refresh', 'owgr.', { k: GOOD_KEY, c: client_id, sc: 'mcp', jti: 'j1', exp: Date.now() + 60_000 }),
+    };
+    const res = await mcpAt(g.base, old.access);
+    assert.equal(res.status, 401);
+    assert.match(res.headers.get('www-authenticate'), /error="invalid_token"/);
+    const rt = await formAt(g.base, '/oauth/token', { grant_type: 'refresh_token', refresh_token: old.refresh, client_id });
+    assert.equal(rt.status, 400);
+    assert.equal((await rt.json()).error, 'invalid_grant');
+
+    const { verifier, challenge } = pkce();
+    const code = sealLegacy(g.stateDir, 'code', 'owgc.', {
+      k: GOOD_KEY, c: client_id, u: 'https://claude.ai/cb', ch: challenge, sc: 'mcp', jti: 'c1', exp: Date.now() + 60_000,
+    });
+    const ex = await formAt(g.base, '/oauth/token', {
+      grant_type: 'authorization_code', code, code_verifier: verifier, redirect_uri: 'https://claude.ai/cb', client_id,
+    });
+    assert.equal(ex.status, 400);
+    assert.equal((await ex.json()).error, 'invalid_grant');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Grants: loading prunes grants revoked over 30 days ago and grants idle past the refresh TTL', async () => {
+  const dir = newStateDir();
+  const day = 86400_000;
+  const t = Date.now();
+  fs.writeFileSync(
+    path.join(dir, 'grants.json'),
+    JSON.stringify({
+      oldRevoked: { createdAt: t - 90 * day, lastUsedAt: t - 40 * day, revokedAt: t - 31 * day },
+      recentRevoked: { createdAt: t - 5 * day, lastUsedAt: t - 2 * day, revokedAt: t - 1 * day },
+      idle: { createdAt: t - 90 * day, lastUsedAt: t - 31 * day },
+      neverUsedOld: { createdAt: t - 31 * day },
+      live: { createdAt: t - 90 * day, lastUsedAt: t - 1 * day },
+    }),
+  );
+  const g = await startGateway({ stateDir: dir });
+  try {
+    assert.deepEqual(Object.keys(grantsOf(dir)).sort(), ['live', 'recentRevoked']);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Refresh: replaying an old refresh token revokes the grant', async () => {
+  const g = await startGateway();
+  try {
+    const c = await connect(g.base);
+    const r2 = await (await c.refresh(c.tok.refresh_token)).json();
+    const r3 = await (await c.refresh(r2.refresh_token)).json();
+    assert.equal((await c.refresh(c.tok.refresh_token)).status, 400, 'two rotations old');
+    assert.ok(Object.values(grantsOf(g.stateDir))[0].revokedAt);
+    assert.equal((await mcpAt(g.base, r3.access_token)).status, 401, 'the newest access token is cut off');
+    assert.equal((await c.refresh(r3.refresh_token)).status, 400, 'and so is the newest refresh token');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Refresh: the previous token works again within 30 s and revokes the grant after that', async () => {
+  let t = 1_000_000;
+  const g = await startGateway({ now: () => t });
+  try {
+    const a = await connect(g.base);
+    const r2 = await (await a.refresh(a.tok.refresh_token)).json();
+    t += 29_000;
+    const retry = await a.refresh(a.tok.refresh_token); // the client lost the response to the first refresh
+    assert.equal(retry.status, 200, 'inside the window');
+    const r3 = await retry.json();
+    assert.notEqual(r3.refresh_token, r2.refresh_token);
+    assert.equal((await mcpAt(g.base, r3.access_token)).status, 200);
+    assert.equal(grantsOf(g.stateDir)[Object.keys(grantsOf(g.stateDir))[0]].revokedAt, undefined);
+
+    const b = await connect(g.base);
+    await b.refresh(b.tok.refresh_token);
+    t += 31_000;
+    assert.equal((await b.refresh(b.tok.refresh_token)).status, 400, 'after the window');
+    const gb = Object.values(grantsOf(g.stateDir)).filter(x => x.revokedAt);
+    assert.equal(gb.length, 1, 'only the replayed grant is revoked');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Refresh: a key revoked upstream makes the refresh fail and revokes the grant', async () => {
+  const key = 'owa_k1_short_lived';
+  liveKeys.add(key);
+  const g = await startGateway();
+  try {
+    const c = await connect(g.base, { key });
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200);
+    liveKeys.delete(key);
+    const res = await c.refresh(c.tok.refresh_token);
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error, 'invalid_grant');
+    assert.ok(Object.values(grantsOf(g.stateDir))[0].revokedAt, 'grant revoked');
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 401);
+  } finally {
+    liveKeys.delete(key);
+    await g.stop();
+  }
+});
+
+test('Refresh: two concurrent refreshes with the same token give exactly one success', async () => {
+  const g = await startGateway();
+  validateDelayMs = 100;
+  try {
+    const c = await connect(g.base);
+    const [x, y] = await Promise.all([c.refresh(c.tok.refresh_token), c.refresh(c.tok.refresh_token)]);
+    assert.deepEqual([x.status, y.status].sort(), [200, 400]);
+    const winner = await (x.status === 200 ? x : y).json();
+    validateDelayMs = 0;
+    assert.equal((await mcpAt(g.base, winner.access_token)).status, 200, 'the grant survives the race');
+  } finally {
+    validateDelayMs = 0;
+    await g.stop();
+  }
+});
+
+test('Revoke: /oauth/revoke on an access token cuts off /mcp at the next call', async () => {
+  const g = await startGateway();
+  try {
+    const c = await connect(g.base);
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200);
+    const res = await formAt(g.base, '/oauth/revoke', { token: c.tok.access_token });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('access-control-allow-origin'), '*');
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 401);
+    assert.equal((await c.refresh(c.tok.refresh_token)).status, 400, 'the grant is gone, refresh too');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Revoke: a refresh token revokes the grant, and unknown, garbage or missing tokens still answer 200', async () => {
+  const g = await startGateway();
+  try {
+    const c = await connect(g.base);
+    assert.equal((await formAt(g.base, '/oauth/revoke', { token: c.tok.refresh_token })).status, 200);
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 401);
+    for (const body of [{ token: 'owga.AAAA' }, { token: 'whatever' }, {}, { token: GOOD_KEY }]) {
+      assert.equal((await formAt(g.base, '/oauth/revoke', body)).status, 200, JSON.stringify(body));
+    }
+    const junk = await fetch(`${g.base}/oauth/revoke`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{nope' });
+    assert.equal(junk.status, 200);
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 401);
+    assert.equal((await fetch(`${g.base}/mcp`, { method: 'POST', headers: { 'x-api-key': GOOD_KEY }, body: '{}' })).status, 200, 'the static key is untouched');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Revoke: another grant is not affected; the preflight answers 204; metadata advertises the endpoint', async () => {
+  const g = await startGateway();
+  try {
+    const one = await connect(g.base);
+    const two = await connect(g.base);
+    await formAt(g.base, '/oauth/revoke', { token: one.tok.access_token });
+    assert.equal((await mcpAt(g.base, two.tok.access_token)).status, 200);
+
+    const pre = await fetch(`${g.base}/oauth/revoke`, { method: 'OPTIONS' });
+    assert.equal(pre.status, 204);
+    assert.equal(pre.headers.get('access-control-allow-origin'), '*');
+    assert.match(pre.headers.get('access-control-allow-methods'), /POST/);
+
+    const meta = await (await fetch(`${g.base}/.well-known/oauth-authorization-server`)).json();
+    assert.equal(meta.revocation_endpoint, `${ISSUER}/oauth/revoke`);
+    assert.deepEqual(meta.revocation_endpoint_auth_methods_supported, ['none']);
+  } finally {
+    await g.stop();
+  }
 });

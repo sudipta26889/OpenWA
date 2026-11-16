@@ -6,9 +6,10 @@
 // page (operator types an OpenWA API key) and the token endpoint. A POST /mcp carrying one of its access
 // tokens is forwarded with the underlying API key in X-API-Key, so OpenWA only ever sees plain key auth.
 //
-// Stateless by design: client ids, auth codes, access and refresh tokens are AES-256-GCM sealed blobs
-// under one secret in STATE_DIR. Only two things need memory: used auth codes (in-process — they live
-// 2 minutes) and rotated refresh tokens (persisted to STATE_DIR/revoked-refresh.json).
+// Client ids, auth codes, access and refresh tokens are AES-256-GCM sealed blobs under one secret in
+// STATE_DIR. The one piece of state is STATE_DIR/grants.json: a record per approved connection (a "grant",
+// keyed by the `gid` every code and token carries). It holds code use, the current refresh jti and
+// revocation, so reuse, replay and /oauth/revoke can cut a connection off. One process only.
 // Zero dependencies: Node 22 built-ins only.
 import http from 'node:http';
 import net from 'node:net';
@@ -20,6 +21,9 @@ import { pathToFileURL } from 'node:url';
 const ACCESS_TTL_MS = 3600_000; // 1h
 const REFRESH_TTL_MS = 30 * 86400_000; // 30d
 const CODE_TTL_MS = 120_000; // 2m
+const REFRESH_RETRY_MS = 30_000; // the just-rotated refresh token still works this long (lost response)
+const REVOKED_KEEP_MS = 30 * 86400_000; // revoked grants are kept this long, then pruned
+const FLUSH_MS = 60_000; // lastUsedAt reaches the disk this often
 const SCOPE = 'mcp';
 const MAX_BODY = 64 * 1024; // OAuth form/JSON bodies are tiny
 // The prefix tells our tokens apart from OpenWA keys (owa_…); it is also the AES-GCM AAD, so a sealed
@@ -110,9 +114,45 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
   const up = new URL(upstream);
   const agent = new http.Agent({ keepAlive: true });
   const secret = loadSecret(stateDir);
-  const revokedFile = path.join(stateDir, 'revoked-refresh.json');
-  const revoked = readJson(revokedFile); // jti -> expiry ms
-  const usedCodes = new Map(); // jti -> expiry ms; ponytail: in-process, a restart within a code's 2m TTL re-opens it (PKCE still binds it)
+  const grantsFile = path.join(stateDir, 'grants.json');
+  const grants = readJson(grantsFile); // gid -> grant record
+  let dirty = false; // lastUsedAt changed in memory and is not on disk yet
+  const refreshing = new Set(); // refresh jtis being handled right now
+
+  const writeGrants = () => {
+    fs.writeFileSync(`${grantsFile}.tmp`, JSON.stringify(grants), { mode: 0o600 });
+    fs.renameSync(`${grantsFile}.tmp`, grantsFile);
+    dirty = false;
+  };
+  const pruneGrants = () => {
+    let changed = false;
+    for (const [gid, g] of Object.entries(grants)) {
+      const idle = (g.lastUsedAt ?? g.createdAt ?? 0) + REFRESH_TTL_MS < now();
+      const goneLong = g.revokedAt !== undefined && g.revokedAt + REVOKED_KEEP_MS < now();
+      if (idle || goneLong) {
+        delete grants[gid];
+        changed = true;
+      }
+    }
+    return changed;
+  };
+  if (pruneGrants()) writeGrants();
+  const revokeGrant = gid => {
+    const g = grants[gid];
+    if (!g || g.revokedAt !== undefined) return;
+    g.revokedAt = now();
+    writeGrants();
+    log('grant revoked', { client_name: g.clientName });
+  };
+  /** The live grant behind a token's gid, or undefined (no gid, unknown, or revoked). */
+  const liveGrant = gid => {
+    const g = typeof gid === 'string' ? grants[gid] : undefined;
+    return g && g.revokedAt === undefined ? g : undefined;
+  };
+  const touch = g => {
+    g.lastUsedAt = now();
+    dirty = true;
+  };
 
   const seal = (kind, obj) => {
     const iv = crypto.randomBytes(12);
@@ -120,23 +160,17 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
     const ct = Buffer.concat([c.update(JSON.stringify(obj), 'utf8'), c.final()]);
     return PREFIX[kind] + Buffer.concat([iv, c.getAuthTag(), ct]).toString('base64url');
   };
-  const unseal = (kind, token) => {
+  const unseal = (kind, token, { ignoreExp = false } = {}) => {
     if (typeof token !== 'string' || !token.startsWith(PREFIX[kind])) return null;
     try {
       const raw = Buffer.from(token.slice(PREFIX[kind].length), 'base64url');
       const d = crypto.createDecipheriv('aes-256-gcm', secret, raw.subarray(0, 12)).setAAD(Buffer.from(kind));
       d.setAuthTag(raw.subarray(12, 28));
       const obj = JSON.parse(Buffer.concat([d.update(raw.subarray(28)), d.final()]).toString('utf8'));
-      return obj.exp !== undefined && obj.exp < now() ? null : obj;
+      return !ignoreExp && obj.exp !== undefined && obj.exp < now() ? null : obj;
     } catch {
       return null;
     }
-  };
-  const pruneMap = map => {
-    for (const [k, exp] of map) if (exp < now()) map.delete(k);
-  };
-  const pruneObj = obj => {
-    for (const [k, exp] of Object.entries(obj)) if (exp < now()) delete obj[k];
   };
 
   // ---- OAuth protocol ----
@@ -165,6 +199,8 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
     token_endpoint_auth_methods_supported: ['none'],
     scopes_supported: [SCOPE],
     authorization_response_iss_parameter_supported: true,
+    revocation_endpoint: `${issuer}/oauth/revoke`,
+    revocation_endpoint_auth_methods_supported: ['none'],
   });
 
   function registerClient(body) {
@@ -205,12 +241,17 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
     return client;
   }
 
-  /** Ask OpenWA itself whether the typed key is valid — the gateway never sees OpenWA's key store. */
+  /**
+   * Ask OpenWA itself whether the key is valid — the gateway never sees OpenWA's key store.
+   * Returns `{ role }` for a valid key, or null.
+   */
   async function apiKeyIsValid(apiKey) {
-    if (!apiKey) return false;
+    if (!apiKey) return null;
     try {
       const res = await fetch(new URL('/api/auth/validate', up), { method: 'POST', headers: { 'x-api-key': apiKey } });
-      return res.ok && (await res.json()).valid === true;
+      if (!res.ok) return null;
+      const body = await res.json();
+      return body.valid === true ? { role: typeof body.role === 'string' ? body.role : 'unknown' } : null;
     } catch (e) {
       log('key validation failed', { error: String(e) });
       throw new OAuthError('temporarily_unavailable', 'OpenWA is unreachable, try again', 503);
@@ -218,15 +259,31 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
   }
 
   async function approve(q) {
-    validateAuthorizeParams(q);
-    if (!(await apiKeyIsValid(q.api_key))) throw new OAuthError('access_denied', 'Invalid OpenWA API key', 401);
+    const client = validateAuthorizeParams(q);
+    const validated = await apiKeyIsValid(q.api_key);
+    if (!validated) throw new OAuthError('access_denied', 'Invalid OpenWA API key', 401);
+    const gid = crypto.randomUUID();
+    const codeJti = crypto.randomUUID();
+    grants[gid] = {
+      clientName: client.n ?? null,
+      clientHost: new URL(q.redirect_uri).host,
+      keyFp: crypto.createHash('sha256').update(q.api_key).digest('hex').slice(0, 16),
+      keyRole: validated.role,
+      createdAt: now(),
+      lastUsedAt: now(),
+      codeJti,
+      codeUsed: false,
+      refreshJti: null,
+    };
+    writeGrants();
     const code = seal('code', {
       k: q.api_key,
       c: q.client_id,
       u: q.redirect_uri,
       ch: q.code_challenge,
       sc: q.scope || SCOPE,
-      jti: crypto.randomUUID(),
+      jti: codeJti,
+      gid,
       exp: now() + CODE_TTL_MS,
     });
     const url = new URL(q.redirect_uri);
@@ -236,45 +293,86 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
     return url.toString();
   }
 
-  function issueTokens(apiKey, clientId, scope) {
+  /** Mint an access + refresh pair for a grant. The caller persists the grant (refreshJti changes here). */
+  function issueTokens(gid, g, apiKey, clientId, scope) {
+    const jti = crypto.randomUUID();
+    g.refreshJti = jti;
+    touch(g);
     return {
-      access_token: seal('access', { k: apiKey, c: clientId, aud: resource, exp: now() + ACCESS_TTL_MS }),
+      access_token: seal('access', { k: apiKey, c: clientId, gid, aud: resource, exp: now() + ACCESS_TTL_MS }),
       token_type: 'Bearer',
       expires_in: ACCESS_TTL_MS / 1000,
-      refresh_token: seal('refresh', { k: apiKey, c: clientId, sc: scope, jti: crypto.randomUUID(), exp: now() + REFRESH_TTL_MS }),
+      refresh_token: seal('refresh', { k: apiKey, c: clientId, sc: scope, gid, jti, exp: now() + REFRESH_TTL_MS }),
       scope,
     };
   }
 
-  function token(b) {
+  async function refreshGrant(b) {
+    if (!b.refresh_token || !b.client_id) throw new OAuthError('invalid_request', 'refresh_token and client_id are required');
+    const invalid = () => new OAuthError('invalid_grant', 'refresh_token is invalid or expired');
+    // 1. Unseal and check the grant. A token without a gid (pre-grants) is refused.
+    const rt = unseal('refresh', b.refresh_token);
+    if (!rt || rt.c !== b.client_id || !liveGrant(rt.gid)) throw invalid();
+    // A second request carrying a token that is already being refreshed is a race, not a lost-response retry
+    // (that arrives after the first answer). It gets nothing, and the first request keeps its result.
+    if (refreshing.has(rt.jti)) throw invalid();
+    refreshing.add(rt.jti);
+    try {
+      // 2. The key must still be valid upstream. This is the only await: nothing below it yields.
+      if (!(await apiKeyIsValid(rt.k))) {
+        revokeGrant(rt.gid);
+        throw invalid();
+      }
+      // 3. Compare-and-set against the grant as it is NOW (it may have been revoked or rotated meanwhile).
+      const g = liveGrant(rt.gid);
+      if (!g) throw invalid();
+      const inRetryWindow = rt.jti === g.prevRefreshJti && now() < g.prevRefreshUntil;
+      if (rt.jti !== g.refreshJti && !inRetryWindow) {
+        revokeGrant(rt.gid); // an old token came back: assume it leaked
+        throw invalid();
+      }
+      // Rotate (OAuth 2.1, public clients). The token being replaced stays usable for the retry window.
+      g.prevRefreshJti = g.refreshJti;
+      g.prevRefreshUntil = now() + REFRESH_RETRY_MS;
+      const tokens = issueTokens(rt.gid, g, rt.k, rt.c, rt.sc);
+      writeGrants();
+      return tokens;
+    } finally {
+      refreshing.delete(rt.jti);
+    }
+  }
+
+  async function token(b) {
     if (b.grant_type === 'authorization_code' || b.grant_type === 'refresh_token') checkResource(b.resource);
     if (b.grant_type === 'authorization_code') {
       if (!b.code || !b.code_verifier || !b.redirect_uri || !b.client_id) {
         throw new OAuthError('invalid_request', 'code, code_verifier, redirect_uri, client_id are required');
       }
       const code = unseal('code', b.code);
-      if (!code || usedCodes.has(code.jti)) throw new OAuthError('invalid_grant', 'Authorization code is invalid or expired');
+      const g = code && liveGrant(code.gid);
+      if (!g || g.codeJti !== code.jti) throw new OAuthError('invalid_grant', 'Authorization code is invalid or expired');
+      if (g.codeUsed) {
+        revokeGrant(code.gid); // reuse: whoever holds the first tokens loses them too
+        throw new OAuthError('invalid_grant', 'Authorization code is invalid or expired');
+      }
       if (code.c !== b.client_id || !redirectMatches(code.u, b.redirect_uri)) throw new OAuthError('invalid_grant', 'client_id / redirect_uri mismatch');
       const challenge = crypto.createHash('sha256').update(b.code_verifier).digest('base64url');
       if (challenge.length !== code.ch.length || !crypto.timingSafeEqual(Buffer.from(challenge), Buffer.from(code.ch))) {
         throw new OAuthError('invalid_grant', 'PKCE verification failed');
       }
-      pruneMap(usedCodes);
-      usedCodes.set(code.jti, code.exp);
-      return issueTokens(code.k, code.c, code.sc);
+      g.codeUsed = true;
+      const tokens = issueTokens(code.gid, g, code.k, code.c, code.sc);
+      writeGrants();
+      return tokens;
     }
-    if (b.grant_type === 'refresh_token') {
-      if (!b.refresh_token || !b.client_id) throw new OAuthError('invalid_request', 'refresh_token and client_id are required');
-      const rt = unseal('refresh', b.refresh_token);
-      if (!rt || rt.c !== b.client_id || revoked[rt.jti]) throw new OAuthError('invalid_grant', 'refresh_token is invalid or expired');
-      // OAuth 2.1: rotate refresh tokens for public clients.
-      pruneObj(revoked);
-      revoked[rt.jti] = rt.exp;
-      fs.writeFileSync(`${revokedFile}.tmp`, JSON.stringify(revoked));
-      fs.renameSync(`${revokedFile}.tmp`, revokedFile);
-      return issueTokens(rt.k, rt.c, rt.sc);
-    }
+    if (b.grant_type === 'refresh_token') return refreshGrant(b);
     throw new OAuthError('unsupported_grant_type', `Unsupported grant_type: ${b.grant_type}`);
+  }
+
+  /** RFC 7009: revoke the grant behind an access or refresh token. Anything else is ignored. */
+  function revokeToken(t) {
+    const parsed = unseal('access', t, { ignoreExp: true }) ?? unseal('refresh', t, { ignoreExp: true });
+    if (parsed?.gid) revokeGrant(parsed.gid);
   }
 
   // ---- HTTP plumbing ----
@@ -377,7 +475,9 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
     if (!bearer && !req.headers['x-api-key']) return unauthorized(res, false);
     if (bearer?.startsWith(PREFIX.access)) {
       const at = unseal('access', bearer);
-      if (!at || at.aud !== resource) return unauthorized(res, true);
+      const g = at && at.aud === resource ? liveGrant(at.gid) : undefined;
+      if (!g) return unauthorized(res, true);
+      touch(g);
       const headers = forwardedHeaders(req);
       delete headers.authorization;
       headers['x-api-key'] = at.k;
@@ -417,9 +517,18 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
       }
     },
     'POST /oauth/token': async (req, res) => {
-      const t = token(await readBody(req));
+      const t = await token(await readBody(req));
       log('token issued');
       send(res, 200, t);
+    },
+    'POST /oauth/revoke': async (req, res) => {
+      // RFC 7009: always 200, whatever the token (or the body) was, so the endpoint tells a caller nothing.
+      try {
+        revokeToken((await readBody(req)).token);
+      } catch (e) {
+        if (!(e instanceof OAuthError)) throw e;
+      }
+      res.writeHead(200, { 'cache-control': 'no-store', 'access-control-allow-origin': '*' }).end();
     },
     'POST /mcp': proxyMcp,
   };
@@ -432,7 +541,7 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
 
   const server = http.createServer((req, res) => {
     const pathname = new URL(req.url, 'http://x').pathname.replace(/\/$/, '') || '/';
-    if (req.method === 'OPTIONS' && (pathname === '/oauth/register' || pathname === '/oauth/token')) {
+    if (req.method === 'OPTIONS' && ['/oauth/register', '/oauth/token', '/oauth/revoke'].includes(pathname)) {
       return res.writeHead(204, cors).end();
     }
     const handler = routes[`${req.method} ${pathname}`];
@@ -459,6 +568,17 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
     };
     conn.on('error', close);
     socket.on('error', close);
+  });
+
+  // lastUsedAt lives in memory; flush it on a timer and when the server closes (SIGTERM calls close).
+  const flush = () => {
+    if (dirty) writeGrants();
+  };
+  const timer = setInterval(flush, FLUSH_MS);
+  timer.unref(); // never keep the process (or a test run) alive
+  server.on('close', () => {
+    clearInterval(timer);
+    flush();
   });
 
   return server;
