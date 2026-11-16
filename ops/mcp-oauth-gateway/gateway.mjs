@@ -160,7 +160,7 @@ for (const [addr, prefix] of [
   ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12],
   ['192.0.0.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['224.0.0.0', 4], ['240.0.0.0', 4],
 ]) BLOCKED.addSubnet(addr, prefix, 'ipv4');
-for (const [addr, prefix] of [['::', 96], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8], ['64:ff9b::', 96], ['2002::', 16]]) {
+for (const [addr, prefix] of [['::', 96], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8], ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['2002::', 16], ['fec0::', 10], ['2001:db8::', 32]]) {
   BLOCKED.addSubnet(addr, prefix, 'ipv6');
 }
 
@@ -215,6 +215,7 @@ export function createGateway({
   cimdTimeoutMs = 5000,
   maxResultChars = MAX_RESULT_CHARS,
   maxBufferBytes = MAX_BUFFERED_BYTES,
+  flushMs = FLUSH_MS,
 }) {
   issuer = issuer.replace(/\/$/, '');
   const resource = `${issuer}/mcp`;
@@ -542,24 +543,39 @@ export function createGateway({
 
   /**
    * Ask OpenWA itself whether the key is valid — the gateway never sees OpenWA's key store.
-   * Returns `{ role }` for a valid key, or null.
+   * Returns `{ role }` for a valid key, or null. Only a 401, or a 200 saying `valid !== true`, means the key is
+   * invalid. Anything else (429 from the throttler, 5xx, 403, a dropped connection, an unreadable answer) is
+   * "could not tell": it throws a 503 so a caller never revokes a grant because OpenWA was having a bad moment.
+   * `forwardedFor` is the client's X-Forwarded-For value, so OpenWA's throttler sees the client, not the gateway.
    */
-  async function apiKeyIsValid(apiKey) {
+  async function apiKeyIsValid(apiKey, forwardedFor) {
     if (!apiKey) return null;
+    const unavailable = why => {
+      log('key validation failed', { why });
+      return new OAuthError('temporarily_unavailable', 'OpenWA could not check the key, try again', 503);
+    };
+    let res;
     try {
-      const res = await fetch(new URL('/api/auth/validate', up), { method: 'POST', headers: { 'x-api-key': apiKey } });
-      if (!res.ok) return null;
-      const body = await res.json();
-      return body.valid === true ? { role: typeof body.role === 'string' ? body.role : 'unknown' } : null;
+      const headers = { 'x-api-key': apiKey };
+      if (forwardedFor) headers['x-forwarded-for'] = forwardedFor;
+      res = await fetch(new URL('/api/auth/validate', up), { method: 'POST', headers });
     } catch (e) {
-      log('key validation failed', { error: String(e) });
-      throw new OAuthError('temporarily_unavailable', 'OpenWA is unreachable, try again', 503);
+      throw unavailable(String(e));
     }
+    if (res.status === 401) return null;
+    if (!res.ok) throw unavailable(`HTTP ${res.status}`);
+    let body;
+    try {
+      body = await res.json();
+    } catch {
+      throw unavailable('unreadable answer');
+    }
+    return body?.valid === true ? { role: typeof body.role === 'string' ? body.role : 'unknown' } : null;
   }
 
-  async function approve(q) {
+  async function approve(q, forwardedFor) {
     const client = await validateAuthorizeParams(q);
-    const validated = await apiKeyIsValid(q.api_key);
+    const validated = await apiKeyIsValid(q.api_key, forwardedFor);
     if (!validated) throw new OAuthError('access_denied', 'Invalid OpenWA API key', 401);
     const gid = crypto.randomUUID();
     const codeJti = crypto.randomUUID();
@@ -606,7 +622,7 @@ export function createGateway({
     };
   }
 
-  async function refreshGrant(b) {
+  async function refreshGrant(b, forwardedFor) {
     if (!b.refresh_token || !b.client_id) throw new OAuthError('invalid_request', 'refresh_token and client_id are required');
     const invalid = () => new OAuthError('invalid_grant', 'refresh_token is invalid or expired');
     // 1. Unseal and check the grant. A token without a gid (pre-grants) is refused.
@@ -618,7 +634,7 @@ export function createGateway({
     refreshing.add(rt.jti);
     try {
       // 2. The key must still be valid upstream. This is the only await: nothing below it yields.
-      if (!(await apiKeyIsValid(rt.k))) {
+      if (!(await apiKeyIsValid(rt.k, forwardedFor))) {
         revokeGrant(rt.gid);
         throw invalid();
       }
@@ -641,7 +657,7 @@ export function createGateway({
     }
   }
 
-  async function token(b) {
+  async function token(b, forwardedFor) {
     if (b.grant_type === 'authorization_code' || b.grant_type === 'refresh_token') {
       checkResource(b.resource);
       // A URL client_id must still obey the URL rules. No fetch: the document was checked when the code was issued.
@@ -654,21 +670,23 @@ export function createGateway({
       const code = unseal('code', b.code);
       const g = code && liveGrant(code.gid);
       if (!g || g.codeJti !== code.jti) throw new OAuthError('invalid_grant', 'Authorization code is invalid or expired');
-      if (g.codeUsed) {
-        revokeGrant(code.gid); // reuse: whoever holds the first tokens loses them too
-        throw new OAuthError('invalid_grant', 'Authorization code is invalid or expired');
-      }
       if (code.c !== b.client_id || !redirectMatches(code.u, b.redirect_uri)) throw new OAuthError('invalid_grant', 'client_id / redirect_uri mismatch');
       const challenge = crypto.createHash('sha256').update(b.code_verifier).digest('base64url');
       if (challenge.length !== code.ch.length || !crypto.timingSafeEqual(Buffer.from(challenge), Buffer.from(code.ch))) {
         throw new OAuthError('invalid_grant', 'PKCE verification failed');
+      }
+      // Reuse revokes only once the caller has proved it holds the code (client, redirect and verifier), so
+      // a leaked, already-used code cannot be posted with a wrong verifier to kill someone's grant.
+      if (g.codeUsed) {
+        revokeGrant(code.gid); // whoever holds the first tokens loses them too
+        throw new OAuthError('invalid_grant', 'Authorization code is invalid or expired');
       }
       g.codeUsed = true;
       const tokens = issueTokens(code.gid, g, code.k, code.c, code.sc);
       writeGrants();
       return tokens;
     }
-    if (b.grant_type === 'refresh_token') return refreshGrant(b);
+    if (b.grant_type === 'refresh_token') return refreshGrant(b, forwardedFor);
     throw new OAuthError('unsupported_grant_type', `Unsupported grant_type: ${b.grant_type}`);
   }
 
@@ -760,10 +778,15 @@ export function createGateway({
     return Object.fromEntries(new URLSearchParams(text));
   }
 
+  /** The X-Forwarded-For value to send upstream: what the client sent, plus the address it connected from. */
+  const forwardedForOf = req => {
+    const peer = req.socket.remoteAddress ?? '';
+    const sent = req.headers['x-forwarded-for'];
+    return sent ? `${sent}, ${peer}` : peer;
+  };
   const forwardedHeaders = req => {
     const h = { ...req.headers };
-    const peer = req.socket.remoteAddress ?? '';
-    h['x-forwarded-for'] = h['x-forwarded-for'] ? `${h['x-forwarded-for']}, ${peer}` : peer;
+    h['x-forwarded-for'] = forwardedForOf(req);
     h['x-forwarded-proto'] ??= 'http';
     h['x-forwarded-host'] ??= h.host ?? '';
     return h;
@@ -775,8 +798,6 @@ export function createGateway({
   function capMessage(msg) {
     const content = msg?.result?.content;
     if (!Array.isArray(content)) return false;
-    const serialized = JSON.stringify(content).length;
-    if (serialized <= maxResultChars) return false;
     // The payload is the decoded resource blob when there is one (the text item next to it is only a label);
     // otherwise the text items.
     const blobs = content.filter(i => i?.type === 'resource' && typeof i.resource?.blob === 'string');
@@ -786,9 +807,10 @@ export function createGateway({
           .map(i => (i?.type === 'text' ? i.text : i?.type === 'resource' ? i.resource?.text : undefined))
           .filter(t => typeof t === 'string')
           .join('\n');
+    if (text.length <= maxResultChars) return false; // the payload fits, however big its serialized form is
     let head = text.slice(0, maxResultChars);
     if (/[\ud800-\udbff]$/.test(head)) head = head.slice(0, -1); // never cut a surrogate pair in half
-    const total = text.length || serialized;
+    const total = text.length;
     msg.result.content = [
       { type: 'text', text: `${head}\n…[truncated by gateway: ${total} characters in all; narrow the request (limit/offset) to see the rest]` },
     ];
@@ -912,7 +934,9 @@ export function createGateway({
     // A JWT is a token minted by the old in-process OAuth module (or another issuer): tell the client to
     // re-run the flow instead of letting OpenWA reject it as an unknown API key without resource_metadata.
     if (bearer && looksLikeJwt(bearer)) return unauthorized(res, true);
-    proxy(req, res, undefined, { capResult: true }); // static API key: OpenWA validates it as before
+    // Static API key: OpenWA validates it as before, and its answer is relayed as is (Claude Code saves an
+    // embedded blob to a file; only OAuth-token callers, such as claude.ai, get the cap).
+    proxy(req, res);
   }
 
   const routes = {
@@ -935,7 +959,7 @@ export function createGateway({
       const b = await readBody(req);
       try {
         requireSameOrigin(req);
-        const location = await approve(b);
+        const location = await approve(b, forwardedForOf(req));
         log('authorize approved');
         res.writeHead(302, { location, 'cache-control': 'no-store' }).end();
       } catch (e) {
@@ -949,7 +973,7 @@ export function createGateway({
       const b = await readBody(req);
       try {
         requireSameOrigin(req);
-        const validated = await apiKeyIsValid(b.api_key);
+        const validated = await apiKeyIsValid(b.api_key, forwardedForOf(req));
         if (!validated) throw new OAuthError('access_denied', 'Invalid OpenWA API key', 401);
         const keyFp = crypto.createHash('sha256').update(b.api_key).digest('hex').slice(0, 16);
         const iso = ms => (ms ? new Date(ms).toISOString() : 'never');
@@ -990,7 +1014,7 @@ export function createGateway({
       }
     },
     'POST /oauth/token': async (req, res) => {
-      const t = await token(await readBody(req));
+      const t = await token(await readBody(req), forwardedForOf(req));
       log('token issued');
       send(res, 200, t);
     },
@@ -1045,9 +1069,10 @@ export function createGateway({
 
   // lastUsedAt lives in memory; flush it on a timer and when the server closes (SIGTERM calls close).
   const flush = () => {
-    if (dirty) writeGrants();
+    const pruned = pruneGrants(); // idle or long-revoked grants go on every flush, not only at startup
+    if (pruned || dirty) writeGrants();
   };
-  const timer = setInterval(flush, FLUSH_MS);
+  const timer = setInterval(flush, flushMs);
   timer.unref(); // never keep the process (or a test run) alive
   server.on('close', () => {
     clearInterval(timer);

@@ -15,6 +15,8 @@ const GOOD_KEY = 'owa_k1_good';
 const VIEWER_KEY = 'owa_k1_viewer';
 const ROLES = { [GOOD_KEY]: 'admin', [VIEWER_KEY]: 'viewer' };
 const liveKeys = new Set([GOOD_KEY, VIEWER_KEY]); // a test deletes a key here to "revoke it upstream"
+let validateFail = null; // a status number, 'reset' (drop the socket) or 'invalid200' (200 with valid:false)
+let lastValidate; // headers of the last /api/auth/validate call
 let validateDelayMs = 0; // a test raises it to make concurrent requests overlap
 let upstream, upPort, gateway, base, seen, streamRelease;
 
@@ -62,6 +64,16 @@ before(async () => {
   // Fake OpenWA: validates keys (with a role), records what /mcp received, echoes a WebSocket-ish upgrade.
   upstream = http.createServer((req, res) => {
     if (req.url === '/api/auth/validate') {
+      lastValidate = req.headers;
+      if (validateFail === 'reset') return req.socket.destroy();
+      if (validateFail === 'invalid200') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ valid: false }));
+      }
+      if (validateFail) {
+        res.writeHead(validateFail, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ message: 'upstream trouble' }));
+      }
       const key = req.headers['x-api-key'];
       const ok = liveKeys.has(key);
       const answer = () => {
@@ -1081,6 +1093,7 @@ test('CIMD: a host resolving to a private, loopback, mapped or NAT64 address is 
       '::', '::1', 'fc00::1', 'fd12:3456::1', 'fe80::1', 'ff02::1',
       '::ffff:127.0.0.1', '::ffff:10.0.0.1', '::ffff:7f00:1', '::ffff:a00:1',
       '64:ff9b::a00:1', '64:ff9b::7f00:1',
+      '64:ff9b:1::1', 'fec0::1', '2001:db8::1',
     ];
     for (const address of blocked) {
       const url = h.add(cimdUrl(), {});
@@ -1244,14 +1257,22 @@ test('CIMD: the document cache is bounded, so the oldest entry is evicted and fe
 
 const CAP = 100_000;
 const MARK = n => `\n…[truncated by gateway: ${n} characters in all; narrow the request (limit/offset) to see the rest]`;
-const mcpFake = (b, mode, size, extra = {}) =>
-  fetch(`${b}/mcp`, { method: 'POST', headers: { 'x-api-key': GOOD_KEY, 'x-fake': mode, 'x-fake-size': String(size), ...extra }, body: '{}' });
+// The cap applies to OAuth-token callers only, so these tests connect first and call with the access token.
+const startCapGateway = async opts => {
+  const g = await startGateway(opts);
+  g.token = (await connect(g.base)).tok.access_token;
+  return g;
+};
+const mcpFake = (g, mode, size, extra = {}) =>
+  fetch(`${g.base}/mcp`, { method: 'POST', headers: { authorization: `Bearer ${g.token}`, 'x-fake': mode, 'x-fake-size': String(size), ...extra }, body: '{}' });
+const mcpStatic = (g, mode, size) =>
+  fetch(`${g.base}/mcp`, { method: 'POST', headers: { 'x-api-key': GOOD_KEY, 'x-fake': mode, 'x-fake-size': String(size) }, body: '{}' });
 const sseData = text => JSON.parse(text.split('\n').find(l => l.startsWith('data:')).slice(5));
 
 test('Result cap: a JSON answer under the cap passes through byte for byte, with a correct content-length', async () => {
-  const g = await startGateway();
+  const g = await startCapGateway();
   try {
-    const res = await mcpFake(g.base, 'json', 99_000);
+    const res = await mcpFake(g, 'json', 99_000);
     const body = await res.text();
     assert.equal(JSON.parse(body).result.content[0].text, BIG_TEXT(99_000));
     assert.equal(Number(res.headers.get('content-length')), Buffer.byteLength(body));
@@ -1263,9 +1284,9 @@ test('Result cap: a JSON answer under the cap passes through byte for byte, with
 });
 
 test('Result cap: a JSON answer over the cap becomes one text item of the first 100,000 characters plus the marker', async () => {
-  const g = await startGateway();
+  const g = await startCapGateway();
   try {
-    const res = await mcpFake(g.base, 'json', 150_000);
+    const res = await mcpFake(g, 'json', 150_000);
     const body = await res.text();
     const msg = JSON.parse(body);
     assert.equal(msg.id, 7);
@@ -1282,13 +1303,13 @@ test('Result cap: a JSON answer over the cap becomes one text item of the first 
 });
 
 test('Result cap: isError is kept on a truncated result, and a JSON-RPC batch is handled item by item', async () => {
-  const g = await startGateway();
+  const g = await startCapGateway();
   try {
-    const err = await (await mcpFake(g.base, 'json', 150_000, { 'x-fake-error': '1' })).json();
+    const err = await (await mcpFake(g, 'json', 150_000, { 'x-fake-error': '1' })).json();
     assert.equal(err.result.isError, true);
     assert.match(err.result.content[0].text, /truncated by gateway/);
 
-    const batch = await (await mcpFake(g.base, 'batch', 150_000)).json();
+    const batch = await (await mcpFake(g, 'batch', 150_000)).json();
     assert.match(batch[0].result.content[0].text, /truncated by gateway: 150000 characters/);
     assert.deepEqual(batch[1].result.content, [{ type: 'text', text: 'small' }]);
   } finally {
@@ -1297,13 +1318,13 @@ test('Result cap: isError is kept on a truncated result, and a JSON-RPC batch is
 });
 
 test('Result cap: SSE answers pass unchanged under the cap, and are truncated inside their event over it', async () => {
-  const g = await startGateway();
+  const g = await startCapGateway();
   try {
-    const small = await (await mcpFake(g.base, 'sse', 1000)).text();
+    const small = await (await mcpFake(g, 'sse', 1000)).text();
     assert.equal(sseData(small).result.content[0].text, BIG_TEXT(1000));
     assert.equal(small, `event: message\nid: 7\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: 7, result: { content: [{ type: 'text', text: BIG_TEXT(1000) }], extra: 'kept' } })}\n\n`);
 
-    const res = await mcpFake(g.base, 'sse', 150_000);
+    const res = await mcpFake(g, 'sse', 150_000);
     const big = await res.text();
     assert.match(big, /^event: message\nid: 7\ndata: \{/, 'event and id lines kept');
     assert.ok(big.endsWith('\n\n'));
@@ -1319,16 +1340,16 @@ test('Result cap: SSE answers pass unchanged under the cap, and are truncated in
 });
 
 test('Result cap: an embedded base64 resource blob is decoded and truncated; a small blob result is left alone', async () => {
-  const g = await startGateway();
+  const g = await startCapGateway();
   try {
-    const msg = await (await mcpFake(g.base, 'json-blob', 233_000)).json();
+    const msg = await (await mcpFake(g, 'json-blob', 233_000)).json();
     assert.equal(msg.result.content.length, 1);
     assert.equal(msg.result.content[0].text, BIG_TEXT(233_000).slice(0, CAP) + MARK(233_000), 'the decoded payload, not the label or the base64');
 
-    const sse = sseData(await (await mcpFake(g.base, 'sse-blob', 233_000)).text());
+    const sse = sseData(await (await mcpFake(g, 'sse-blob', 233_000)).text());
     assert.equal(sse.result.content[0].text, BIG_TEXT(233_000).slice(0, CAP) + MARK(233_000));
 
-    const small = await (await mcpFake(g.base, 'json-blob', 2000)).json();
+    const small = await (await mcpFake(g, 'json-blob', 2000)).json();
     assert.equal(small.result.content.length, 2, 'under the cap: untouched');
     assert.equal(small.result.content[1].type, 'resource');
   } finally {
@@ -1337,10 +1358,10 @@ test('Result cap: an embedded base64 resource blob is decoded and truncated; a s
 });
 
 test('Result cap: results with no content, non-JSON-RPC bodies and other content types pass through unchanged', async () => {
-  const g = await startGateway();
+  const g = await startCapGateway();
   try {
     for (const mode of ['nocontent', 'notrpc', 'plain']) {
-      const res = await mcpFake(g.base, mode, 150_000);
+      const res = await mcpFake(g, mode, 150_000);
       const body = await res.text();
       assert.ok(body.length > CAP, mode);
       assert.ok(!body.includes('truncated by gateway'), mode);
@@ -1351,15 +1372,15 @@ test('Result cap: results with no content, non-JSON-RPC bodies and other content
 });
 
 test('Result cap: a body over the hard buffer limit streams through unchanged, and the cap is configurable', async () => {
-  const g = await startGateway({ maxResultChars: 100, maxBufferBytes: 2000 });
+  const g = await startCapGateway({ maxResultChars: 100, maxBufferBytes: 2000 });
   try {
-    const mid = await (await mcpFake(g.base, 'json', 1000)).json();
+    const mid = await (await mcpFake(g, 'json', 1000)).json();
     assert.equal(mid.result.content[0].text, BIG_TEXT(100) + MARK(1000), 'under the buffer limit: capped at the configured size');
 
-    const res = await mcpFake(g.base, 'json', 5000);
+    const res = await mcpFake(g, 'json', 5000);
     const body = await res.json();
     assert.equal(body.result.content[0].text, BIG_TEXT(5000), 'over the buffer limit: whole answer, untouched');
-    const sse = await (await mcpFake(g.base, 'sse', 5000)).text();
+    const sse = await (await mcpFake(g, 'sse', 5000)).text();
     assert.equal(sseData(sse).result.content[0].text, BIG_TEXT(5000));
   } finally {
     await g.stop();
@@ -1367,7 +1388,7 @@ test('Result cap: a body over the hard buffer limit streams through unchanged, a
 });
 
 test('Result cap: everything that is not POST /mcp still streams', async () => {
-  const g = await startGateway();
+  const g = await startCapGateway();
   try {
     const res = await fetch(`${g.base}/api/stream`);
     const reader = res.body.getReader();
@@ -1380,4 +1401,180 @@ test('Result cap: everything that is not POST /mcp still streams', async () => {
   } finally {
     await g.stop();
   }
+});
+
+// ---- phase 2 review fixes ----
+
+test('Upstream errors never revoke a grant: a 429, 500, 403, 502 or dropped connection during refresh gives 503 and the grant survives', async () => {
+  const g = await startGateway();
+  try {
+    const c = await connect(g.base);
+    const grant = () => Object.values(grantsOf(g.stateDir))[0];
+    for (const fail of [429, 500, 403, 502, 'reset']) {
+      validateFail = fail;
+      const res = await c.refresh(c.tok.refresh_token);
+      assert.equal(res.status, 503, String(fail));
+      assert.equal((await res.json()).error, 'temporarily_unavailable', String(fail));
+      assert.equal(grant().revokedAt, undefined, `grant survives ${fail}`);
+      assert.equal(grant().refreshJti, grantsOf(g.stateDir)[Object.keys(grantsOf(g.stateDir))[0]].refreshJti, 'not rotated');
+    }
+    validateFail = null;
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200, 'the access token still works');
+    const later = await c.refresh(c.tok.refresh_token);
+    assert.equal(later.status, 200, 'the same refresh token works once upstream recovers');
+    assert.ok((await later.json()).refresh_token);
+  } finally {
+    validateFail = null;
+    await g.stop();
+  }
+});
+
+test('Upstream errors: only a 401 or a 200 with valid:false means an invalid key', async () => {
+  const g = await startGateway();
+  try {
+    const c = await connect(g.base);
+    validateFail = 'invalid200';
+    const res = await c.refresh(c.tok.refresh_token);
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error, 'invalid_grant');
+    assert.ok(Object.values(grantsOf(g.stateDir))[0].revokedAt, 'a clear "invalid" does revoke');
+  } finally {
+    validateFail = null;
+    await g.stop();
+  }
+});
+
+test('Upstream errors: approve and the connections page answer 503, not "invalid key", when OpenWA is troubled', async () => {
+  const g = await startGateway();
+  try {
+    const q = { ...(await consentQuery(g.base)), api_key: GOOD_KEY };
+    for (const fail of [429, 500, 'reset']) {
+      validateFail = fail;
+      const a = await rawPost(g.base, '/oauth/authorize', q, { origin: ISSUER });
+      assert.equal(a.status, 503, `authorize ${fail}`);
+      assert.equal(a.headers.get('location'), null);
+      const l = await connectionsPost(g.base, GOOD_KEY);
+      assert.equal(l.status, 503, `connections ${fail}`);
+      assert.doesNotMatch(await l.text(), /Invalid OpenWA API key/);
+    }
+    assert.equal(fs.existsSync(path.join(g.stateDir, 'grants.json')), false, 'no grant was created');
+    validateFail = null;
+    assert.equal((await rawPost(g.base, '/oauth/authorize', q, { origin: ISSUER })).status, 302);
+  } finally {
+    validateFail = null;
+    await g.stop();
+  }
+});
+
+test('Key checks carry the client IP in X-Forwarded-For (approve, refresh, connections)', async () => {
+  const g = await startGateway();
+  try {
+    const q = { ...(await consentQuery(g.base)), api_key: GOOD_KEY };
+    await rawPost(g.base, '/oauth/authorize', q, { origin: ISSUER, 'x-forwarded-for': '203.0.113.9' });
+    assert.equal(lastValidate['x-forwarded-for'], '203.0.113.9, 127.0.0.1');
+
+    const c = await connect(g.base);
+    await formAt(g.base, '/oauth/token', { grant_type: 'refresh_token', refresh_token: c.tok.refresh_token, client_id: c.client_id });
+    assert.equal(lastValidate['x-forwarded-for'], '127.0.0.1', 'no header from the client: the peer address');
+    await fetch(`${g.base}/oauth/token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-forwarded-for': '198.51.100.7' },
+      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: c.tok.refresh_token, client_id: c.client_id }),
+    });
+    assert.equal(lastValidate['x-forwarded-for'], '198.51.100.7, 127.0.0.1');
+
+    await connectionsPost(g.base, GOOD_KEY, { origin: ISSUER, 'x-forwarded-for': '192.0.2.44' });
+    assert.equal(lastValidate['x-forwarded-for'], '192.0.2.44, 127.0.0.1');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Code reuse revokes only after client_id, redirect_uri and PKCE check out', async () => {
+  const g = await startGateway();
+  try {
+    const c = await connect(g.base);
+    const grant = () => Object.values(grantsOf(g.stateDir))[0];
+    const ex = c.exchange;
+    for (const bad of [{ code_verifier: 'wrong-verifier' }, { redirect_uri: 'https://claude.ai/elsewhere' }, { client_id: 'owgk.nope' }]) {
+      const res = await formAt(g.base, '/oauth/token', { ...ex, ...bad });
+      assert.equal(res.status, 400, JSON.stringify(bad));
+      assert.equal(grant().revokedAt, undefined, `a used code with ${Object.keys(bad)} wrong cannot revoke`);
+    }
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200);
+
+    const again = await formAt(g.base, '/oauth/token', ex); // the real holder of the code, reusing it
+    assert.equal(again.status, 400);
+    assert.ok(grant().revokedAt, 'a verified reuse revokes');
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 401);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: static-key callers (Claude Code) keep OpenWA\'s answer untouched', async () => {
+  const g = await startCapGateway();
+  try {
+    for (const mode of ['json', 'json-blob', 'sse']) {
+      const res = await mcpStatic(g, mode, 233_000);
+      const body = await res.text();
+      assert.ok(!body.includes('truncated by gateway'), mode);
+      assert.ok(body.length > 233_000, mode);
+    }
+    const blob = await (await mcpStatic(g, 'json-blob', 233_000)).json();
+    assert.equal(blob.result.content.length, 2);
+    assert.equal(blob.result.content[1].type, 'resource', 'the embedded blob Claude Code saves to a file');
+    assert.ok(seen.headers['accept-encoding'], 'and the request is forwarded as it came');
+    // the same answer for an OAuth caller is capped
+    assert.match((await (await mcpFake(g, 'json-blob', 233_000)).json()).result.content[0].text, /truncated by gateway/);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: only a payload longer than the cap is truncated, however big its serialized form is', async () => {
+  const g = await startCapGateway();
+  try {
+    const exact = await (await mcpFake(g, 'json', 100_000)).json(); // serialized form is a little over 100,000
+    assert.equal(exact.result.content[0].text, BIG_TEXT(100_000), 'payload fits: untouched');
+
+    for (const size of [80_000, 100_000]) {
+      const blob = await (await mcpFake(g, 'json-blob', size)).json(); // base64 makes it ~33% bigger than the payload
+      assert.equal(blob.result.content.length, 2, `${size}: untouched`);
+      assert.equal(blob.result.content[1].resource.blob, Buffer.from(BIG_TEXT(size)).toString('base64'));
+    }
+    const over = await (await mcpFake(g, 'json-blob', 100_001)).json();
+    assert.equal(over.result.content[0].text, BIG_TEXT(100_001).slice(0, CAP) + MARK(100_001));
+    const overText = await (await mcpFake(g, 'json', 100_001)).json();
+    assert.equal(overText.result.content[0].text, BIG_TEXT(100_001).slice(0, CAP) + MARK(100_001));
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Grants are pruned by the flush timer as well as at startup, and again when the server closes', async () => {
+  const day = 86400_000;
+  let t = 40_000_000_000;
+  const g = await startGateway({ now: () => t, flushMs: 15 });
+  try {
+    const c = await connect(g.base);
+    const gid = Object.keys(grantsOf(g.stateDir))[0];
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200);
+    t += 31 * day; // idle past the 30-day refresh TTL
+    for (let i = 0; i < 300 && gid in grantsOf(g.stateDir); i++) await new Promise(r => setTimeout(r, 10));
+    assert.ok(!(gid in grantsOf(g.stateDir)), 'the timer pruned the idle grant');
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 401, 'and it is gone from memory too');
+  } finally {
+    await g.stop();
+  }
+
+  // Closing flushes the same way.
+  let u = 50_000_000_000;
+  const h = await startGateway({ now: () => u });
+  const d = await connect(h.base);
+  const hid = Object.keys(grantsOf(h.stateDir))[0];
+  await formAt(h.base, '/oauth/revoke', { token: d.tok.access_token });
+  u += 31 * day;
+  await h.stop();
+  assert.ok(!(hid in grantsOf(h.stateDir)), 'a long-revoked grant is pruned on close');
 });
