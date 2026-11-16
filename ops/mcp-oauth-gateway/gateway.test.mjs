@@ -16,7 +16,45 @@ const VIEWER_KEY = 'owa_k1_viewer';
 const ROLES = { [GOOD_KEY]: 'admin', [VIEWER_KEY]: 'viewer' };
 const liveKeys = new Set([GOOD_KEY, VIEWER_KEY]); // a test deletes a key here to "revoke it upstream"
 let validateDelayMs = 0; // a test raises it to make concurrent requests overlap
-let upstream, upPort, gateway, base, seen;
+let upstream, upPort, gateway, base, seen, streamRelease;
+
+/** Fake OpenWA /mcp answers. x-fake picks the shape, x-fake-size the text length, x-fake-error sets isError. */
+const BIG_TEXT = n => 'abcdefghij'.repeat(Math.ceil(n / 10)).slice(0, n);
+function fakeMcp(req, res) {
+  const mode = req.headers['x-fake'];
+  const size = Number(req.headers['x-fake-size'] ?? 10);
+  const text = BIG_TEXT(size);
+  const result = { content: [{ type: 'text', text }], extra: 'kept' };
+  if (req.headers['x-fake-error']) result.isError = true;
+  if (mode.endsWith('blob')) {
+    result.content = [
+      { type: 'text', text: `Received resource x with ${size} bytes` },
+      { type: 'resource', resource: { uri: 'owa://x', mimeType: 'application/json', blob: Buffer.from(text).toString('base64') } },
+    ];
+  }
+  if (mode === 'nocontent') delete result.content, (result.tools = [{ name: 'big', description: text }]);
+  const msg = { jsonrpc: '2.0', id: 7, result };
+  if (mode === 'notrpc') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ content: [{ type: 'text', text }] }));
+  }
+  if (mode === 'plain') {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    return res.end(JSON.stringify(msg));
+  }
+  if (mode.startsWith('sse')) {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    const frame = `event: message\nid: 7\ndata: ${JSON.stringify(msg)}\n\n`;
+    res.write(frame.slice(0, 20)); // split mid-frame, and no content-length: chunked
+    return res.end(frame.slice(20));
+  }
+  if (mode === 'batch') {
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    return res.end(JSON.stringify([msg, { jsonrpc: '2.0', id: 8, result: { content: [{ type: 'text', text: 'small' }] } }]));
+  }
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(msg));
+}
 
 const listen = srv => new Promise(r => srv.listen(0, '127.0.0.1', () => r(srv.address().port)));
 
@@ -33,6 +71,14 @@ before(async () => {
       return validateDelayMs ? setTimeout(answer, validateDelayMs) : answer();
     }
     seen = { url: req.url, method: req.method, headers: req.headers };
+    if (req.url === '/api/stream') {
+      // two chunks with a gap the test controls: a proxy that buffers never delivers the first one
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('one\n');
+      streamRelease = () => res.end('two\n');
+      return;
+    }
+    if (req.headers['x-fake']) return fakeMcp(req, res);
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ upstream: true }));
   });
@@ -1189,6 +1235,148 @@ test('CIMD: the document cache is bounded, so the oldest entry is evicted and fe
     }
     assert.equal((await cimdAuthorize(g.base, first)).status, 200);
     assert.equal(h.requests.filter(u => u === first).length, 2, 'evicted, then fetched again');
+  } finally {
+    await g.stop();
+  }
+});
+
+// ---- phase 2: result cap ----
+
+const CAP = 100_000;
+const MARK = n => `\n…[truncated by gateway: ${n} characters in all; narrow the request (limit/offset) to see the rest]`;
+const mcpFake = (b, mode, size, extra = {}) =>
+  fetch(`${b}/mcp`, { method: 'POST', headers: { 'x-api-key': GOOD_KEY, 'x-fake': mode, 'x-fake-size': String(size), ...extra }, body: '{}' });
+const sseData = text => JSON.parse(text.split('\n').find(l => l.startsWith('data:')).slice(5));
+
+test('Result cap: a JSON answer under the cap passes through byte for byte, with a correct content-length', async () => {
+  const g = await startGateway();
+  try {
+    const res = await mcpFake(g.base, 'json', 99_000);
+    const body = await res.text();
+    assert.equal(JSON.parse(body).result.content[0].text, BIG_TEXT(99_000));
+    assert.equal(Number(res.headers.get('content-length')), Buffer.byteLength(body));
+    assert.equal(res.headers.get('content-type'), 'application/json');
+    assert.equal(seen.headers['accept-encoding'], undefined, 'the gateway asks upstream for an unencoded body it can read');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: a JSON answer over the cap becomes one text item of the first 100,000 characters plus the marker', async () => {
+  const g = await startGateway();
+  try {
+    const res = await mcpFake(g.base, 'json', 150_000);
+    const body = await res.text();
+    const msg = JSON.parse(body);
+    assert.equal(msg.id, 7);
+    assert.equal(msg.result.extra, 'kept', 'other fields stay');
+    assert.equal(msg.result.isError, undefined);
+    assert.equal(msg.result.content.length, 1);
+    assert.equal(msg.result.content[0].type, 'text');
+    assert.equal(msg.result.content[0].text, BIG_TEXT(150_000).slice(0, CAP) + MARK(150_000));
+    assert.equal(Number(res.headers.get('content-length')), Buffer.byteLength(body), 'content-length recomputed');
+    assert.equal(res.headers.get('transfer-encoding'), null);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: isError is kept on a truncated result, and a JSON-RPC batch is handled item by item', async () => {
+  const g = await startGateway();
+  try {
+    const err = await (await mcpFake(g.base, 'json', 150_000, { 'x-fake-error': '1' })).json();
+    assert.equal(err.result.isError, true);
+    assert.match(err.result.content[0].text, /truncated by gateway/);
+
+    const batch = await (await mcpFake(g.base, 'batch', 150_000)).json();
+    assert.match(batch[0].result.content[0].text, /truncated by gateway: 150000 characters/);
+    assert.deepEqual(batch[1].result.content, [{ type: 'text', text: 'small' }]);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: SSE answers pass unchanged under the cap, and are truncated inside their event over it', async () => {
+  const g = await startGateway();
+  try {
+    const small = await (await mcpFake(g.base, 'sse', 1000)).text();
+    assert.equal(sseData(small).result.content[0].text, BIG_TEXT(1000));
+    assert.equal(small, `event: message\nid: 7\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: 7, result: { content: [{ type: 'text', text: BIG_TEXT(1000) }], extra: 'kept' } })}\n\n`);
+
+    const res = await mcpFake(g.base, 'sse', 150_000);
+    const big = await res.text();
+    assert.match(big, /^event: message\nid: 7\ndata: \{/, 'event and id lines kept');
+    assert.ok(big.endsWith('\n\n'));
+    const msg = sseData(big);
+    assert.equal(msg.result.content.length, 1);
+    assert.equal(msg.result.content[0].text, BIG_TEXT(150_000).slice(0, CAP) + MARK(150_000));
+    assert.equal(msg.result.extra, 'kept');
+    assert.equal(Number(res.headers.get('content-length')), Buffer.byteLength(big));
+    assert.match(res.headers.get('content-type'), /^text\/event-stream/);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: an embedded base64 resource blob is decoded and truncated; a small blob result is left alone', async () => {
+  const g = await startGateway();
+  try {
+    const msg = await (await mcpFake(g.base, 'json-blob', 233_000)).json();
+    assert.equal(msg.result.content.length, 1);
+    assert.equal(msg.result.content[0].text, BIG_TEXT(233_000).slice(0, CAP) + MARK(233_000), 'the decoded payload, not the label or the base64');
+
+    const sse = sseData(await (await mcpFake(g.base, 'sse-blob', 233_000)).text());
+    assert.equal(sse.result.content[0].text, BIG_TEXT(233_000).slice(0, CAP) + MARK(233_000));
+
+    const small = await (await mcpFake(g.base, 'json-blob', 2000)).json();
+    assert.equal(small.result.content.length, 2, 'under the cap: untouched');
+    assert.equal(small.result.content[1].type, 'resource');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: results with no content, non-JSON-RPC bodies and other content types pass through unchanged', async () => {
+  const g = await startGateway();
+  try {
+    for (const mode of ['nocontent', 'notrpc', 'plain']) {
+      const res = await mcpFake(g.base, mode, 150_000);
+      const body = await res.text();
+      assert.ok(body.length > CAP, mode);
+      assert.ok(!body.includes('truncated by gateway'), mode);
+    }
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: a body over the hard buffer limit streams through unchanged, and the cap is configurable', async () => {
+  const g = await startGateway({ maxResultChars: 100, maxBufferBytes: 2000 });
+  try {
+    const mid = await (await mcpFake(g.base, 'json', 1000)).json();
+    assert.equal(mid.result.content[0].text, BIG_TEXT(100) + MARK(1000), 'under the buffer limit: capped at the configured size');
+
+    const res = await mcpFake(g.base, 'json', 5000);
+    const body = await res.json();
+    assert.equal(body.result.content[0].text, BIG_TEXT(5000), 'over the buffer limit: whole answer, untouched');
+    const sse = await (await mcpFake(g.base, 'sse', 5000)).text();
+    assert.equal(sseData(sse).result.content[0].text, BIG_TEXT(5000));
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: everything that is not POST /mcp still streams', async () => {
+  const g = await startGateway();
+  try {
+    const res = await fetch(`${g.base}/api/stream`);
+    const reader = res.body.getReader();
+    const first = await reader.read(); // would hang if the gateway buffered the answer
+    assert.equal(new TextDecoder().decode(first.value), 'one\n');
+    streamRelease();
+    let rest = '';
+    for (let r = await reader.read(); !r.done; r = await reader.read()) rest += new TextDecoder().decode(r.value);
+    assert.equal(rest, 'two\n');
   } finally {
     await g.stop();
   }

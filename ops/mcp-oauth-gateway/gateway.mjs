@@ -43,6 +43,10 @@ const CIMD_MAX_INFLIGHT = 4;
 const CIMD_OK_TTL_MS = 600_000; // 10m
 const CIMD_FAIL_TTL_MS = 120_000; // 2m
 const CIMD_CACHE_MAX = 256;
+// OpenWA returns any tool result over 32 KB as an embedded base64 resource with no upper bound; clients choke
+// on that (claude.ai ~150k characters). The gateway caps what it relays until upstream does.
+export const MAX_RESULT_CHARS = 100_000;
+const MAX_BUFFERED_BYTES = 8 * 1024 * 1024; // a /mcp answer bigger than this is relayed untouched
 const AUTHORIZE_PARAMS = ['client_id', 'redirect_uri', 'response_type', 'code_challenge', 'code_challenge_method', 'state', 'scope', 'resource'];
 
 const log = (msg, extra = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), msg, ...extra }));
@@ -209,6 +213,8 @@ export function createGateway({
   cimdLookup = dns.lookup, // injectable so tests never touch the network
   cimdRequest = https.request,
   cimdTimeoutMs = 5000,
+  maxResultChars = MAX_RESULT_CHARS,
+  maxBufferBytes = MAX_BUFFERED_BYTES,
 }) {
   issuer = issuer.replace(/\/$/, '');
   const resource = `${issuer}/mcp`;
@@ -763,12 +769,110 @@ export function createGateway({
     return h;
   };
 
-  function proxy(req, res, headers = forwardedHeaders(req)) {
+  // ---- result cap (POST /mcp answers only) ----
+
+  /** Cap one JSON-RPC message's `result.content` in place. Returns true when it changed. */
+  function capMessage(msg) {
+    const content = msg?.result?.content;
+    if (!Array.isArray(content)) return false;
+    const serialized = JSON.stringify(content).length;
+    if (serialized <= maxResultChars) return false;
+    // The payload is the decoded resource blob when there is one (the text item next to it is only a label);
+    // otherwise the text items.
+    const blobs = content.filter(i => i?.type === 'resource' && typeof i.resource?.blob === 'string');
+    const text = blobs.length
+      ? blobs.map(i => Buffer.from(i.resource.blob, 'base64').toString('utf8')).join('\n')
+      : content
+          .map(i => (i?.type === 'text' ? i.text : i?.type === 'resource' ? i.resource?.text : undefined))
+          .filter(t => typeof t === 'string')
+          .join('\n');
+    let head = text.slice(0, maxResultChars);
+    if (/[\ud800-\udbff]$/.test(head)) head = head.slice(0, -1); // never cut a surrogate pair in half
+    const total = text.length || serialized;
+    msg.result.content = [
+      { type: 'text', text: `${head}\n…[truncated by gateway: ${total} characters in all; narrow the request (limit/offset) to see the rest]` },
+    ];
+    return true;
+  }
+
+  /** Apply the cap to a whole answer body. Returns the new body, or null when nothing needed changing. */
+  function capBody(text, contentType) {
+    if (/^text\/event-stream/i.test(contentType)) {
+      let changed = false;
+      const parts = text.split(/(\r?\n\r?\n)/); // events and their separators, kept
+      const out = parts.map(part => {
+        const lines = part.split(/\r?\n/);
+        const at = lines.findIndex(l => l.startsWith('data:'));
+        if (at < 0) return part;
+        const data = lines.filter(l => l.startsWith('data:')).map(l => l.slice(5).replace(/^ /, '')).join('\n');
+        let msg;
+        try {
+          msg = JSON.parse(data);
+        } catch {
+          return part;
+        }
+        const batch = Array.isArray(msg) ? msg : [msg];
+        if (!batch.map(capMessage).some(Boolean)) return part;
+        changed = true;
+        const rest = lines.filter(l => !l.startsWith('data:'));
+        rest.splice(at, 0, `data: ${JSON.stringify(msg)}`);
+        return rest.join('\n');
+      });
+      return changed ? out.join('') : null;
+    }
+    let msg;
+    try {
+      msg = JSON.parse(text);
+    } catch {
+      return null;
+    }
+    const batch = Array.isArray(msg) ? msg : [msg];
+    return batch.map(capMessage).some(Boolean) ? JSON.stringify(msg) : null;
+  }
+
+  function proxy(req, res, headers = forwardedHeaders(req), { capResult = false } = {}) {
+    if (capResult) delete headers['accept-encoding']; // the answer must be readable to be capped
     const upReq = http.request(
       { host: up.hostname, port: up.port || 80, method: req.method, path: req.url, headers, agent },
       upRes => {
-        res.writeHead(upRes.statusCode ?? 502, upRes.headers);
-        upRes.pipe(res);
+        const status = upRes.statusCode ?? 502;
+        const type = String(upRes.headers['content-type'] ?? '');
+        if (!capResult || upRes.headers['content-encoding'] || !/^(application\/json|text\/event-stream)/i.test(type)) {
+          res.writeHead(status, upRes.headers);
+          return upRes.pipe(res);
+        }
+        // Buffer the answer (up to a hard limit) so it can be measured. Past the limit, relay what we have
+        // and stream the rest untouched.
+        const chunks = [];
+        let size = 0;
+        let relaying = false;
+        upRes.on('data', c => {
+          if (relaying) {
+            if (!res.write(c)) {
+              upRes.pause();
+              res.once('drain', () => upRes.resume());
+            }
+            return;
+          }
+          chunks.push(c);
+          size += c.length;
+          if (size > maxBufferBytes) {
+            relaying = true;
+            res.writeHead(status, upRes.headers);
+            for (const b of chunks.splice(0)) res.write(b);
+          }
+        });
+        upRes.on('end', () => {
+          if (relaying) return res.end();
+          const raw = Buffer.concat(chunks);
+          const capped = capBody(raw.toString('utf8'), type);
+          const body = capped === null ? raw : Buffer.from(capped, 'utf8');
+          const outHeaders = { ...upRes.headers, 'content-length': String(body.length) };
+          delete outHeaders['transfer-encoding'];
+          res.writeHead(status, outHeaders);
+          res.end(body);
+        });
+        upRes.on('error', () => res.destroy());
       },
     );
     upReq.on('error', e => {
@@ -803,12 +907,12 @@ export function createGateway({
       const headers = forwardedHeaders(req);
       delete headers.authorization;
       headers['x-api-key'] = at.k;
-      return proxy(req, res, headers);
+      return proxy(req, res, headers, { capResult: true });
     }
     // A JWT is a token minted by the old in-process OAuth module (or another issuer): tell the client to
     // re-run the flow instead of letting OpenWA reject it as an unknown API key without resource_metadata.
     if (bearer && looksLikeJwt(bearer)) return unauthorized(res, true);
-    proxy(req, res); // static API key: OpenWA validates it as before
+    proxy(req, res, undefined, { capResult: true }); // static API key: OpenWA validates it as before
   }
 
   const routes = {

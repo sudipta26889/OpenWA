@@ -46,6 +46,14 @@ client ──► :2785 mcp-oauth-gateway ──► openwa-api:2785 (not publishe
 5. **RFC 8252:** a registered `http://localhost` / `http://127.0.0.1` redirect URI matches any port (scheme, host, path, query equal), at authorize and at the token step; all other URIs are exact.
 6. **DCR schemes:** `cursor://` and `vscode://` redirect URIs are accepted (`CUSTOM_REDIRECT_SCHEMES` in `gateway.mjs`); other custom schemes are refused.
 
+## Result cap
+
+`POST /mcp` answers are buffered (up to 8 MB; bigger ones stream through untouched) and a JSON-RPC
+`result.content` over `MAX_RESULT_CHARS` (100,000) is replaced by one text item with its first 100,000
+characters (the decoded blob for an embedded base64 resource) and a `[truncated by gateway: N characters in all; …]`
+marker, in `application/json` and `text/event-stream` answers; `isError` and the other fields are kept. Remove it
+once upstream caps results itself.
+
 ## CIMD (client ID metadata documents)
 
 An `https://` URL as `client_id` (at `/oauth/authorize`, GET and POST, and the token endpoint) is a pointer to
