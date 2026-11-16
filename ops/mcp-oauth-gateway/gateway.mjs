@@ -38,6 +38,8 @@ const LOOPBACK_HOSTS = ['localhost', '127.0.0.1'];
 const LOOPBACK_ORIGIN = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
 // Browser-side origins of hosted MCP connectors; matched exactly, never by suffix.
 const HOSTED_CLIENT_ORIGINS = ['https://claude.ai', 'https://chatgpt.com'];
+const MAX_REDIRECT_URIS = 10; // per DCR registration or CIMD document
+const MAX_REDIRECT_URI_LENGTH = 512;
 const CIMD_MAX_BYTES = 64 * 1024; // a client metadata document is tiny
 const CIMD_MAX_INFLIGHT = 4;
 const CIMD_OK_TTL_MS = 600_000; // 10m
@@ -314,7 +316,13 @@ export function createGateway({
   });
 
   function checkRedirectUris(redirectUris) {
+    if (redirectUris.length > MAX_REDIRECT_URIS) {
+      throw new OAuthError('invalid_redirect_uri', `at most ${MAX_REDIRECT_URIS} redirect_uris are allowed`);
+    }
     for (const uri of redirectUris) {
+      if (uri.length > MAX_REDIRECT_URI_LENGTH) {
+        throw new OAuthError('invalid_redirect_uri', `a redirect_uri may be at most ${MAX_REDIRECT_URI_LENGTH} characters`);
+      }
       const custom = CUSTOM_REDIRECT_SCHEMES.some(s => uri.startsWith(`${s}://`));
       if (!custom && !/^https:\/\//.test(uri) && !/^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(uri)) {
         throw new OAuthError('invalid_redirect_uri', `redirect_uri must be https (or http localhost): ${uri}`);

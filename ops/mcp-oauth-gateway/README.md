@@ -81,6 +81,10 @@ Sealed DCR ids (`owgk.…`) keep working unchanged.
 - **Tests:** `createGateway({ cimdLookup, cimdRequest, cimdTimeoutMs })` replaces `dns.lookup`,
   `https.request` and the timeout, so no test touches the network.
 
+## Redirect URI limits
+
+A DCR registration or a CIMD document may list at most 10 redirect URIs, each at most 512 characters; beyond that DCR answers 400 `invalid_redirect_uri` and a CIMD document is refused.
+
 ## Connections
 
 `GET /oauth/connections` shows a form; the operator types an OpenWA API key, which is POSTed (never in a
