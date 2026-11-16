@@ -1578,3 +1578,43 @@ test('Grants are pruned by the flush timer as well as at startup, and again when
   await h.stop();
   assert.ok(!(hid in grantsOf(h.stateDir)), 'a long-revoked grant is pruned on close');
 });
+
+// ---- redirect URI limits (DCR and CIMD) ----
+
+const uriOfLength = n => 'https://claude.ai/' + 'a'.repeat(n - 'https://claude.ai/'.length);
+
+test('DCR: a 512-character redirect URI is accepted and a 513-character one refused', async () => {
+  assert.equal(uriOfLength(512).length, 512);
+  assert.equal((await register([uriOfLength(512)])).status, 201);
+  const bad = await register([uriOfLength(513)]);
+  assert.equal(bad.status, 400);
+  assert.equal(bad.body.error, 'invalid_redirect_uri');
+  assert.ok(!JSON.stringify(bad.body).includes('a'.repeat(100)), 'the long URI is not echoed back');
+});
+
+test('DCR: 10 redirect URIs are accepted and 11 refused', async () => {
+  const uris = n => Array.from({ length: n }, (_, i) => `https://claude.ai/cb${i}`);
+  assert.equal((await register(uris(10))).status, 201);
+  const bad = await register(uris(11));
+  assert.equal(bad.status, 400);
+  assert.equal(bad.body.error, 'invalid_redirect_uri');
+});
+
+test('CIMD: the same redirect URI limits hold for a client metadata document', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const run = async (uris, redirect) => {
+      const url = cimdUrl();
+      h.add(url, { body: cimdDoc(url, { redirect_uris: uris }) });
+      return (await cimdAuthorize(g.base, url, redirect)).status;
+    };
+    assert.equal(await run([uriOfLength(512)], uriOfLength(512)), 200);
+    assert.equal(await run([uriOfLength(513)], uriOfLength(513)), 400);
+    const ten = Array.from({ length: 10 }, (_, i) => `https://cimd.example.test/cb${i}`);
+    assert.equal(await run(ten, ten[0]), 200);
+    assert.equal(await run([...ten, 'https://cimd.example.test/cb10'], ten[0]), 400);
+  } finally {
+    await g.stop();
+  }
+});
