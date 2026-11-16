@@ -20,7 +20,7 @@ client ──► :2785 mcp-oauth-gateway ──► openwa-api:2785 (not publishe
 
 ## Fleet-checklist behaviours
 
-1. **Origin check:** `POST /mcp` with an `Origin` header that is not the issuer origin or `http://localhost|127.0.0.1[:port]` gets 403 (JSON-RPC error) before auth; no `Origin` passes.
+1. **Origin check:** `POST /mcp` with an `Origin` header that is not the issuer origin, `http://localhost|127.0.0.1[:port]`, or a hosted connector origin (`https://claude.ai`, `https://chatgpt.com`, exact match only) gets 403 (JSON-RPC error) before auth, and the refusal logs one `mcp origin refused` line with the origin clipped to 200 characters; no `Origin` passes.
 2. **`scope="mcp"`:** every 401 `WWW-Authenticate` carries it after `resource_metadata` (`error="invalid_token"` still follows when a token was sent).
 3. **RFC 9207:** the authorize redirect adds `iss=<issuer>`; AS metadata sets `authorization_response_iss_parameter_supported: true`.
 4. **RFC 8707:** a `resource` on authorize or `/oauth/token` (both grants) that is not `${issuer}/mcp` is `invalid_target` (400); omitting it is allowed.

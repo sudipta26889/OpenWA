@@ -29,6 +29,8 @@ const PREFIX = { access: 'owga.', refresh: 'owgr.', code: 'owgc.', client: 'owgk
 const CUSTOM_REDIRECT_SCHEMES = ['cursor', 'vscode'];
 const LOOPBACK_HOSTS = ['localhost', '127.0.0.1'];
 const LOOPBACK_ORIGIN = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+// Browser-side origins of hosted MCP connectors; matched exactly, never by suffix.
+const HOSTED_CLIENT_ORIGINS = ['https://claude.ai', 'https://chatgpt.com'];
 const AUTHORIZE_PARAMS = ['client_id', 'redirect_uri', 'response_type', 'code_challenge', 'code_challenge_method', 'state', 'scope', 'resource'];
 
 const log = (msg, extra = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), msg, ...extra }));
@@ -361,7 +363,13 @@ export function createGateway({ issuer, upstream, stateDir, now = () => Date.now
   function proxyMcp(req, res) {
     // DNS-rebinding guard: a present Origin must be the issuer or a loopback origin. No Origin passes.
     const origin = req.headers.origin;
-    if (origin !== undefined && origin !== new URL(issuer).origin && !LOOPBACK_ORIGIN.test(origin)) {
+    if (
+      origin !== undefined &&
+      origin !== new URL(issuer).origin &&
+      !LOOPBACK_ORIGIN.test(origin) &&
+      !HOSTED_CLIENT_ORIGINS.includes(origin)
+    ) {
+      log('mcp origin refused', { origin: String(origin).slice(0, 200) });
       return send(res, 403, { jsonrpc: '2.0', error: { code: -32000, message: 'Forbidden origin' }, id: null });
     }
     const auth = req.headers.authorization;

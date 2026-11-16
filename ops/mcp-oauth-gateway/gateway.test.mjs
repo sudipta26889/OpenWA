@@ -189,6 +189,36 @@ test('POST /mcp accepts the issuer origin, localhost origins and no Origin at al
   assert.equal((await mcpPost({})).status, 401, 'no Origin still goes to auth');
 });
 
+test('POST /mcp lets the hosted connector origins through to auth', async () => {
+  for (const origin of ['https://claude.ai', 'https://chatgpt.com']) {
+    assert.equal((await mcpPost({ origin })).status, 401, `${origin} without credentials`);
+    assert.equal((await mcpPost({ origin, 'x-api-key': GOOD_KEY })).status, 200, `${origin} with a key`);
+  }
+});
+
+test('POST /mcp still refuses look-alikes of the hosted origins', async () => {
+  for (const origin of ['https://claude.ai.evil.example', 'https://evil.claude.ai']) {
+    assert.equal((await mcpPost({ origin, 'x-api-key': GOOD_KEY })).status, 403, origin);
+  }
+});
+
+test('a refused Origin writes one log line, clipped to 200 characters', async () => {
+  const lines = [];
+  const orig = console.log;
+  console.log = (...a) => lines.push(a.join(' '));
+  try {
+    await mcpPost({ origin: 'https://evil.example', 'x-api-key': GOOD_KEY });
+    await mcpPost({ origin: 'https://' + 'a'.repeat(300) + '.example' });
+  } finally {
+    console.log = orig;
+  }
+  const refused = lines.map(l => JSON.parse(l)).filter(l => l.msg === 'mcp origin refused');
+  assert.equal(refused.length, 2);
+  assert.equal(refused[0].origin, 'https://evil.example');
+  assert.deepEqual(Object.keys(refused[0]).sort(), ['msg', 'origin', 'ts']);
+  assert.equal(refused[1].origin.length, 200);
+});
+
 test('every 401 WWW-Authenticate carries scope="mcp" after resource_metadata', async () => {
   const none = (await mcpPost({})).headers.get('www-authenticate');
   assert.match(none, /resource_metadata="[^"]+", scope="mcp"$/);
