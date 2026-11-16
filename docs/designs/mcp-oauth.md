@@ -90,7 +90,17 @@ The checklist items "reuse revokes the grant", "replay revokes the grant", "revo
 | Anthropic egress (`160.79.104.0/21`, `153.61.208.0/20`) | Done in practice: the claude.ai connector works. Recheck after any NPM or WAF change |
 | No apex-to-www redirect | Done: the MCP URL is a subdomain with no redirect |
 
-The upstream gaps go into one PR to `rmyndharis/OpenWA`: tool `title`, `openWorldHint: true` on the send tools, a configurable result cap, and validation errors returned as `isError`. Rewriting responses in the gateway was rejected: it is fragile across SSE and JSON, and it hides the fix from upstream.
+The upstream gaps go into one PR to `rmyndharis/OpenWA`: tool `title`, `openWorldHint: true` on the send tools, a configurable result cap, and validation errors returned as `isError`.
+
+**Revised 2026-11-16 (owner's "finish everything"):** the result cap could not wait for upstream, so the gateway now caps it. This reverses v1's "no response rewriting":
+- Only answers to OAuth-token callers (the claude.ai and ChatGPT path) are touched. Static-key callers keep OpenWA's resource-blob answer, which Claude Code saves to a file.
+- A result is truncated, with a note, only when its payload is longer than 100,000 characters.
+- JSON and SSE are both handled. Buffering is capped at 8 MB, beyond which the answer is relayed untouched.
+
+The gateway cap comes out once upstream ships its own.
+
+### 8. Accepted risks
+- **CIMD fetch slots:** an unauthenticated caller can keep the 4 CIMD fetch slots busy with slow URLs (5 s each), delaying a CIMD client whose document is not cached. That is availability only, not access. DCR clients and cached documents are unaffected. Revisit if it is seen in the logs.
 
 ## Tests (written first, `gateway.test.mjs`)
 - **Grants:**

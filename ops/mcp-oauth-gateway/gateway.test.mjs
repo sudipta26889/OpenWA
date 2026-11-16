@@ -1,28 +1,96 @@
-// Run: node --test ops/mcp-oauth-gateway/
+// Run: node --test ops/mcp-oauth-gateway/*.test.mjs
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import { Readable } from 'node:stream';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createGateway } from './gateway.mjs';
 
 const GOOD_KEY = 'owa_k1_good';
-let upstream, gateway, base, seen;
+const VIEWER_KEY = 'owa_k1_viewer';
+const ROLES = { [GOOD_KEY]: 'admin', [VIEWER_KEY]: 'viewer' };
+const liveKeys = new Set([GOOD_KEY, VIEWER_KEY]); // a test deletes a key here to "revoke it upstream"
+let validateFail = null; // a status number, 'reset' (drop the socket) or 'invalid200' (200 with valid:false)
+let lastValidate; // headers of the last /api/auth/validate call
+let validateDelayMs = 0; // a test raises it to make concurrent requests overlap
+let upstream, upPort, gateway, base, seen, streamRelease;
+
+/** Fake OpenWA /mcp answers. x-fake picks the shape, x-fake-size the text length, x-fake-error sets isError. */
+const BIG_TEXT = n => 'abcdefghij'.repeat(Math.ceil(n / 10)).slice(0, n);
+function fakeMcp(req, res) {
+  const mode = req.headers['x-fake'];
+  const size = Number(req.headers['x-fake-size'] ?? 10);
+  const text = BIG_TEXT(size);
+  const result = { content: [{ type: 'text', text }], extra: 'kept' };
+  if (req.headers['x-fake-error']) result.isError = true;
+  if (mode.endsWith('blob')) {
+    result.content = [
+      { type: 'text', text: `Received resource x with ${size} bytes` },
+      { type: 'resource', resource: { uri: 'owa://x', mimeType: 'application/json', blob: Buffer.from(text).toString('base64') } },
+    ];
+  }
+  if (mode === 'nocontent') delete result.content, (result.tools = [{ name: 'big', description: text }]);
+  const msg = { jsonrpc: '2.0', id: 7, result };
+  if (mode === 'notrpc') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ content: [{ type: 'text', text }] }));
+  }
+  if (mode === 'plain') {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    return res.end(JSON.stringify(msg));
+  }
+  if (mode.startsWith('sse')) {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    const frame = `event: message\nid: 7\ndata: ${JSON.stringify(msg)}\n\n`;
+    res.write(frame.slice(0, 20)); // split mid-frame, and no content-length: chunked
+    return res.end(frame.slice(20));
+  }
+  if (mode === 'batch') {
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    return res.end(JSON.stringify([msg, { jsonrpc: '2.0', id: 8, result: { content: [{ type: 'text', text: 'small' }] } }]));
+  }
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(msg));
+}
 
 const listen = srv => new Promise(r => srv.listen(0, '127.0.0.1', () => r(srv.address().port)));
 
 before(async () => {
-  // Fake OpenWA: validates GOOD_KEY, records what /mcp received, echoes a WebSocket-ish upgrade.
+  // Fake OpenWA: validates keys (with a role), records what /mcp received, echoes a WebSocket-ish upgrade.
   upstream = http.createServer((req, res) => {
     if (req.url === '/api/auth/validate') {
-      const ok = req.headers['x-api-key'] === GOOD_KEY;
-      res.writeHead(ok ? 200 : 401, { 'content-type': 'application/json' });
-      return res.end(JSON.stringify(ok ? { valid: true } : { message: 'Invalid API key' }));
+      lastValidate = req.headers;
+      if (validateFail === 'reset') return req.socket.destroy();
+      if (validateFail === 'invalid200') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ valid: false }));
+      }
+      if (validateFail) {
+        res.writeHead(validateFail, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ message: 'upstream trouble' }));
+      }
+      const key = req.headers['x-api-key'];
+      const ok = liveKeys.has(key);
+      const answer = () => {
+        res.writeHead(ok ? 200 : 401, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(ok ? { valid: true, role: ROLES[key] ?? 'operator' } : { message: 'Invalid API key' }));
+      };
+      return validateDelayMs ? setTimeout(answer, validateDelayMs) : answer();
     }
     seen = { url: req.url, method: req.method, headers: req.headers };
+    if (req.url === '/api/stream') {
+      // two chunks with a gap the test controls: a proxy that buffers never delivers the first one
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('one\n');
+      streamRelease = () => res.end('two\n');
+      return;
+    }
+    if (req.headers['x-fake']) return fakeMcp(req, res);
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ upstream: true }));
   });
@@ -30,7 +98,7 @@ before(async () => {
     seen = { url: req.url, headers: req.headers };
     socket.end('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\npong');
   });
-  const upPort = await listen(upstream);
+  upPort = await listen(upstream);
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owg-'));
   gateway = createGateway({ issuer: 'https://wa.example.test', upstream: `http://127.0.0.1:${upPort}`, stateDir });
   base = `http://127.0.0.1:${await listen(gateway)}`;
@@ -46,7 +114,7 @@ const form = (url, body) =>
   fetch(base + url, {
     method: 'POST',
     redirect: 'manual',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    headers: { 'content-type': 'application/x-www-form-urlencoded', origin: 'https://wa.example.test' },
     body: new URLSearchParams(body),
   });
 
@@ -89,7 +157,6 @@ test('full OAuth flow: register → consent → code → token → /mcp with the
   assert.equal((await form('/oauth/token', { ...exchange, code_verifier: 'nope' })).status, 400, 'PKCE enforced');
   const tok = await (await form('/oauth/token', exchange)).json();
   assert.ok(tok.access_token.startsWith('owga.'));
-  assert.equal((await form('/oauth/token', exchange)).status, 400, 'a code is single-use');
 
   const mcp = await fetch(`${base}/mcp`, { method: 'POST', headers: { authorization: `Bearer ${tok.access_token}` }, body: '{}' });
   assert.equal(mcp.status, 200);
@@ -99,7 +166,13 @@ test('full OAuth flow: register → consent → code → token → /mcp with the
   const refresh = { grant_type: 'refresh_token', refresh_token: tok.refresh_token, client_id };
   const rotated = await form('/oauth/token', refresh);
   assert.equal(rotated.status, 200);
+  // The just-rotated token stays usable for a 30 s retry window (see the Refresh tests), so it is only
+  // dead once it is two rotations old.
+  const second = await form('/oauth/token', { ...refresh, refresh_token: (await rotated.json()).refresh_token });
+  assert.equal(second.status, 200);
   assert.equal((await form('/oauth/token', refresh)).status, 400, 'a rotated refresh token is dead');
+
+  assert.equal((await form('/oauth/token', exchange)).status, 400, 'a code is single-use');
 });
 
 test('/mcp without credentials, or with a foreign JWT, asks the client to run the OAuth flow', async () => {
@@ -305,4 +378,1203 @@ test('DCR accepts cursor:// and vscode:// redirect URIs and refuses other custom
   const bad = await register(['myapp://cb']);
   assert.equal(bad.status, 400);
   assert.equal(bad.body.error, 'invalid_redirect_uri');
+});
+
+// ---- phase 2: grants, refresh, revoke ----
+
+const ISSUER = 'https://wa.example.test';
+const newStateDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'owg-'));
+/** A second (or third) gateway on the same stateDir simulates a restart. */
+async function startGateway({ stateDir = newStateDir(), now, ...extra } = {}) {
+  const gw = createGateway({ issuer: ISSUER, upstream: `http://127.0.0.1:${upPort}`, stateDir, now, ...extra });
+  const url = `http://127.0.0.1:${await listen(gw)}`;
+  const stop = async () => {
+    gw.closeAllConnections();
+    await new Promise(r => gw.close(r)); // 'close' flushes lastUsedAt
+  };
+  return { gw, stateDir, base: url, stop };
+}
+const formAt = (b, url, body) =>
+  fetch(b + url, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', origin: ISSUER },
+    body: new URLSearchParams(body),
+  });
+const grantsOf = dir => JSON.parse(fs.readFileSync(path.join(dir, 'grants.json'), 'utf8'));
+const mcpAt = (b, token) => fetch(`${b}/mcp`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}' });
+/** Register, approve with `key`, and exchange the code. Returns everything a test needs to poke at it. */
+async function connect(b, { key = GOOD_KEY, uri = 'https://claude.ai/cb', name = 'Claude' } = {}) {
+  const reg = await (
+    await fetch(`${b}/oauth/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ redirect_uris: [uri], client_name: name }),
+    })
+  ).json();
+  const { verifier, challenge } = pkce();
+  const q = authQuery(reg.client_id, uri, challenge);
+  const approved = await formAt(b, '/oauth/authorize', { ...q, api_key: key });
+  assert.equal(approved.status, 302);
+  const code = new URL(approved.headers.get('location')).searchParams.get('code');
+  const exchange = { grant_type: 'authorization_code', code, code_verifier: verifier, redirect_uri: uri, client_id: reg.client_id };
+  const res = await formAt(b, '/oauth/token', exchange);
+  const tok = res.status === 200 ? await res.json() : null;
+  const refresh = rt => formAt(b, '/oauth/token', { grant_type: 'refresh_token', refresh_token: rt, client_id: reg.client_id });
+  return { client_id: reg.client_id, exchange, tok, refresh };
+}
+/** Seal a token the way the gateway does, to forge a pre-phase-2 token (no gid). */
+function sealLegacy(stateDir, kind, prefix, obj) {
+  const secret = Buffer.from(fs.readFileSync(path.join(stateDir, 'gateway-secret.key'), 'utf8').trim(), 'base64');
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', secret, iv).setAAD(Buffer.from(kind));
+  const ct = Buffer.concat([c.update(JSON.stringify(obj), 'utf8'), c.final()]);
+  return prefix + Buffer.concat([iv, c.getAuthTag(), ct]).toString('base64url');
+}
+const sha16 = k => crypto.createHash('sha256').update(k).digest('hex').slice(0, 16);
+
+test('Grants: approving writes a grant with the key fingerprint and role, never the key', async () => {
+  const g = await startGateway();
+  try {
+    const c = await connect(g.base, { key: VIEWER_KEY, name: 'Claude Desktop' });
+    const file = fs.readFileSync(path.join(g.stateDir, 'grants.json'), 'utf8');
+    assert.ok(!file.includes(VIEWER_KEY), 'the API key is not stored');
+    const grants = Object.values(JSON.parse(file));
+    assert.equal(grants.length, 1);
+    const [grant] = grants;
+    assert.equal(grant.keyFp, sha16(VIEWER_KEY));
+    assert.equal(grant.keyRole, 'viewer');
+    assert.equal(grant.clientName, 'Claude Desktop');
+    assert.equal(grant.clientHost, 'claude.ai');
+    assert.equal(grant.codeUsed, true);
+    assert.ok(grant.codeJti && grant.refreshJti && grant.createdAt);
+    assert.equal(grant.revokedAt, undefined);
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200);
+    assert.deepEqual(fs.readdirSync(g.stateDir).filter(f => f.endsWith('.tmp') || f === 'revoked-refresh.json'), []);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Grants: lastUsedAt is kept in memory and flushed when the server closes', async () => {
+  const dir = newStateDir();
+  let t = 5_000_000;
+  const g = await startGateway({ stateDir: dir, now: () => t });
+  const c = await connect(g.base);
+  const gid = Object.keys(grantsOf(dir))[0];
+  const before = grantsOf(dir)[gid].lastUsedAt;
+  t += 10_000;
+  assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200);
+  assert.equal(grantsOf(dir)[gid].lastUsedAt, before, 'a /mcp call does not write the file');
+  await g.stop();
+  assert.equal(grantsOf(dir)[gid].lastUsedAt, 5_010_000);
+});
+
+test('Grants: a code reused after a gateway restart revokes the grant, and the first access token gets 401', async () => {
+  const a = await startGateway();
+  const c = await connect(a.base);
+  assert.equal((await mcpAt(a.base, c.tok.access_token)).status, 200);
+  await a.stop();
+
+  const b = await startGateway({ stateDir: a.stateDir });
+  try {
+    const again = await formAt(b.base, '/oauth/token', c.exchange);
+    assert.equal(again.status, 400);
+    assert.equal((await again.json()).error, 'invalid_grant');
+    assert.ok(Object.values(grantsOf(b.stateDir))[0].revokedAt, 'grant revoked');
+    const res = await mcpAt(b.base, c.tok.access_token);
+    assert.equal(res.status, 401);
+    assert.match(res.headers.get('www-authenticate'), /resource_metadata="[^"]+", scope="mcp", error="invalid_token"$/);
+    const rt = await formAt(b.base, '/oauth/token', { grant_type: 'refresh_token', refresh_token: c.tok.refresh_token, client_id: c.client_id });
+    assert.equal(rt.status, 400, 'its refresh token is dead too');
+  } finally {
+    await b.stop();
+  }
+});
+
+test('Grants: a revoked grant stays revoked across a restart', async () => {
+  const a = await startGateway();
+  const c = await connect(a.base);
+  await formAt(a.base, '/oauth/revoke', { token: c.tok.access_token });
+  await a.stop();
+  const b = await startGateway({ stateDir: a.stateDir });
+  try {
+    assert.equal((await mcpAt(b.base, c.tok.access_token)).status, 401);
+  } finally {
+    await b.stop();
+  }
+});
+
+test('Grants: tokens from before phase 2 (no gid) are refused', async () => {
+  const g = await startGateway();
+  try {
+    const { client_id } = await connect(g.base); // also creates the secret
+    const old = {
+      access: sealLegacy(g.stateDir, 'access', 'owga.', { k: GOOD_KEY, c: client_id, aud: `${ISSUER}/mcp`, exp: Date.now() + 60_000 }),
+      refresh: sealLegacy(g.stateDir, 'refresh', 'owgr.', { k: GOOD_KEY, c: client_id, sc: 'mcp', jti: 'j1', exp: Date.now() + 60_000 }),
+    };
+    const res = await mcpAt(g.base, old.access);
+    assert.equal(res.status, 401);
+    assert.match(res.headers.get('www-authenticate'), /error="invalid_token"/);
+    const rt = await formAt(g.base, '/oauth/token', { grant_type: 'refresh_token', refresh_token: old.refresh, client_id });
+    assert.equal(rt.status, 400);
+    assert.equal((await rt.json()).error, 'invalid_grant');
+
+    const { verifier, challenge } = pkce();
+    const code = sealLegacy(g.stateDir, 'code', 'owgc.', {
+      k: GOOD_KEY, c: client_id, u: 'https://claude.ai/cb', ch: challenge, sc: 'mcp', jti: 'c1', exp: Date.now() + 60_000,
+    });
+    const ex = await formAt(g.base, '/oauth/token', {
+      grant_type: 'authorization_code', code, code_verifier: verifier, redirect_uri: 'https://claude.ai/cb', client_id,
+    });
+    assert.equal(ex.status, 400);
+    assert.equal((await ex.json()).error, 'invalid_grant');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Grants: loading prunes grants revoked over 30 days ago and grants idle past the refresh TTL', async () => {
+  const dir = newStateDir();
+  const day = 86400_000;
+  const t = Date.now();
+  fs.writeFileSync(
+    path.join(dir, 'grants.json'),
+    JSON.stringify({
+      oldRevoked: { createdAt: t - 90 * day, lastUsedAt: t - 40 * day, revokedAt: t - 31 * day },
+      recentRevoked: { createdAt: t - 5 * day, lastUsedAt: t - 2 * day, revokedAt: t - 1 * day },
+      idle: { createdAt: t - 90 * day, lastUsedAt: t - 31 * day },
+      neverUsedOld: { createdAt: t - 31 * day },
+      live: { createdAt: t - 90 * day, lastUsedAt: t - 1 * day },
+    }),
+  );
+  const g = await startGateway({ stateDir: dir });
+  try {
+    assert.deepEqual(Object.keys(grantsOf(dir)).sort(), ['live', 'recentRevoked']);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Refresh: replaying an old refresh token revokes the grant', async () => {
+  const g = await startGateway();
+  try {
+    const c = await connect(g.base);
+    const r2 = await (await c.refresh(c.tok.refresh_token)).json();
+    const r3 = await (await c.refresh(r2.refresh_token)).json();
+    assert.equal((await c.refresh(c.tok.refresh_token)).status, 400, 'two rotations old');
+    assert.ok(Object.values(grantsOf(g.stateDir))[0].revokedAt);
+    assert.equal((await mcpAt(g.base, r3.access_token)).status, 401, 'the newest access token is cut off');
+    assert.equal((await c.refresh(r3.refresh_token)).status, 400, 'and so is the newest refresh token');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Refresh: the previous token works again within 30 s and revokes the grant after that', async () => {
+  let t = 1_000_000;
+  const g = await startGateway({ now: () => t });
+  try {
+    const a = await connect(g.base);
+    const r2 = await (await a.refresh(a.tok.refresh_token)).json();
+    t += 29_000;
+    const retry = await a.refresh(a.tok.refresh_token); // the client lost the response to the first refresh
+    assert.equal(retry.status, 200, 'inside the window');
+    const r3 = await retry.json();
+    assert.notEqual(r3.refresh_token, r2.refresh_token);
+    assert.equal((await mcpAt(g.base, r3.access_token)).status, 200);
+    assert.equal(grantsOf(g.stateDir)[Object.keys(grantsOf(g.stateDir))[0]].revokedAt, undefined);
+
+    const b = await connect(g.base);
+    await b.refresh(b.tok.refresh_token);
+    t += 31_000;
+    assert.equal((await b.refresh(b.tok.refresh_token)).status, 400, 'after the window');
+    const gb = Object.values(grantsOf(g.stateDir)).filter(x => x.revokedAt);
+    assert.equal(gb.length, 1, 'only the replayed grant is revoked');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Refresh: a key revoked upstream makes the refresh fail and revokes the grant', async () => {
+  const key = 'owa_k1_short_lived';
+  liveKeys.add(key);
+  const g = await startGateway();
+  try {
+    const c = await connect(g.base, { key });
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200);
+    liveKeys.delete(key);
+    const res = await c.refresh(c.tok.refresh_token);
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error, 'invalid_grant');
+    assert.ok(Object.values(grantsOf(g.stateDir))[0].revokedAt, 'grant revoked');
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 401);
+  } finally {
+    liveKeys.delete(key);
+    await g.stop();
+  }
+});
+
+test('Refresh: two concurrent refreshes with the same token give exactly one success', async () => {
+  const g = await startGateway();
+  validateDelayMs = 100;
+  try {
+    const c = await connect(g.base);
+    const [x, y] = await Promise.all([c.refresh(c.tok.refresh_token), c.refresh(c.tok.refresh_token)]);
+    assert.deepEqual([x.status, y.status].sort(), [200, 400]);
+    const winner = await (x.status === 200 ? x : y).json();
+    validateDelayMs = 0;
+    assert.equal((await mcpAt(g.base, winner.access_token)).status, 200, 'the grant survives the race');
+  } finally {
+    validateDelayMs = 0;
+    await g.stop();
+  }
+});
+
+test('Revoke: /oauth/revoke on an access token cuts off /mcp at the next call', async () => {
+  const g = await startGateway();
+  try {
+    const c = await connect(g.base);
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200);
+    const res = await formAt(g.base, '/oauth/revoke', { token: c.tok.access_token });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('access-control-allow-origin'), '*');
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 401);
+    assert.equal((await c.refresh(c.tok.refresh_token)).status, 400, 'the grant is gone, refresh too');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Revoke: a refresh token revokes the grant, and unknown, garbage or missing tokens still answer 200', async () => {
+  const g = await startGateway();
+  try {
+    const c = await connect(g.base);
+    assert.equal((await formAt(g.base, '/oauth/revoke', { token: c.tok.refresh_token })).status, 200);
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 401);
+    for (const body of [{ token: 'owga.AAAA' }, { token: 'whatever' }, {}, { token: GOOD_KEY }]) {
+      assert.equal((await formAt(g.base, '/oauth/revoke', body)).status, 200, JSON.stringify(body));
+    }
+    const junk = await fetch(`${g.base}/oauth/revoke`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{nope' });
+    assert.equal(junk.status, 200);
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 401);
+    assert.equal((await fetch(`${g.base}/mcp`, { method: 'POST', headers: { 'x-api-key': GOOD_KEY }, body: '{}' })).status, 200, 'the static key is untouched');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Revoke: another grant is not affected; the preflight answers 204; metadata advertises the endpoint', async () => {
+  const g = await startGateway();
+  try {
+    const one = await connect(g.base);
+    const two = await connect(g.base);
+    await formAt(g.base, '/oauth/revoke', { token: one.tok.access_token });
+    assert.equal((await mcpAt(g.base, two.tok.access_token)).status, 200);
+
+    const pre = await fetch(`${g.base}/oauth/revoke`, { method: 'OPTIONS' });
+    assert.equal(pre.status, 204);
+    assert.equal(pre.headers.get('access-control-allow-origin'), '*');
+    assert.match(pre.headers.get('access-control-allow-methods'), /POST/);
+
+    const meta = await (await fetch(`${g.base}/.well-known/oauth-authorization-server`)).json();
+    assert.equal(meta.revocation_endpoint, `${ISSUER}/oauth/revoke`);
+    assert.deepEqual(meta.revocation_endpoint_auth_methods_supported, ['none']);
+  } finally {
+    await g.stop();
+  }
+});
+
+// ---- phase 2: consent CSRF, client host, connections view ----
+
+const rawPost = (b, url, body, headers = {}) =>
+  fetch(b + url, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers },
+    body: new URLSearchParams(body),
+  });
+const consentQuery = async (b, uri = 'https://claude.ai/cb', name = 'Claude') => {
+  const reg = await (
+    await fetch(`${b}/oauth/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ redirect_uris: [uri], client_name: name }),
+    })
+  ).json();
+  return authQuery(reg.client_id, uri, pkce().challenge);
+};
+
+test('Consent: a POST is refused with the consent page and 403 unless Origin is the issuer, or absent with Sec-Fetch-Site same-origin', async () => {
+  const g = await startGateway();
+  try {
+    const q = { ...(await consentQuery(g.base)), api_key: GOOD_KEY };
+    const refused = [
+      { origin: 'https://evil.example' },
+      { origin: 'null' },
+      { origin: 'https://wa.example.test.evil.com' },
+      { origin: 'https://evil.example', 'sec-fetch-site': 'same-origin' }, // Origin wins over Sec-Fetch-Site
+      { 'sec-fetch-site': 'cross-site' },
+      { 'sec-fetch-site': 'same-site' },
+      { 'sec-fetch-site': 'none' },
+      {}, // neither header
+    ];
+    for (const headers of refused) {
+      const res = await rawPost(g.base, '/oauth/authorize', q, headers);
+      assert.equal(res.status, 403, JSON.stringify(headers));
+      assert.equal(res.headers.get('location'), null, 'no redirect with a code');
+      const html = await res.text();
+      assert.match(html, /<form/, 'the consent page is shown again');
+      assert.ok(!html.includes(GOOD_KEY), 'the key is never echoed');
+    }
+    assert.equal(fs.existsSync(path.join(g.stateDir, 'grants.json')), false, 'a refused POST creates no grant');
+
+    assert.equal((await rawPost(g.base, '/oauth/authorize', q, { origin: ISSUER })).status, 302, 'issuer Origin');
+    assert.equal((await rawPost(g.base, '/oauth/authorize', q, { 'sec-fetch-site': 'same-origin' })).status, 302, 'same-origin, no Origin');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Consent: the page shows the client host beside the client name, both HTML-escaped', async () => {
+  const g = await startGateway();
+  try {
+    const q = await consentQuery(g.base, 'https://app.evil.example:8443/cb', '<b>Fake Claude</b>');
+    const html = await (await fetch(`${g.base}/oauth/authorize?${new URLSearchParams(q)}`)).text();
+    assert.match(html, /<code>app\.evil\.example:8443<\/code>/, 'redirect host (with port), visible beside the name');
+    assert.match(html, /&lt;b&gt;Fake Claude&lt;\/b&gt;/, 'name escaped');
+    assert.ok(!html.includes('<b>Fake Claude</b>'));
+
+    // The host is also on the page re-rendered after a wrong key.
+    const bad = await rawPost(g.base, '/oauth/authorize', { ...q, api_key: 'wrong' }, { origin: ISSUER });
+    assert.equal(bad.status, 401);
+    assert.match(await bad.text(), /<code>app\.evil\.example:8443<\/code>/);
+  } finally {
+    await g.stop();
+  }
+});
+
+const connectionsPost = (b, key, headers = { origin: ISSUER }) => rawPost(b, '/oauth/connections', { api_key: key }, headers);
+const tokensIn = html => [...html.matchAll(/name="vtoken" value="([^"]+)"/g)].map(m => m[1]);
+const gidOf = (dir, name) => Object.entries(grantsOf(dir)).find(([, g]) => g.clientName === name)[0];
+async function twoConnections() {
+  const g = await startGateway();
+  const admin = await connect(g.base, { key: GOOD_KEY, name: 'AdminClient', uri: 'https://admin.example.test/cb' });
+  const viewer = await connect(g.base, { key: VIEWER_KEY, name: 'ViewerClient', uri: 'https://viewer.example.test/cb' });
+  return { g, admin, viewer, adminGid: gidOf(g.stateDir, 'AdminClient'), viewerGid: gidOf(g.stateDir, 'ViewerClient') };
+}
+
+test('Connections: GET is a form that POSTs a key, with no key in any URL, and every page is framed-denied and uncached', async () => {
+  const g = await startGateway();
+  try {
+    const res = await fetch(`${g.base}/oauth/connections?api_key=${GOOD_KEY}`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    const html = await res.text();
+    assert.match(html, /<form[^>]*method="post"[^>]*action="\/oauth\/connections"/i);
+    assert.match(html, /<input[^>]*type="password"[^>]*name="api_key"/);
+    assert.ok(!html.includes(GOOD_KEY), 'a key in the query string is ignored and not echoed');
+    assert.ok(!/<tr/.test(html), 'a GET lists nothing');
+
+    const post = await connectionsPost(g.base, GOOD_KEY);
+    assert.match(post.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+    assert.equal(post.headers.get('cache-control'), 'no-store');
+    const bad = await connectionsPost(g.base, 'wrong');
+    assert.equal(bad.status, 401);
+    assert.match(bad.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+    assert.ok(!(await bad.text()).includes('wrong'), 'a bad key is not echoed either');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Connections: a key sees only its own grants, an admin key sees all, and the key is never echoed', async () => {
+  const { g, admin, viewer } = await twoConnections();
+  try {
+    const own = await (await connectionsPost(g.base, VIEWER_KEY)).text();
+    assert.match(own, /ViewerClient/);
+    assert.match(own, /viewer\.example\.test/);
+    assert.match(own, /active/);
+    assert.doesNotMatch(own, /AdminClient/);
+    assert.equal(tokensIn(own).length, 1);
+
+    const all = await (await connectionsPost(g.base, GOOD_KEY)).text();
+    assert.match(all, /AdminClient/);
+    assert.match(all, /ViewerClient/);
+    assert.equal(tokensIn(all).length, 2);
+    for (const html of [own, all]) {
+      assert.ok(!html.includes(GOOD_KEY) && !html.includes(VIEWER_KEY), 'no key in the page');
+      assert.match(html, /\d{4}-\d\d-\d\dT/, 'created and last used are shown');
+    }
+    assert.ok(admin.tok && viewer.tok);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Connections: revoke cuts off the grant; revoked rows show their status', async () => {
+  const { g, admin, viewer } = await twoConnections();
+  try {
+    const [token] = tokensIn(await (await connectionsPost(g.base, VIEWER_KEY)).text());
+    const res = await rawPost(g.base, '/oauth/connections/revoke', { vtoken: token }, { origin: ISSUER });
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    assert.equal((await mcpAt(g.base, viewer.tok.access_token)).status, 401);
+    assert.equal((await mcpAt(g.base, admin.tok.access_token)).status, 200, 'other grants untouched');
+    assert.match(await (await connectionsPost(g.base, VIEWER_KEY)).text(), /revoked/);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Connections: an admin token revokes any grant; a non-admin token only its own key\'s grants', async () => {
+  const { g, admin, viewer, adminGid, viewerGid } = await twoConnections();
+  try {
+    const vToken = (key, gid, role, exp = Date.now() + 60_000) =>
+      sealLegacy(g.stateDir, 'v', 'owgv.', { keyFp: sha16(key), role, gid, exp });
+    const revoke = token => rawPost(g.base, '/oauth/connections/revoke', { vtoken: token }, { origin: ISSUER });
+
+    // a viewer-key token aimed at the admin grant is refused
+    assert.equal((await revoke(vToken(VIEWER_KEY, adminGid, 'viewer'))).status, 403);
+    assert.equal((await mcpAt(g.base, admin.tok.access_token)).status, 200);
+    // a token claiming admin with the wrong key fingerprint is still only as good as its role claim; the
+    // sealed role comes from our own validate call, so a viewer token cannot carry it
+    // an admin token covers the viewer's grant
+    assert.equal((await revoke(vToken(GOOD_KEY, viewerGid, 'admin'))).status, 200);
+    assert.equal((await mcpAt(g.base, viewer.tok.access_token)).status, 401);
+    // an unknown gid is refused
+    assert.equal((await revoke(vToken(GOOD_KEY, 'no-such-gid', 'admin'))).status, 403);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Connections: revoke refuses a foreign Origin, a missing Origin, a bad, expired or wrong-kind token', async () => {
+  let t = 10_000_000;
+  const g = await startGateway({ now: () => t });
+  try {
+    const c = await connect(g.base, { name: 'Solo' });
+    const [token] = tokensIn(await (await connectionsPost(g.base, GOOD_KEY)).text());
+    const revoke = (vtoken, headers = { origin: ISSUER }) => rawPost(g.base, '/oauth/connections/revoke', { vtoken }, headers);
+
+    assert.equal((await revoke(token, { origin: 'https://evil.example' })).status, 403);
+    assert.equal((await revoke(token, { 'sec-fetch-site': 'cross-site' })).status, 403);
+    assert.equal((await revoke(token, {})).status, 403);
+    assert.equal((await revoke('owgv.AAAA')).status, 403, 'forged');
+    assert.equal((await revoke(c.tok.access_token)).status, 403, 'an access token is not a revoke token');
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200, 'still live after every refusal');
+
+    t += 5 * 60_000 + 1000;
+    assert.equal((await revoke(token)).status, 403, 'expired after 5 minutes');
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200);
+
+    t -= 5 * 60_000; // inside the TTL again: the same token works
+    assert.equal((await revoke(token)).status, 200);
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 401);
+  } finally {
+    await g.stop();
+  }
+});
+
+// ---- phase 2: CIMD (client ID metadata documents) ----
+
+const PUBLIC_IP = '93.184.216.34';
+/**
+ * Stand-ins for dns.lookup and https.request, so no test touches the network. The fake request runs the
+ * `lookup` the gateway handed it (as Node's socket would) and "connects" to whatever address that returns.
+ */
+function cimdHarness() {
+  const docs = new Map(); // `${host}${path}` -> { status, headers, body | chunks, hold, never }
+  const h = {
+    docs,
+    answer: () => [{ address: PUBLIC_IP, family: 4 }], // what dns "resolves"; may change per call
+    lookups: 0,
+    requests: [], // every request that reached connect
+    connected: [], // the address each connection went to
+    pending: [], // responders for `hold` documents
+    useAll: true, // Node >= 20 calls lookup with { all: true }
+    add(url, doc) {
+      docs.set(url.replace('https://', ''), doc);
+      return url;
+    },
+  };
+  h.lookup = (host, opts, cb) => {
+    h.lookups++;
+    const list = h.answer(host, h.lookups);
+    if (list instanceof Error) return cb(list);
+    return opts?.all ? cb(null, list) : cb(null, list[0].address, list[0].family);
+  };
+  h.request = (opts, cb) => {
+    const req = new EventEmitter();
+    req.destroy = err => {
+      req.destroyed = true;
+      if (err) setImmediate(() => req.emit('error', err));
+    };
+    req.end = () => {
+      h.requests.push(`https://${opts.hostname}${opts.path}`);
+      const done = (err, address, family) => {
+        if (err) return setImmediate(() => req.emit('error', err));
+        const picked = h.useAll ? address[0].address : address;
+        h.connected.push(picked);
+        const doc = docs.get(`${opts.hostname}${opts.path}`) ?? { status: 404, body: {} };
+        const respond = () => {
+          if (req.destroyed) return;
+          const res = Readable.from(doc.chunks ?? [Buffer.from(JSON.stringify(doc.body))]);
+          res.statusCode = doc.status ?? 200;
+          res.headers = { 'content-type': 'application/json', ...doc.headers };
+          cb(res);
+        };
+        if (doc.hold) h.pending.push(respond);
+        else if (!doc.never) respond();
+      };
+      opts.lookup(opts.hostname, h.useAll ? { all: true } : {}, done);
+    };
+    return req;
+  };
+  return h;
+}
+const cimdGateway = (h, extra = {}) => startGateway({ cimdLookup: h.lookup, cimdRequest: h.request, ...extra });
+const CIMD_REDIRECT = 'https://cimd.example.test/cb';
+const cimdDoc = (url, extra = {}) => ({
+  client_id: url,
+  client_name: 'Cimd Client',
+  redirect_uris: [CIMD_REDIRECT],
+  token_endpoint_auth_method: 'none',
+  ...extra,
+});
+let cimdN = 0;
+const cimdUrl = () => `https://client.example.test/meta/${++cimdN}`;
+const cimdAuthorize = (b, clientId, redirect = CIMD_REDIRECT, challenge = pkce().challenge) =>
+  fetch(`${b}/oauth/authorize?${new URLSearchParams(authQuery(clientId, redirect, challenge))}`);
+
+test('CIMD: metadata advertises support, and a good document gives a consent page showing its name and URL host', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const meta = await (await fetch(`${g.base}/.well-known/oauth-authorization-server`)).json();
+    assert.equal(meta.client_id_metadata_document_supported, true);
+
+    const url = cimdUrl();
+    h.add(url, { body: cimdDoc(url, { client_name: 'Cimd <Client>' }) });
+    const res = await cimdAuthorize(g.base, url);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /<code>Cimd &lt;Client&gt;<\/code>/);
+    assert.match(html, /<code>client\.example\.test<\/code>/, 'the CIMD URL host, not the redirect host');
+    assert.deepEqual(h.connected, [PUBLIC_IP]);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: the full flow works with a URL client_id (authorize, token, /mcp, refresh) and records the client on the grant', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const url = cimdUrl();
+    h.add(url, { body: cimdDoc(url) });
+    const { verifier, challenge } = pkce();
+    const q = authQuery(url, CIMD_REDIRECT, challenge);
+    const approved = await rawPost(g.base, '/oauth/authorize', { ...q, api_key: GOOD_KEY }, { origin: ISSUER });
+    assert.equal(approved.status, 302);
+    const code = new URL(approved.headers.get('location')).searchParams.get('code');
+    const exchange = { grant_type: 'authorization_code', code, code_verifier: verifier, redirect_uri: CIMD_REDIRECT, client_id: url };
+    assert.equal((await formAt(g.base, '/oauth/token', { ...exchange, client_id: `${url}x` })).status, 400, 'another client_id');
+    const tok = await (await formAt(g.base, '/oauth/token', exchange)).json();
+    assert.equal((await mcpAt(g.base, tok.access_token)).status, 200);
+    const rt = await formAt(g.base, '/oauth/token', { grant_type: 'refresh_token', refresh_token: tok.refresh_token, client_id: url });
+    assert.equal(rt.status, 200);
+    const [grant] = Object.values(grantsOf(g.stateDir));
+    assert.equal(grant.clientName, 'Cimd Client');
+    assert.equal(grant.clientHost, 'client.example.test');
+    assert.equal(h.requests.length, 1, 'the document was fetched once and cached');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: a document may omit token_endpoint_auth_method, clips long names to 200 characters, and honours the loopback port rule', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const url = cimdUrl();
+    h.add(url, { body: { client_id: url, client_name: 'x'.repeat(300), client_uri: 'y'.repeat(300), redirect_uris: ['http://localhost/cb'] } });
+    const res = await cimdAuthorize(g.base, url, 'http://localhost:5555/cb');
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.ok(html.includes('x'.repeat(200)) && !html.includes('x'.repeat(201)));
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: documents that break the rules are refused', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const cases = {
+      'client_id differs from the URL': url => ({ body: cimdDoc(`${url}/other`) }),
+      'client_id missing': () => ({ body: { client_name: 'n', redirect_uris: [CIMD_REDIRECT] } }),
+      'redirect not listed': url => ({ body: cimdDoc(url, { redirect_uris: ['https://other.example.test/cb'] }) }),
+      'no redirect_uris': url => ({ body: cimdDoc(url, { redirect_uris: [] }) }),
+      'bad redirect scheme': url => ({ body: cimdDoc(url, { redirect_uris: ['myapp://cb'] }) }),
+      'client_secret_basic': url => ({ body: cimdDoc(url, { token_endpoint_auth_method: 'client_secret_basic' }) }),
+      'not JSON content-type': url => ({ headers: { 'content-type': 'text/html' }, body: cimdDoc(url) }),
+      'invalid JSON': () => ({ chunks: [Buffer.from('{nope')] }),
+      'JSON that is not an object': () => ({ body: ['x'] }),
+      '404': () => ({ status: 404, body: {} }),
+      '301 redirect': url => ({ status: 301, headers: { location: `${url}/moved` }, body: {} }),
+      '302 redirect': url => ({ status: 302, headers: { location: 'https://evil.example.test/x' }, body: cimdDoc(url) }),
+      // content-length claims 10 bytes, the stream sends 150 KB: the cap counts what arrives
+      'oversized streamed body': () => ({ headers: { 'content-length': '10' }, chunks: [Buffer.alloc(50_000, 97), Buffer.alloc(50_000, 97), Buffer.alloc(50_000, 97)] }),
+    };
+    for (const [name, make] of Object.entries(cases)) {
+      const url = cimdUrl();
+      h.add(url, make(url));
+      const res = await cimdAuthorize(g.base, url);
+      assert.equal(res.status, 400, name);
+      assert.ok(!(await res.text()).includes('Approve to'), name);
+    }
+    // and nothing was approvable: no grant exists
+    assert.equal(fs.existsSync(path.join(g.stateDir, 'grants.json')), false);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: URL rules are enforced before any lookup or connection', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const bad = [
+      'http://client.example.test/meta/1', // not https
+      'https://client.example.test:8443/meta/1',
+      'https://user@client.example.test/meta/1',
+      'https://user:pw@client.example.test/meta/1',
+      'https://client.example.test/meta/1#frag',
+      'https://client.example.test/meta/1#',
+      'https://client.example.test/a/../meta/1',
+      'https://client.example.test/a/./meta/1',
+      'https://client.example.test/%2e%2e/meta/1',
+      'https://client.example.test/%2E/meta/1',
+      'https://client.example.test',
+      'https://client.example.test/',
+      'https://client.example.test/?x=1',
+      'https://127.0.0.1/meta/1', // an IP literal skips the custom lookup, so it is refused outright
+      'https://[::1]/meta/1',
+      'https://2130706433/meta/1',
+      'https://[::ffff:127.0.0.1]/meta/1',
+    ];
+    for (const url of bad) {
+      const res = await cimdAuthorize(g.base, url);
+      assert.equal(res.status, 400, url);
+    }
+    assert.equal(h.lookups, 0, 'no DNS lookup');
+    assert.deepEqual(h.requests, [], 'no connection');
+
+    // the same rules at the token endpoint
+    const t = await formAt(g.base, '/oauth/token', { grant_type: 'refresh_token', refresh_token: 'owgr.x', client_id: 'https://user@client.example.test/meta/1' });
+    assert.equal(t.status, 400);
+    assert.equal((await t.json()).error, 'invalid_client');
+    assert.equal(h.lookups, 0);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: a host resolving to a private, loopback, mapped or NAT64 address is refused, and so is a mixed answer', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const blocked = [
+      '10.0.0.1', '172.16.0.1', '192.168.1.1', '127.0.0.1', '0.0.0.0', '169.254.169.254', '100.64.0.1', '224.0.0.1',
+      '::', '::1', 'fc00::1', 'fd12:3456::1', 'fe80::1', 'ff02::1',
+      '::ffff:127.0.0.1', '::ffff:10.0.0.1', '::ffff:7f00:1', '::ffff:a00:1',
+      '64:ff9b::a00:1', '64:ff9b::7f00:1',
+      '64:ff9b:1::1', 'fec0::1', '2001:db8::1',
+    ];
+    for (const address of blocked) {
+      const url = h.add(cimdUrl(), {});
+      h.add(url, { body: cimdDoc(url) });
+      h.answer = () => [{ address, family: address.includes(':') ? 6 : 4 }];
+      const res = await cimdAuthorize(g.base, url);
+      assert.equal(res.status, 400, address);
+    }
+    assert.deepEqual(h.connected, [], 'no connection was ever made to a blocked address');
+
+    // ANY blocked address in the answer refuses the whole name
+    const mixed = h.add(cimdUrl(), {});
+    h.add(mixed, { body: cimdDoc(mixed) });
+    h.answer = () => [{ address: PUBLIC_IP, family: 4 }, { address: '10.0.0.1', family: 4 }];
+    assert.equal((await cimdAuthorize(g.base, mixed)).status, 400);
+    assert.deepEqual(h.connected, []);
+
+    // a public address, including a mapped public v4, is fine; a failing lookup is refused
+    const ok = h.add(cimdUrl(), {});
+    h.add(ok, { body: cimdDoc(ok) });
+    h.answer = () => [{ address: '::ffff:5db8:d822', family: 6 }]; // ::ffff:93.184.216.34
+    assert.equal((await cimdAuthorize(g.base, ok)).status, 200);
+    const nx = cimdUrl();
+    h.answer = () => Object.assign(new Error('ENOTFOUND'), { code: 'ENOTFOUND' });
+    assert.equal((await cimdAuthorize(g.base, nx)).status, 400);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: the connection goes to the address the checked lookup returned (no DNS-rebinding gap)', async () => {
+  for (const useAll of [true, false]) {
+    const h = cimdHarness();
+    h.useAll = useAll;
+    const g = await cimdGateway(h);
+    try {
+      const url = h.add(cimdUrl(), {});
+      h.add(url, { body: cimdDoc(url) });
+      // The first answer is public; any later resolution would be loopback. A gap between "check" and
+      // "connect" (checking one lookup, connecting through another) would reach 127.0.0.1.
+      h.answer = (host, call) => (call === 1 ? [{ address: PUBLIC_IP, family: 4 }] : [{ address: '127.0.0.1', family: 4 }]);
+      assert.equal((await cimdAuthorize(g.base, url)).status, 200);
+      assert.deepEqual(h.connected, [PUBLIC_IP], `useAll=${useAll}`);
+      assert.equal(h.lookups, 1, 'resolved once');
+      assert.ok(h.requests[0].startsWith('https://client.example.test/'), 'the request keeps the real hostname for SNI and Host');
+    } finally {
+      await g.stop();
+    }
+  }
+});
+
+test('CIMD: a document is cached for 10 minutes, and a failure for 2 minutes', async () => {
+  let t = 20_000_000;
+  const h = cimdHarness();
+  const g = await cimdGateway(h, { now: () => t });
+  try {
+    const good = h.add(cimdUrl(), {});
+    h.add(good, { body: cimdDoc(good) });
+    const gone = h.add(cimdUrl(), { status: 404, body: {} });
+
+    assert.equal((await cimdAuthorize(g.base, good)).status, 200);
+    assert.equal((await cimdAuthorize(g.base, good)).status, 200);
+    assert.equal(h.requests.filter(u => u === good).length, 1, 'repeat served from cache');
+    assert.equal((await cimdAuthorize(g.base, gone)).status, 400);
+    assert.equal((await cimdAuthorize(g.base, gone)).status, 400);
+    assert.equal(h.requests.filter(u => u === gone).length, 1, 'the failure is cached too');
+
+    // the document appears after the failure; the negative cache still answers until 2 minutes pass
+    h.add(gone, { body: cimdDoc(gone) });
+    t += 119_000;
+    assert.equal((await cimdAuthorize(g.base, gone)).status, 400);
+    t += 2_000;
+    assert.equal((await cimdAuthorize(g.base, gone)).status, 200, 'fetched again after 2 minutes');
+    assert.equal(h.requests.filter(u => u === gone).length, 2);
+
+    t += 8 * 60_000; // 10 minutes after the first fetch of `good`
+    assert.equal((await cimdAuthorize(g.base, good)).status, 200);
+    assert.equal(h.requests.filter(u => u === good).length, 2, 'refetched after 10 minutes');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: at most 4 fetches run at once; the 5th is refused with 503 and not cached', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const urls = Array.from({ length: 5 }, () => h.add(cimdUrl(), {}));
+    for (const u of urls) h.add(u, { hold: true, body: cimdDoc(u) });
+    const running = urls.slice(0, 4).map(u => cimdAuthorize(g.base, u));
+    while (h.pending.length < 4) await new Promise(r => setImmediate(r));
+
+    const fifth = await cimdAuthorize(g.base, urls[4]);
+    assert.equal(fifth.status, 503);
+    assert.match(await fifth.text(), /temporar|try again/i);
+    assert.equal(h.requests.length, 4);
+
+    // the same URL asked again while it is in flight shares that fetch instead of using a slot
+    const shared = cimdAuthorize(g.base, urls[0]);
+    for (const release of h.pending.splice(0)) release();
+    assert.deepEqual((await Promise.all(running)).map(r => r.status), [200, 200, 200, 200]);
+    assert.equal((await shared).status, 200);
+    assert.equal(h.requests.length, 4, 'no extra fetch for the shared URL');
+
+    // slots are free again, and the refused URL was not cached as a failure
+    h.docs.get(urls[4].replace('https://', '')).hold = false;
+    assert.equal((await cimdAuthorize(g.base, urls[4])).status, 200);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: a server that never answers is cut off at the timeout and the slot is freed', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h, { cimdTimeoutMs: 40 });
+  try {
+    const url = h.add(cimdUrl(), { never: true });
+    const res = await cimdAuthorize(g.base, url);
+    assert.equal(res.status, 400);
+    const ok = h.add(cimdUrl(), {});
+    h.add(ok, { body: cimdDoc(ok) });
+    assert.equal((await cimdAuthorize(g.base, ok)).status, 200);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: DCR clients keep working beside CIMD ones', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const c = await connect(g.base, { name: 'Dcr Client' });
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200);
+    assert.deepEqual(h.requests, [], 'a sealed DCR id never triggers a fetch');
+    assert.equal((await cimdAuthorize(g.base, 'owgk.garbage')).status, 400);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('CIMD: the document cache is bounded, so the oldest entry is evicted and fetched again', async () => {
+  const h = cimdHarness();
+  const g = await cimdGateway(h);
+  try {
+    const first = cimdUrl();
+    h.add(first, { body: cimdDoc(first) });
+    assert.equal((await cimdAuthorize(g.base, first)).status, 200);
+    for (let i = 0; i < 256; i++) {
+      const u = cimdUrl();
+      h.add(u, { body: cimdDoc(u) });
+      assert.equal((await cimdAuthorize(g.base, u)).status, 200);
+    }
+    assert.equal((await cimdAuthorize(g.base, first)).status, 200);
+    assert.equal(h.requests.filter(u => u === first).length, 2, 'evicted, then fetched again');
+  } finally {
+    await g.stop();
+  }
+});
+
+// ---- phase 2: result cap ----
+
+const CAP = 100_000;
+const MARK = n => `\n…[truncated by gateway: ${n} characters in all; narrow the request (limit/offset) to see the rest]`;
+// The cap applies to OAuth-token callers only, so these tests connect first and call with the access token.
+const startCapGateway = async opts => {
+  const g = await startGateway(opts);
+  g.token = (await connect(g.base)).tok.access_token;
+  return g;
+};
+const mcpFake = (g, mode, size, extra = {}) =>
+  fetch(`${g.base}/mcp`, { method: 'POST', headers: { authorization: `Bearer ${g.token}`, 'x-fake': mode, 'x-fake-size': String(size), ...extra }, body: '{}' });
+const mcpStatic = (g, mode, size) =>
+  fetch(`${g.base}/mcp`, { method: 'POST', headers: { 'x-api-key': GOOD_KEY, 'x-fake': mode, 'x-fake-size': String(size) }, body: '{}' });
+const sseData = text => JSON.parse(text.split('\n').find(l => l.startsWith('data:')).slice(5));
+
+test('Result cap: a JSON answer under the cap passes through byte for byte, with a correct content-length', async () => {
+  const g = await startCapGateway();
+  try {
+    const res = await mcpFake(g, 'json', 99_000);
+    const body = await res.text();
+    assert.equal(JSON.parse(body).result.content[0].text, BIG_TEXT(99_000));
+    assert.equal(Number(res.headers.get('content-length')), Buffer.byteLength(body));
+    assert.equal(res.headers.get('content-type'), 'application/json');
+    assert.equal(seen.headers['accept-encoding'], undefined, 'the gateway asks upstream for an unencoded body it can read');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: a JSON answer over the cap becomes one text item of the first 100,000 characters plus the marker', async () => {
+  const g = await startCapGateway();
+  try {
+    const res = await mcpFake(g, 'json', 150_000);
+    const body = await res.text();
+    const msg = JSON.parse(body);
+    assert.equal(msg.id, 7);
+    assert.equal(msg.result.extra, 'kept', 'other fields stay');
+    assert.equal(msg.result.isError, undefined);
+    assert.equal(msg.result.content.length, 1);
+    assert.equal(msg.result.content[0].type, 'text');
+    assert.equal(msg.result.content[0].text, BIG_TEXT(150_000).slice(0, CAP) + MARK(150_000));
+    assert.equal(Number(res.headers.get('content-length')), Buffer.byteLength(body), 'content-length recomputed');
+    assert.equal(res.headers.get('transfer-encoding'), null);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: isError is kept on a truncated result, and a JSON-RPC batch is handled item by item', async () => {
+  const g = await startCapGateway();
+  try {
+    const err = await (await mcpFake(g, 'json', 150_000, { 'x-fake-error': '1' })).json();
+    assert.equal(err.result.isError, true);
+    assert.match(err.result.content[0].text, /truncated by gateway/);
+
+    const batch = await (await mcpFake(g, 'batch', 150_000)).json();
+    assert.match(batch[0].result.content[0].text, /truncated by gateway: 150000 characters/);
+    assert.deepEqual(batch[1].result.content, [{ type: 'text', text: 'small' }]);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: SSE answers pass unchanged under the cap, and are truncated inside their event over it', async () => {
+  const g = await startCapGateway();
+  try {
+    const small = await (await mcpFake(g, 'sse', 1000)).text();
+    assert.equal(sseData(small).result.content[0].text, BIG_TEXT(1000));
+    assert.equal(small, `event: message\nid: 7\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: 7, result: { content: [{ type: 'text', text: BIG_TEXT(1000) }], extra: 'kept' } })}\n\n`);
+
+    const res = await mcpFake(g, 'sse', 150_000);
+    const big = await res.text();
+    assert.match(big, /^event: message\nid: 7\ndata: \{/, 'event and id lines kept');
+    assert.ok(big.endsWith('\n\n'));
+    const msg = sseData(big);
+    assert.equal(msg.result.content.length, 1);
+    assert.equal(msg.result.content[0].text, BIG_TEXT(150_000).slice(0, CAP) + MARK(150_000));
+    assert.equal(msg.result.extra, 'kept');
+    assert.equal(Number(res.headers.get('content-length')), Buffer.byteLength(big));
+    assert.match(res.headers.get('content-type'), /^text\/event-stream/);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: an embedded base64 resource blob is decoded and truncated; a small blob result is left alone', async () => {
+  const g = await startCapGateway();
+  try {
+    const msg = await (await mcpFake(g, 'json-blob', 233_000)).json();
+    assert.equal(msg.result.content.length, 1);
+    assert.equal(msg.result.content[0].text, BIG_TEXT(233_000).slice(0, CAP) + MARK(233_000), 'the decoded payload, not the label or the base64');
+
+    const sse = sseData(await (await mcpFake(g, 'sse-blob', 233_000)).text());
+    assert.equal(sse.result.content[0].text, BIG_TEXT(233_000).slice(0, CAP) + MARK(233_000));
+
+    const small = await (await mcpFake(g, 'json-blob', 2000)).json();
+    assert.equal(small.result.content.length, 2, 'under the cap: untouched');
+    assert.equal(small.result.content[1].type, 'resource');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: results with no content, non-JSON-RPC bodies and other content types pass through unchanged', async () => {
+  const g = await startCapGateway();
+  try {
+    for (const mode of ['nocontent', 'notrpc', 'plain']) {
+      const res = await mcpFake(g, mode, 150_000);
+      const body = await res.text();
+      assert.ok(body.length > CAP, mode);
+      assert.ok(!body.includes('truncated by gateway'), mode);
+    }
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: a body over the hard buffer limit streams through unchanged, and the cap is configurable', async () => {
+  const g = await startCapGateway({ maxResultChars: 100, maxBufferBytes: 2000 });
+  try {
+    const mid = await (await mcpFake(g, 'json', 1000)).json();
+    assert.equal(mid.result.content[0].text, BIG_TEXT(100) + MARK(1000), 'under the buffer limit: capped at the configured size');
+
+    const res = await mcpFake(g, 'json', 5000);
+    const body = await res.json();
+    assert.equal(body.result.content[0].text, BIG_TEXT(5000), 'over the buffer limit: whole answer, untouched');
+    const sse = await (await mcpFake(g, 'sse', 5000)).text();
+    assert.equal(sseData(sse).result.content[0].text, BIG_TEXT(5000));
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: everything that is not POST /mcp still streams', async () => {
+  const g = await startCapGateway();
+  try {
+    const res = await fetch(`${g.base}/api/stream`);
+    const reader = res.body.getReader();
+    const first = await reader.read(); // would hang if the gateway buffered the answer
+    assert.equal(new TextDecoder().decode(first.value), 'one\n');
+    streamRelease();
+    let rest = '';
+    for (let r = await reader.read(); !r.done; r = await reader.read()) rest += new TextDecoder().decode(r.value);
+    assert.equal(rest, 'two\n');
+  } finally {
+    await g.stop();
+  }
+});
+
+// ---- phase 2 review fixes ----
+
+test('Upstream errors never revoke a grant: a 429, 500, 403, 502 or dropped connection during refresh gives 503 and the grant survives', async () => {
+  const g = await startGateway();
+  try {
+    const c = await connect(g.base);
+    const grant = () => Object.values(grantsOf(g.stateDir))[0];
+    for (const fail of [429, 500, 403, 502, 'reset']) {
+      validateFail = fail;
+      const res = await c.refresh(c.tok.refresh_token);
+      assert.equal(res.status, 503, String(fail));
+      assert.equal((await res.json()).error, 'temporarily_unavailable', String(fail));
+      assert.equal(grant().revokedAt, undefined, `grant survives ${fail}`);
+      assert.equal(grant().refreshJti, grantsOf(g.stateDir)[Object.keys(grantsOf(g.stateDir))[0]].refreshJti, 'not rotated');
+    }
+    validateFail = null;
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200, 'the access token still works');
+    const later = await c.refresh(c.tok.refresh_token);
+    assert.equal(later.status, 200, 'the same refresh token works once upstream recovers');
+    assert.ok((await later.json()).refresh_token);
+  } finally {
+    validateFail = null;
+    await g.stop();
+  }
+});
+
+test('Upstream errors: only a 401 or a 200 with valid:false means an invalid key', async () => {
+  const g = await startGateway();
+  try {
+    const c = await connect(g.base);
+    validateFail = 'invalid200';
+    const res = await c.refresh(c.tok.refresh_token);
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error, 'invalid_grant');
+    assert.ok(Object.values(grantsOf(g.stateDir))[0].revokedAt, 'a clear "invalid" does revoke');
+  } finally {
+    validateFail = null;
+    await g.stop();
+  }
+});
+
+test('Upstream errors: approve and the connections page answer 503, not "invalid key", when OpenWA is troubled', async () => {
+  const g = await startGateway();
+  try {
+    const q = { ...(await consentQuery(g.base)), api_key: GOOD_KEY };
+    for (const fail of [429, 500, 'reset']) {
+      validateFail = fail;
+      const a = await rawPost(g.base, '/oauth/authorize', q, { origin: ISSUER });
+      assert.equal(a.status, 503, `authorize ${fail}`);
+      assert.equal(a.headers.get('location'), null);
+      const l = await connectionsPost(g.base, GOOD_KEY);
+      assert.equal(l.status, 503, `connections ${fail}`);
+      assert.doesNotMatch(await l.text(), /Invalid OpenWA API key/);
+    }
+    assert.equal(fs.existsSync(path.join(g.stateDir, 'grants.json')), false, 'no grant was created');
+    validateFail = null;
+    assert.equal((await rawPost(g.base, '/oauth/authorize', q, { origin: ISSUER })).status, 302);
+  } finally {
+    validateFail = null;
+    await g.stop();
+  }
+});
+
+test('Key checks carry the client IP in X-Forwarded-For (approve, refresh, connections)', async () => {
+  const g = await startGateway();
+  try {
+    const q = { ...(await consentQuery(g.base)), api_key: GOOD_KEY };
+    await rawPost(g.base, '/oauth/authorize', q, { origin: ISSUER, 'x-forwarded-for': '203.0.113.9' });
+    assert.equal(lastValidate['x-forwarded-for'], '203.0.113.9, 127.0.0.1');
+
+    const c = await connect(g.base);
+    await formAt(g.base, '/oauth/token', { grant_type: 'refresh_token', refresh_token: c.tok.refresh_token, client_id: c.client_id });
+    assert.equal(lastValidate['x-forwarded-for'], '127.0.0.1', 'no header from the client: the peer address');
+    await fetch(`${g.base}/oauth/token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-forwarded-for': '198.51.100.7' },
+      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: c.tok.refresh_token, client_id: c.client_id }),
+    });
+    assert.equal(lastValidate['x-forwarded-for'], '198.51.100.7, 127.0.0.1');
+
+    await connectionsPost(g.base, GOOD_KEY, { origin: ISSUER, 'x-forwarded-for': '192.0.2.44' });
+    assert.equal(lastValidate['x-forwarded-for'], '192.0.2.44, 127.0.0.1');
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Code reuse revokes only after client_id, redirect_uri and PKCE check out', async () => {
+  const g = await startGateway();
+  try {
+    const c = await connect(g.base);
+    const grant = () => Object.values(grantsOf(g.stateDir))[0];
+    const ex = c.exchange;
+    for (const bad of [{ code_verifier: 'wrong-verifier' }, { redirect_uri: 'https://claude.ai/elsewhere' }, { client_id: 'owgk.nope' }]) {
+      const res = await formAt(g.base, '/oauth/token', { ...ex, ...bad });
+      assert.equal(res.status, 400, JSON.stringify(bad));
+      assert.equal(grant().revokedAt, undefined, `a used code with ${Object.keys(bad)} wrong cannot revoke`);
+    }
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200);
+
+    const again = await formAt(g.base, '/oauth/token', ex); // the real holder of the code, reusing it
+    assert.equal(again.status, 400);
+    assert.ok(grant().revokedAt, 'a verified reuse revokes');
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 401);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: static-key callers (Claude Code) keep OpenWA\'s answer untouched', async () => {
+  const g = await startCapGateway();
+  try {
+    for (const mode of ['json', 'json-blob', 'sse']) {
+      const res = await mcpStatic(g, mode, 233_000);
+      const body = await res.text();
+      assert.ok(!body.includes('truncated by gateway'), mode);
+      assert.ok(body.length > 233_000, mode);
+    }
+    const blob = await (await mcpStatic(g, 'json-blob', 233_000)).json();
+    assert.equal(blob.result.content.length, 2);
+    assert.equal(blob.result.content[1].type, 'resource', 'the embedded blob Claude Code saves to a file');
+    assert.ok(seen.headers['accept-encoding'], 'and the request is forwarded as it came');
+    // the same answer for an OAuth caller is capped
+    assert.match((await (await mcpFake(g, 'json-blob', 233_000)).json()).result.content[0].text, /truncated by gateway/);
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Result cap: only a payload longer than the cap is truncated, however big its serialized form is', async () => {
+  const g = await startCapGateway();
+  try {
+    const exact = await (await mcpFake(g, 'json', 100_000)).json(); // serialized form is a little over 100,000
+    assert.equal(exact.result.content[0].text, BIG_TEXT(100_000), 'payload fits: untouched');
+
+    for (const size of [80_000, 100_000]) {
+      const blob = await (await mcpFake(g, 'json-blob', size)).json(); // base64 makes it ~33% bigger than the payload
+      assert.equal(blob.result.content.length, 2, `${size}: untouched`);
+      assert.equal(blob.result.content[1].resource.blob, Buffer.from(BIG_TEXT(size)).toString('base64'));
+    }
+    const over = await (await mcpFake(g, 'json-blob', 100_001)).json();
+    assert.equal(over.result.content[0].text, BIG_TEXT(100_001).slice(0, CAP) + MARK(100_001));
+    const overText = await (await mcpFake(g, 'json', 100_001)).json();
+    assert.equal(overText.result.content[0].text, BIG_TEXT(100_001).slice(0, CAP) + MARK(100_001));
+  } finally {
+    await g.stop();
+  }
+});
+
+test('Grants are pruned by the flush timer as well as at startup, and again when the server closes', async () => {
+  const day = 86400_000;
+  let t = 40_000_000_000;
+  const g = await startGateway({ now: () => t, flushMs: 15 });
+  try {
+    const c = await connect(g.base);
+    const gid = Object.keys(grantsOf(g.stateDir))[0];
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 200);
+    t += 31 * day; // idle past the 30-day refresh TTL
+    for (let i = 0; i < 300 && gid in grantsOf(g.stateDir); i++) await new Promise(r => setTimeout(r, 10));
+    assert.ok(!(gid in grantsOf(g.stateDir)), 'the timer pruned the idle grant');
+    assert.equal((await mcpAt(g.base, c.tok.access_token)).status, 401, 'and it is gone from memory too');
+  } finally {
+    await g.stop();
+  }
+
+  // Closing flushes the same way.
+  let u = 50_000_000_000;
+  const h = await startGateway({ now: () => u });
+  const d = await connect(h.base);
+  const hid = Object.keys(grantsOf(h.stateDir))[0];
+  await formAt(h.base, '/oauth/revoke', { token: d.tok.access_token });
+  u += 31 * day;
+  await h.stop();
+  assert.ok(!(hid in grantsOf(h.stateDir)), 'a long-revoked grant is pruned on close');
 });
