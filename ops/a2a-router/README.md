@@ -63,6 +63,17 @@ restart. The router starts without the token file in `shadow` mode. The text sen
 | `ROUTER_SESSION_NAMES`        | optional JSON `{"<sessionId>":"personal-wa"}`  |
 | `ROUTER_DATA_DIR`, `PORT`     | `/data`, `8790`                                |
 
+### Evals (synthetic, no personal data)
+
+`node router.mjs eval [--mode flint|decision|both] [--temperature N] [--fixtures path]` runs
+`evals/fixtures.json` (40 made-up batches) one case at a time against LiteLLM and prints per-case results (ids
+only, never message bodies) and a summary: accuracy, false positives, false negatives, invalid outputs, p50/p95
+latency. `decision` mode calls `POST <base>/systemone` with `local/decision` and prints accuracy / FP / FN at
+confidence thresholds 0.5, 0.6, 0.7, 0.8 and 0.9; it stops with a clear error if LiteLLM refuses the key
+(401/403). Needs `ROUTER_LLM_BASE_URL` and `ROUTER_LLM_KEY_FILE`. `ROUTER_LLM_TEMPERATURE` (default `0`) sets the
+router's classification temperature. Flint is a reasoning model: the router sends no `max_tokens`, parses only
+`message.content`, and counts an empty content as invalid even if `reasoning_content` holds an answer.
+
 **Owner rule: WhatsApp text reaches `recursivesi/flint` and no other model.** `ROUTER_MODEL` may only be
 `recursivesi/flint`; any other value makes the router refuse to start (and `classify-fixture` refuse to
 run). LiteLLM must also have no fallback route from `recursivesi/flint` to a cloud model, otherwise a Flint

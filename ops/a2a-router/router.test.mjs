@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createRouter, buildPrompt, routeKey, runFixture, ICICI_FIXTURE, INBOUND_RETENTION_MS, buildMitraRequest } from './router.mjs';
+import { createRouter, buildPrompt, routeKey, runFixture, ICICI_FIXTURE, INBOUND_RETENTION_MS, buildMitraRequest, runEval, thresholdTable, trimForDecision, classifyMessages, EvalAbort } from './router.mjs';
 
 const SECRET = 'test-webhook-secret-123';
 const LLM = 'http://llm.test/v1';
@@ -812,6 +812,142 @@ test('mitra: a missing token file in shadow starts fine; in live it is peer_auth
 
 test('peer must be mitra or taskpilot', () => {
   assert.throws(() => createRouter({ mode: 'off', dataDir: os.tmpdir(), webhookSecret: SECRET, llmBaseUrl: LLM, peer: 'x' }), /peer must be/);
+});
+
+// ---- evals ----
+
+const FIXTURES = JSON.parse(fs.readFileSync(new URL('./evals/fixtures.json', import.meta.url), 'utf8'));
+const EVAL_CASES = [
+  { id: 'E1', messages: [{ body: 'BODY-ONE send the PAN', ts: 1795082400 }], expected_action_needed: true },
+  { id: 'E2', messages: [{ body: 'BODY-TWO good morning', ts: 1795082400 }], expected_action_needed: false },
+  { id: 'E3', messages: [{ body: 'BODY-THREE thanks', ts: 1795082400 }], expected_action_needed: false },
+];
+
+test('fixtures: 40 made-up cases with the required mix and no real numbers', () => {
+  assert.equal(FIXTURES.length, 40);
+  assert.equal(new Set(FIXTURES.map(c => c.id)).size, 40);
+  const t = FIXTURES.filter(c => c.expected_action_needed).length;
+  assert.ok(t >= 16 && t <= 20, `true cases: ${t}`);
+  assert.ok(FIXTURES.filter(c => /ignore|forget the rules|SYSTEM:/i.test(c.messages.map(m => m.body).join(' '))).length >= 4);
+  for (const c of FIXTURES) {
+    assert.ok(c.messages.length > 0 && c.messages.every(m => typeof m.body === 'string' && Number.isFinite(m.ts)), c.id);
+    assert.equal(typeof c.expected_action_needed, 'boolean');
+    assert.ok(!/\b[6-9]\d{9}\b|\b91\d{10}\b/.test(JSON.stringify(c)), `${c.id} looks like a real phone number`);
+  }
+});
+
+test('eval flint: runs cases one at a time, counts FP / FN / invalid, never reports bodies', async () => {
+  let active = 0;
+  let maxActive = 0;
+  const bodies = [];
+  const answers = { 'BODY-ONE': GOOD, 'BODY-TWO': { action_needed: true, summary: 'wrong' }, 'BODY-THREE': 'not json at all' };
+  const stub = async (url, init) => {
+    active++;
+    maxActive = Math.max(maxActive, active);
+    await new Promise(r => setTimeout(r, 2));
+    const b = JSON.parse(init.body);
+    assert.equal(b.temperature, 0.7);
+    assert.equal(b.max_tokens, undefined, 'no token cap, so reasoning cannot eat the answer');
+    const prompt = b.messages[1].content;
+    bodies.push(prompt);
+    active--;
+    return llmReply(answers[Object.keys(answers).find(k => prompt.includes(k))]);
+  };
+  const seenCases = [];
+  const out = await runEval({ mode: 'flint', cases: EVAL_CASES, fetch: stub, baseUrl: LLM, key: 'k', temperature: 0.7, onCase: (m, r) => seenCases.push(r) });
+  assert.equal(maxActive, 1);
+  assert.deepEqual(out.flint.summary, { cases: 3, accuracy: 33.3, false_positives: 1, false_negatives: 0, invalid: 1, p50_ms: out.flint.summary.p50_ms, p95_ms: out.flint.summary.p95_ms });
+  assert.ok(out.flint.summary.p95_ms >= out.flint.summary.p50_ms);
+  assert.ok(!JSON.stringify([out, seenCases]).includes('BODY-'), 'results carry ids, not message bodies');
+  assert.equal(seenCases[2].reason, 'invalid_json');
+});
+
+test('flint parse: only message.content counts; reasoning_content is ignored even when it holds JSON', async () => {
+  const withReasoning = (content, reasoning) => json(200, { choices: [{ message: { content, reasoning_content: reasoning } }] });
+  const ev = ICICI_FIXTURE;
+  const ok = await classifyMessages({ events: ev, baseUrl: LLM, key: 'k', model: 'recursivesi/flint', fetch: async () => withReasoning(JSON.stringify(GOOD), 'thinking: {"action_needed": false, "summary": "x"}') });
+  assert.equal(ok.action_needed, true);
+  for (const content of ['', null, undefined]) {
+    await assert.rejects(
+      classifyMessages({ events: ev, baseUrl: LLM, key: 'k', model: 'recursivesi/flint', fetch: async () => withReasoning(content, JSON.stringify(GOOD)) }),
+      /invalid_json/,
+    );
+  }
+});
+
+test('router passes ROUTER_LLM_TEMPERATURE through; the default stays 0', async () => {
+  const s0 = await setup();
+  await hook(s0, evt());
+  await s0.router.drain();
+  assert.equal(s0.calls.llm[0].body.temperature, 0);
+  const s1 = await setup({ cfg: { temperature: 1 } });
+  await hook(s1, evt());
+  await s1.router.drain();
+  assert.equal(s1.calls.llm[0].body.temperature, 1);
+});
+
+test('eval decision: POSTs /systemone with local/decision and reads answers.action_needed.noul', async () => {
+  const reqs = [];
+  const scores = { 'BODY-ONE': 0.95, 'BODY-TWO': 0.55, 'BODY-THREE': 0.1 };
+  const stub = async (url, init) => {
+    const b = JSON.parse(init.body);
+    reqs.push({ url, b, auth: init.headers.authorization });
+    const k = Object.keys(scores).find(x => b.state.messages.join(' ').includes(x));
+    return json(200, { model: 'local/decision', answers: { action_needed: { type: 'noul', noul: scores[k] } } });
+  };
+  const out = await runEval({ mode: 'decision', cases: EVAL_CASES, fetch: stub, baseUrl: 'http://litellm.test/v1', key: 'k' });
+  assert.equal(reqs.length, 3);
+  assert.equal(reqs[0].url, 'http://litellm.test/systemone');
+  assert.equal(reqs[0].b.model, 'local/decision');
+  assert.deepEqual(reqs[0].b.state.messages, ['BODY-ONE send the PAN']);
+  assert.equal(reqs[0].b.questions.action_needed.type, 'noul');
+  assert.ok(reqs[0].b.questions.action_needed.criteria.true && reqs[0].b.questions.action_needed.criteria.false);
+  assert.equal(reqs[0].auth, 'Bearer k');
+  assert.deepEqual(out.decision.results.map(r => r.noul), [0.95, 0.55, 0.1]);
+  assert.ok(!JSON.stringify(out).includes('BODY-'));
+});
+
+test('threshold table: accuracy, FP and FN at 0.5 / 0.6 / 0.7 / 0.8 / 0.9', () => {
+  const r = (expected, noul) => ({ expected, noul, valid: noul !== null });
+  const results = [r(true, 0.95), r(true, 0.75), r(true, 0.55), r(false, 0.65), r(false, 0.3), r(false, null)];
+  const table = thresholdTable(results);
+  assert.deepEqual(table.map(t => t.threshold), [0.5, 0.6, 0.7, 0.8, 0.9]);
+  // t=0.5: predicted T,T,T,T,F -> FP 1 (0.65), FN 0, correct 4 of 6 (the invalid one is wrong)
+  assert.deepEqual(table[0], { threshold: 0.5, accuracy: 66.7, false_positives: 1, false_negatives: 0 });
+  // t=0.7: T,T,F,F,F -> FP 0, FN 1 (0.55), correct 4 of 6
+  assert.deepEqual(table[2], { threshold: 0.7, accuracy: 66.7, false_positives: 0, false_negatives: 1 });
+  // t=0.9: T,F,F,F,F -> FN 2, correct 3 of 6
+  assert.deepEqual(table[4], { threshold: 0.9, accuracy: 50, false_positives: 0, false_negatives: 2 });
+});
+
+test('eval decision: a 403 aborts the run with a clear error after one call', async () => {
+  let n = 0;
+  const stub = async () => {
+    n++;
+    return json(403, { error: 'key not allowed to access model' });
+  };
+  await assert.rejects(runEval({ mode: 'decision', cases: EVAL_CASES, fetch: stub, baseUrl: LLM, key: 'k' }), e => e instanceof EvalAbort && /refused this key \(HTTP 403\).*GuardianAI/.test(e.message));
+  assert.equal(n, 1);
+});
+
+test('eval decision: other failures and malformed answers are invalid, not fatal', async () => {
+  const replies = [json(503, {}), json(200, { answers: { action_needed: { type: 'noul', noul: 7 } } }), json(200, { answers: {} })];
+  let i = 0;
+  const out = await runEval({ mode: 'decision', cases: EVAL_CASES, fetch: async () => replies[i++], baseUrl: LLM, key: 'k' });
+  assert.deepEqual(out.decision.results.map(r => r.reason), ['http_503', 'invalid_shape', 'invalid_shape']);
+  assert.equal(out.decision.summary.invalid, 3);
+});
+
+test('eval both: runs flint then decision; decision window trimming keeps the newest messages', async () => {
+  const stub = async (url, init) => (String(url).endsWith('/systemone') ? json(200, { answers: { action_needed: { type: 'noul', noul: 0.9 } } }) : llmReply(GOOD));
+  const out = await runEval({ mode: 'both', cases: EVAL_CASES.slice(0, 1), fetch: stub, baseUrl: LLM, key: 'k' });
+  assert.ok(out.flint && out.decision);
+  const big = Array.from({ length: 50 }, (_, i) => `msg-${i} ${'x'.repeat(900)}`);
+  const kept = trimForDecision(big);
+  assert.ok(kept.length < 50 && kept.length > 0);
+  assert.equal(kept.at(-1), big.at(-1));
+  assert.ok(kept.join('').length / 3 <= 3000);
+  assert.equal(trimForDecision(['y'.repeat(60_000)]).length, 1);
 });
 
 // ---- ICICI fixture ----
