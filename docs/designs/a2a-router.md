@@ -119,6 +119,17 @@ Webhook secret 16-255 chars. OpenWA times out at 10 s and treats any 2xx as deli
   router adds no rate limiter of its own.
 - Before `live`: `curl -s https://taskpilot-mcp.sudiptadhara.in/health` must show the DharaHIL and
   approval-worker dependencies healthy. Without DharaHIL, TaskPilot runs peer writes unapproved.
+- Before `live`: TaskPilot's lead confirms its agent runs for `peer_openwa_router` use
+  `recursivesi/flint` with no cloud fallback (TaskPilot's code default is `nemotron-3-nano-cloud`).
+  Owner's rule: WhatsApp-derived text never reaches a cloud model. Request:
+  `~/fleet-tasks/openwa-to-taskpilot-2026-11-19-flint.md`.
+  TaskPilot's reply (`~/fleet-tasks/taskpilot-to-openwa-2026-11-19-flint.md`): live model was
+  `nemotron-3-nano-cloud`; the owner approved a global switch to `recursivesi/flint` (DB row
+  `instance_configurations.LLM_MODEL`, pending the owner's write). Live is blocked until:
+  (a) TaskPilot logs show `model=recursivesi/flint`; (b) the owner decides on Jev
+  (`typesafe/jev-latest`), which receives the free text and work-item text and is not covered by the
+  switch; (c) LiteLLM has no fallback route from `recursivesi/flint` to a cloud model (applies to the
+  router's own calls too).
 
 ## Prerequisites (via GuardianAI / owner; no secret in any message)
 

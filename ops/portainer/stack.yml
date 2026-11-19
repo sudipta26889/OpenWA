@@ -8,6 +8,37 @@ networks:
     external: true
     name: openwa-network
 services:
+  a2a-router:
+    cap_drop:
+      - ALL
+    container_name: openwa-a2a-router
+    environment:
+      - ROUTER_MODE=shadow
+      - ROUTER_LLM_BASE_URL=${ROUTER_LLM_BASE_URL:?ROUTER_LLM_BASE_URL is required}
+      - ROUTER_MODEL=recursivesi/flint
+      - ROUTER_TASKPILOT_URL=https://taskpilot-mcp.sudiptadhara.in/a2a
+      - ROUTER_WEBHOOK_SECRET_FILE=/secrets/webhook-secret
+      - ROUTER_LLM_KEY_FILE=/secrets/llm-key
+      - ROUTER_TASKPILOT_TOKEN_FILE=/secrets/taskpilot-token
+    image: ghcr.io/sudipta26889/openwa-a2a-router:latest
+    mem_limit: 128m
+    networks:
+      openwa-network: null
+    read_only: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - source: a2a-router-data
+        target: /data
+        type: volume
+        volume: {}
+      - bind:
+          create_host_path: true
+        read_only: true
+        source: /opt/openwa/a2a-router-secrets
+        target: /secrets
+        type: bind
   docker-proxy:
     container_name: openwa-docker-proxy
     environment:
@@ -345,6 +376,9 @@ services:
         type: volume
         volume: {}
 volumes:
+  a2a-router-data:
+    external: true
+    name: openwa_a2a-router-data
   mcp-oauth-gateway-data:
     external: true
     name: openwa_mcp-oauth-gateway-data

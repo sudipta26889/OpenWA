@@ -24,6 +24,20 @@ services:
     build: !reset null
     image: ghcr.io/sudipta26889/openwa-mcp-oauth-gateway:latest
 
+  # WhatsApp message -> local model -> task proposal to TaskPilot (ops/a2a-router/README.md). Port 8790 is
+  # not published. It needs outbound access to LiteLLM and TaskPilot, so it sits on openwa-network only.
+  # Secret files are bind-mounted read-only (mode 600, owned by uid 1000). Stays in shadow until the owner
+  # reviews a week of routes.jsonl; then ROUTER_MODE=live.
+  a2a-router:
+    build: !reset null
+    image: ghcr.io/sudipta26889/openwa-a2a-router:latest
+    environment:
+      - ROUTER_MODE=shadow
+      - ROUTER_LLM_BASE_URL=${ROUTER_LLM_BASE_URL:?ROUTER_LLM_BASE_URL is required}
+    volumes:
+      - a2a-router-data:/data
+      - /opt/openwa/a2a-router-secrets:/secrets:ro
+
   # Self-heals the message stream after a WhatsApp Web reload (see ops/watchdog/watchdog.sh). No docker
   # socket: logs come through docker-proxy, restarts over HTTP with an operator-role key.
   openwa-watchdog:
@@ -58,6 +72,9 @@ volumes:
     driver: !reset null
   mcp-oauth-gateway-data:
     name: openwa_mcp-oauth-gateway-data
+    external: true
+  a2a-router-data:
+    name: openwa_a2a-router-data
     external: true
   openwa-watchdog-state:
     name: watchdog_openwa-watchdog-state

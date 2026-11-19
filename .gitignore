@@ -85,3 +85,6 @@ _docs/
 .superpowers/
 # TypeScript incremental build cache (tsc writes this at repo root under the TS6 build config)
 *.tsbuildinfo
+
+# a2a-router dev secret files
+ops/a2a-router/.secrets/

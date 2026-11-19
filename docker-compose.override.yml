@@ -49,5 +49,35 @@ services:
       - 'no-new-privileges:true'
     mem_limit: 128m
 
+  # Reads webhook messages, asks the local model whether the owner must act, proposes a task to TaskPilot
+  # (ops/a2a-router/README.md). Starts in shadow mode: classifies and logs, never calls the peer.
+  # Secret files (webhook-secret, llm-key, taskpilot-token, mode 600, readable by uid 1000) live in
+  # A2A_ROUTER_SECRETS_DIR.
+  a2a-router:
+    build: ./ops/a2a-router
+    image: openwa-a2a-router
+    container_name: openwa-a2a-router
+    restart: unless-stopped
+    environment:
+      - ROUTER_MODE=${ROUTER_MODE:-shadow}
+      - ROUTER_LLM_BASE_URL=${ROUTER_LLM_BASE_URL:-}
+      - ROUTER_MODEL=recursivesi/flint
+      - ROUTER_TASKPILOT_URL=https://taskpilot-mcp.sudiptadhara.in/a2a
+      - ROUTER_WEBHOOK_SECRET_FILE=/secrets/webhook-secret
+      - ROUTER_LLM_KEY_FILE=/secrets/llm-key
+      - ROUTER_TASKPILOT_TOKEN_FILE=/secrets/taskpilot-token
+    volumes:
+      - a2a-router-data:/data
+      - ${A2A_ROUTER_SECRETS_DIR:-./ops/a2a-router/.secrets}:/secrets:ro
+    networks:
+      - openwa-network
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - 'no-new-privileges:true'
+    mem_limit: 128m
+
 volumes:
   mcp-oauth-gateway-data:
+  a2a-router-data:
