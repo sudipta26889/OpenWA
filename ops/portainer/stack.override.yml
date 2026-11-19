@@ -24,8 +24,9 @@ services:
     build: !reset null
     image: ghcr.io/sudipta26889/openwa-mcp-oauth-gateway:latest
 
-  # WhatsApp message -> local model -> task proposal to TaskPilot (ops/a2a-router/README.md). Port 8790 is
-  # not published. It needs outbound access to LiteLLM and TaskPilot, so it sits on openwa-network only.
+  # WhatsApp message -> local model -> hand-off to OpenClaw/Mitra (ops/a2a-router/README.md). Port 8790 is
+  # not published. It needs outbound access to LiteLLM and Mitra, so it sits on openwa-network only.
+  # dharabot.lan (Mitra's A2A bridge) is resolved by DNS on purpose: owner rule is DNS names, not IPs.
   # Secret files are bind-mounted read-only (mode 600, owned by uid 1000). Stays in shadow until the owner
   # reviews a week of routes.jsonl; then ROUTER_MODE=live.
   a2a-router:
@@ -33,6 +34,11 @@ services:
     image: ghcr.io/sudipta26889/openwa-a2a-router:latest
     environment:
       - ROUTER_MODE=shadow
+      # Peer is OpenClaw/Mitra (design Addendum A). The token file is created later by GuardianAI; the router
+      # starts without it in shadow, and in live a missing token is peer_auth_failed.
+      - ROUTER_PEER=mitra
+      - ROUTER_MITRA_URL=http://dharabot.lan:12345/a2a/v1
+      - ROUTER_MITRA_TOKEN_FILE=/secrets/mitra-token
       # Same LAN LiteLLM TaskPilot uses; Flint only (the router refuses any other model).
       - ROUTER_LLM_BASE_URL=http://db.lan:4000/v1
     # Pinned like openwa-api: a DNS failure must not cut the router off from LiteLLM.

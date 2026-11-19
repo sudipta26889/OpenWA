@@ -210,8 +210,10 @@ pings me via WhatsApp, discusses with me, and does the job with the help of Open
   and acts only on the owner's yes, using its `Whatsapp` MCP tools (OpenWA's MCP).
 - **Models:** the router's classification stays Flint-only. Mitra keeps its current model (owner, 2026-11-19: "Do not
   change Mitra to use flint"), an owner-approved exception to the local-models rule for this flow.
-- **Contract details** (method name, reply/task shape, dedup on `messageId`, sync vs async) are filled in from
-  GuardianAI's reply / the OpenClaw A2A plugin before the developer builds it. Idempotency: same K as today, sent as
-  `messageId`; retries resend the stored bytes.
+- **Contract details:** the peer is Mitra **by default** (`ROUTER_PEER=mitra`). Method `SendMessage` with
+  `role: ROLE_USER`, `parts: [{text}]`, `configuration.returnImmediately: true`; JSON-RPC `-32601` falls back once to
+  `message/send`. Any 2xx without `error` is `routed`; 401/403 `peer_auth_failed`; other 4xx `peer_rejected`; 5xx, 429,
+  timeout (25 s) and network errors retry at 30 s / 2 min / 10 min. No `tasks/list` for Mitra. Idempotency: same K as
+  `messageId`; retries resend the stored bytes; Mitra does not verify dedup, so a `routed` batch is never resent.
 - **Live gate:** Mitra peer + token + standing instruction in place, one end-to-end test with an owner-chosen test
   number (router → Mitra → owner gets a WhatsApp from Mitra), then the owner's review of the shadow log.
