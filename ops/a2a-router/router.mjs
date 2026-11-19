@@ -20,7 +20,11 @@ const PEER_RETRY_MS = [30_000, 120_000, 600_000]; // resend schedule after the f
 const MAX_RETRY_AFTER_MS = 600_000;
 const CLASSIFY_RETRY_MS = 600_000; // the one retry after invalid_json / invalid_shape
 /** Backend unavailable (Flint's laptop off or asleep): timeout, network error, HTTP 5xx, 429, 404. */
-const isUnavailable = reason => /^(timeout|network_error|http_(5\d\d|429|404))$/.test(reason ?? '');
+/** `empty_answer`: Flint spent its tokens reasoning and returned no content (or stopped at the length limit). */
+const isUnavailable = reason => /^(timeout|network_error|empty_answer|http_(5\d\d|429|404|400))$/.test(reason ?? '');
+export const DEFAULT_TEMPERATURE = 1.0; // Flint model card; temperature 0 makes it loop in its reasoning
+export const DEFAULT_TOP_P = 0.95;
+export const DEFAULT_LLM_TIMEOUT_MS = 300_000;
 const SUMMARY_MAX = 300;
 const MODES = ['off', 'shadow', 'live'];
 // A batch in one of these states is finished. 'classify_failed' is finished only once `final` is set.
@@ -90,14 +94,14 @@ export function parseClassification(content) {
 }
 
 /** One chat/completions call. Returns {action_needed, summary}; throws Error(reason) on any failure. */
-export async function classifyMessages({ events, fetch: fetchFn = globalThis.fetch, baseUrl, key, model, timeoutMs = 180_000, temperature = 0 }) {
+export async function classifyMessages({ events, fetch: fetchFn = globalThis.fetch, baseUrl, key, model, timeoutMs = DEFAULT_LLM_TIMEOUT_MS, temperature = DEFAULT_TEMPERATURE, topP = DEFAULT_TOP_P }) {
   let res;
   try {
     res = await fetchFn(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-      // No max_tokens on purpose: Flint is a reasoning model and a cap would let the reasoning eat the answer.
-      body: JSON.stringify({ model, temperature, messages: buildPrompt(events) }),
+      // No max_tokens (a cap would let the reasoning eat the answer) and no response_format (LM Studio 400s on it).
+      body: JSON.stringify({ model, temperature, top_p: topP, messages: buildPrompt(events) }),
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (e) {
@@ -111,8 +115,11 @@ export async function classifyMessages({ events, fetch: fetchFn = globalThis.fet
     throw new Error('invalid_json');
   }
   // Only `message.content` is parsed. `reasoning_content` is never read: if content is empty the case is
-  // invalid_json, even when the reasoning happens to contain a JSON object.
-  return parseClassification(j?.choices?.[0]?.message?.content);
+  // empty_answer (an unavailable-class failure, retried), even when the reasoning contains a JSON object.
+  const choice = j?.choices?.[0];
+  const content = choice?.message?.content;
+  if (choice?.finish_reason === 'length' || content == null || (typeof content === 'string' && !content.trim())) throw new Error('empty_answer');
+  return parseClassification(content);
 }
 
 // ---- evals (synthetic fixtures; run from the CLI: `node router.mjs eval`) ----
@@ -229,7 +236,7 @@ export function thresholdTable(results, thresholds = EVAL_THRESHOLDS) {
 }
 
 /** Runs every case ONE AT A TIME. Never prints or returns message bodies. */
-export async function runEval({ mode = 'flint', cases, fetch: fetchFn = globalThis.fetch, baseUrl, key, model = REQUIRED_MODEL, temperature = 0, timeoutMs = 120_000, clock = () => performance.now(), onCase = () => {} }) {
+export async function runEval({ mode = 'flint', cases, fetch: fetchFn = globalThis.fetch, baseUrl, key, model = REQUIRED_MODEL, temperature = DEFAULT_TEMPERATURE, topP = DEFAULT_TOP_P, timeoutMs = DEFAULT_LLM_TIMEOUT_MS, clock = () => performance.now(), onCase = () => {} }) {
   const out = {};
   if (mode === 'flint' || mode === 'both') {
     const results = [];
@@ -238,7 +245,7 @@ export async function runEval({ mode = 'flint', cases, fetch: fetchFn = globalTh
       let predicted = null;
       let reason = null;
       try {
-        predicted = (await classifyMessages({ events: caseEvents(c), fetch: fetchFn, baseUrl, key, model, timeoutMs, temperature })).action_needed;
+        predicted = (await classifyMessages({ events: caseEvents(c), fetch: fetchFn, baseUrl, key, model, timeoutMs, temperature, topP })).action_needed;
       } catch (e) {
         reason = String(e?.message ?? 'unknown');
       }
@@ -409,7 +416,7 @@ export function buildMitraRequest({ K, sessionId, chatId, text, method = 'SendMe
 // ---- the router ----
 
 export function createRouter(o) {
-  const cfg = { temperature: 0, peer: 'mitra', mitraUrl: 'http://dharabot.lan:12345/a2a/v1', mitraTimeoutMs: 90_000, mode: 'off', batchQuietMs: 120_000, peerTimeoutMs: 120_000, llmTimeoutMs: 180_000, classifyRetryMs: 30 * 60_000, classifyGiveUpMs: DAY_MS, model: REQUIRED_MODEL, sessionNames: {}, ...o };
+  const cfg = { temperature: DEFAULT_TEMPERATURE, topP: DEFAULT_TOP_P, peer: 'mitra', mitraUrl: 'http://dharabot.lan:12345/a2a/v1', mitraTimeoutMs: 90_000, mode: 'off', batchQuietMs: 120_000, peerTimeoutMs: 120_000, llmTimeoutMs: DEFAULT_LLM_TIMEOUT_MS, classifyRetryMs: 30 * 60_000, classifyGiveUpMs: DAY_MS, peerRetryMs: 30 * 60_000, peerGiveUpMs: DAY_MS, model: REQUIRED_MODEL, sessionNames: {}, ...o };
   if (cfg.model !== REQUIRED_MODEL) throw new Error(`ROUTER_MODEL must be ${REQUIRED_MODEL}; WhatsApp text may not reach any other model (got ${cfg.model})`);
   if (!MODES.includes(cfg.mode)) throw new Error(`mode must be one of ${MODES.join(', ')}`);
   if (!['mitra', 'taskpilot'].includes(cfg.peer)) throw new Error('peer must be mitra or taskpilot');
@@ -541,7 +548,7 @@ export function createRouter(o) {
     let result;
     let reason = 'unknown';
     try {
-      result = await classifyMessages({ events: evs, fetch: fetchFn, baseUrl: cfg.llmBaseUrl, key: getLlmKey(), model: cfg.model, timeoutMs: cfg.llmTimeoutMs, temperature: cfg.temperature });
+      result = await classifyMessages({ events: evs, fetch: fetchFn, baseUrl: cfg.llmBaseUrl, key: getLlmKey(), model: cfg.model, timeoutMs: cfg.llmTimeoutMs, temperature: cfg.temperature, topP: cfg.topP });
     } catch (e) {
       reason = String(e?.message ?? 'unknown');
     }
@@ -730,6 +737,15 @@ export function createRouter(o) {
     return { kind: 'result', taskId: j?.result?.task?.id ?? j?.result?.id ?? null };
   }
 
+  /**
+   * How long to wait before the next resend of a retryable failure, or null once the peer has been failing for
+   * peerGiveUpMs since the first attempt. 30 s / 2 min / 10 min first, then every peerRetryMs.
+   */
+  const peerWait = (attempt, out, firstAttemptAt) => {
+    if (now() - (firstAttemptAt ?? now()) >= cfg.peerGiveUpMs) return null;
+    return out.retryAfterMs ?? (attempt < PEER_RETRY_MS.length ? PEER_RETRY_MS[attempt] : cfg.peerRetryMs);
+  };
+
   async function sendBatchMitra(batchId) {
     const b = batches.get(batchId);
     if (!b?.request || inflight.has(b.K)) return;
@@ -754,8 +770,8 @@ export function createRouter(o) {
         if (out.kind === 'rejected') return logRow(batchId, { state: 'peer_rejected', reason: out.reason });
         if (out.kind === 'failed') return logRow(batchId, { state: 'peer_failed', reason: out.reason });
         if (out.kind === 'result') return logRow(batchId, { state: 'routed', taskId: out.taskId });
-        if (attempt >= PEER_RETRY_MS.length) return logRow(batchId, { state: 'peer_failed', reason: out.reason });
-        const waitMs = out.retryAfterMs ?? PEER_RETRY_MS[attempt];
+        const waitMs = peerWait(attempt, out, b.firstAttemptAt);
+        if (waitMs === null) return logRow(batchId, { state: 'peer_failed', reason: out.reason });
         logRow(batchId, { state: 'retry_wait', attempt: attempt + 1, reason: out.reason, waitMs });
         await sleep(waitMs);
         // no tasks/list lookup for Mitra
@@ -787,8 +803,8 @@ export function createRouter(o) {
           return logRow(batchId, { state: 'peer_failed', reason: state === 'failed' ? 'peer_state_failed' : 'unexpected_state' });
         }
         // retry: network error, timeout, 429, 5xx or -32603
-        if (attempt >= PEER_RETRY_MS.length) return logRow(batchId, { state: 'peer_failed', reason: out.reason });
-        const waitMs = out.retryAfterMs ?? PEER_RETRY_MS[attempt];
+        const waitMs = peerWait(attempt, out, b.firstAttemptAt);
+        if (waitMs === null) return logRow(batchId, { state: 'peer_failed', reason: out.reason });
         logRow(batchId, { state: 'retry_wait', attempt: attempt + 1, reason: out.reason, waitMs });
         await sleep(waitMs);
         if (closed) return;
@@ -964,7 +980,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   if (process.argv[2] === 'classify-fixture') {
     const key = readSecretFile('ROUTER_LLM_KEY_FILE')();
     try {
-      const r = await runFixture({ baseUrl: env.ROUTER_LLM_BASE_URL, key, model, timeoutMs: Number(env.ROUTER_LLM_TIMEOUT_MS ?? 180_000) });
+      const r = await runFixture({ baseUrl: env.ROUTER_LLM_BASE_URL, key, model, timeoutMs: Number(env.ROUTER_LLM_TIMEOUT_MS ?? DEFAULT_LLM_TIMEOUT_MS), temperature: Number(env.ROUTER_LLM_TEMPERATURE ?? DEFAULT_TEMPERATURE), topP: Number(env.ROUTER_LLM_TOP_P ?? DEFAULT_TOP_P) });
       console.log(JSON.stringify(r, null, 2));
     } catch (e) {
       console.error(`classify-fixture failed: ${e.message}`);
@@ -984,7 +1000,8 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
       console.error('--mode must be flint, decision or both');
       process.exit(1);
     }
-    const temperature = Number(opt('--temperature') ?? env.ROUTER_LLM_TEMPERATURE ?? 0);
+    const temperature = Number(opt('--temperature') ?? env.ROUTER_LLM_TEMPERATURE ?? DEFAULT_TEMPERATURE);
+    const topP = Number(opt('--top-p') ?? env.ROUTER_LLM_TOP_P ?? DEFAULT_TOP_P);
     if (!Number.isFinite(temperature) || temperature < 0) {
       console.error('--temperature must be a number >= 0');
       process.exit(1);
@@ -1006,7 +1023,8 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
         baseUrl: env.ROUTER_LLM_BASE_URL,
         key,
         temperature,
-        timeoutMs: Number(env.ROUTER_LLM_TIMEOUT_MS ?? 120_000),
+        topP,
+        timeoutMs: Number(env.ROUTER_LLM_TIMEOUT_MS ?? DEFAULT_LLM_TIMEOUT_MS),
         onCase: (m, r) => console.log(m === 'flint' ? `flint    ${r.id} expected=${r.expected} got=${r.predicted}${mark(r)} ${r.ms}ms` : `decision ${r.id} expected=${r.expected} noul=${r.noul}${mark(r)} ${r.ms}ms`),
       });
       if (out.flint) console.log(`\nflint (temperature ${temperature}):`, JSON.stringify(out.flint.summary));
@@ -1069,8 +1087,11 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
     taskpilotUrl: env.ROUTER_TASKPILOT_URL ?? 'https://taskpilot-mcp.sudiptadhara.in/a2a',
     batchQuietMs: Number(env.ROUTER_BATCH_QUIET_MS ?? 120_000),
     peerTimeoutMs: Number(env.ROUTER_PEER_TIMEOUT_MS ?? 120_000),
-    llmTimeoutMs: Number(env.ROUTER_LLM_TIMEOUT_MS ?? 180_000),
-    temperature: Number(env.ROUTER_LLM_TEMPERATURE ?? 0),
+    llmTimeoutMs: Number(env.ROUTER_LLM_TIMEOUT_MS ?? DEFAULT_LLM_TIMEOUT_MS),
+    temperature: Number(env.ROUTER_LLM_TEMPERATURE ?? DEFAULT_TEMPERATURE),
+    topP: Number(env.ROUTER_LLM_TOP_P ?? DEFAULT_TOP_P),
+    peerRetryMs: Number(env.ROUTER_PEER_RETRY_MS ?? 30 * 60_000),
+    peerGiveUpMs: Number(env.ROUTER_PEER_GIVE_UP_MS ?? 24 * 3600_000),
     classifyRetryMs: Number(env.ROUTER_CLASSIFY_RETRY_MS ?? 30 * 60_000),
     classifyGiveUpMs: Number(env.ROUTER_CLASSIFY_GIVE_UP_MS ?? 24 * 3600_000),
     sessionNames,
