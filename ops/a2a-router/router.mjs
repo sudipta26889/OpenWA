@@ -409,7 +409,7 @@ export function buildMitraRequest({ K, sessionId, chatId, text, method = 'SendMe
 // ---- the router ----
 
 export function createRouter(o) {
-  const cfg = { temperature: 0, peer: 'mitra', mitraUrl: 'http://dharabot.lan:12345/a2a/v1', mitraTimeoutMs: 25_000, mode: 'off', batchQuietMs: 120_000, peerTimeoutMs: 120_000, llmTimeoutMs: 180_000, classifyRetryMs: 30 * 60_000, classifyGiveUpMs: DAY_MS, model: REQUIRED_MODEL, sessionNames: {}, ...o };
+  const cfg = { temperature: 0, peer: 'mitra', mitraUrl: 'http://dharabot.lan:12345/a2a/v1', mitraTimeoutMs: 90_000, mode: 'off', batchQuietMs: 120_000, peerTimeoutMs: 120_000, llmTimeoutMs: 180_000, classifyRetryMs: 30 * 60_000, classifyGiveUpMs: DAY_MS, model: REQUIRED_MODEL, sessionNames: {}, ...o };
   if (cfg.model !== REQUIRED_MODEL) throw new Error(`ROUTER_MODEL must be ${REQUIRED_MODEL}; WhatsApp text may not reach any other model (got ${cfg.model})`);
   if (!MODES.includes(cfg.mode)) throw new Error(`mode must be one of ${MODES.join(', ')}`);
   if (!['mitra', 'taskpilot'].includes(cfg.peer)) throw new Error('peer must be mitra or taskpilot');
@@ -1063,7 +1063,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
     getMitraToken,
     peer,
     mitraUrl: env.ROUTER_MITRA_URL ?? 'http://dharabot.lan:12345/a2a/v1',
-    mitraTimeoutMs: Number(env.ROUTER_MITRA_TIMEOUT_MS ?? 25_000),
+    mitraTimeoutMs: Number(env.ROUTER_MITRA_TIMEOUT_MS ?? 90_000),
     llmBaseUrl: env.ROUTER_LLM_BASE_URL,
     model,
     taskpilotUrl: env.ROUTER_TASKPILOT_URL ?? 'https://taskpilot-mcp.sudiptadhara.in/a2a',
