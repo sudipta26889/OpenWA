@@ -27,13 +27,13 @@ services:
   # WhatsApp message -> local model -> hand-off to OpenClaw/Mitra (ops/a2a-router/README.md). Port 8790 is
   # not published. It needs outbound access to LiteLLM and Mitra, so it sits on openwa-network only.
   # dharabot.lan (Mitra's A2A bridge) is resolved by DNS on purpose: owner rule is DNS names, not IPs.
-  # Secret files are bind-mounted read-only (mode 600, owned by uid 1000). Stays in shadow until the owner
+  # Secret files are bind-mounted read-only (mode 600, owned by uid 1000). Live since 2026-11-19 on the owner's goal; Portainer Stack Env ROUTER_MODE=shadow|off overrides it. Was shadow until the owner
   # reviews a week of routes.jsonl; then ROUTER_MODE=live.
   a2a-router:
     build: !reset null
     image: ghcr.io/sudipta26889/openwa-a2a-router:latest
     environment:
-      - ROUTER_MODE=shadow
+      - ROUTER_MODE=${ROUTER_MODE:-live}
       # Peer is OpenClaw/Mitra (design Addendum A). The token file is created later by GuardianAI; the router
       # starts without it in shadow, and in live a missing token is peer_auth_failed.
       - ROUTER_PEER=mitra

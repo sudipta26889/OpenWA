@@ -13,7 +13,7 @@ services:
       - ALL
     container_name: openwa-a2a-router
     environment:
-      - ROUTER_MODE=shadow
+      - ROUTER_MODE=${ROUTER_MODE:-live}
       - ROUTER_LLM_BASE_URL=http://db.lan:4000/v1
       - ROUTER_MODEL=recursivesi/flint
       - ROUTER_PEER=mitra
