@@ -33,7 +33,11 @@ services:
     image: ghcr.io/sudipta26889/openwa-a2a-router:latest
     environment:
       - ROUTER_MODE=shadow
-      - ROUTER_LLM_BASE_URL=${ROUTER_LLM_BASE_URL:?ROUTER_LLM_BASE_URL is required}
+      # Same LAN LiteLLM TaskPilot uses; Flint only (the router refuses any other model).
+      - ROUTER_LLM_BASE_URL=http://db.lan:4000/v1
+    # Pinned like openwa-api: a DNS failure must not cut the router off from LiteLLM.
+    extra_hosts:
+      - "db.lan:192.168.10.120"
     volumes:
       - a2a-router-data:/data
       - /opt/openwa/a2a-router-secrets:/secrets:ro
