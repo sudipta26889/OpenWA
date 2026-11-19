@@ -17,7 +17,9 @@ export const REQUIRED_MODEL = 'recursivesi/flint'; // owner rule: WhatsApp text 
 const MAX_HOOK_BYTES = 1024 * 1024;
 const PEER_RETRY_MS = [30_000, 120_000, 600_000]; // resend schedule after the first attempt
 const MAX_RETRY_AFTER_MS = 600_000;
-const CLASSIFY_RETRY_MS = 600_000;
+const CLASSIFY_RETRY_MS = 600_000; // the one retry after invalid_json / invalid_shape
+/** Backend unavailable (Flint's laptop off or asleep): timeout, network error, HTTP 5xx, 429, 404. */
+const isUnavailable = reason => /^(timeout|network_error|http_(5\d\d|429|404))$/.test(reason ?? '');
 const SUMMARY_MAX = 300;
 const MODES = ['off', 'shadow', 'live'];
 // A batch in one of these states is finished. 'classify_failed' is finished only once `final` is set.
@@ -219,7 +221,7 @@ export function buildRequest({ K, sessionId, chatId, text }) {
 // ---- the router ----
 
 export function createRouter(o) {
-  const cfg = { mode: 'off', batchQuietMs: 120_000, peerTimeoutMs: 120_000, llmTimeoutMs: 60_000, model: REQUIRED_MODEL, sessionNames: {}, ...o };
+  const cfg = { mode: 'off', batchQuietMs: 120_000, peerTimeoutMs: 120_000, llmTimeoutMs: 60_000, classifyRetryMs: 30 * 60_000, classifyGiveUpMs: DAY_MS, model: REQUIRED_MODEL, sessionNames: {}, ...o };
   if (cfg.model !== REQUIRED_MODEL) throw new Error(`ROUTER_MODEL must be ${REQUIRED_MODEL}; WhatsApp text may not reach any other model (got ${cfg.model})`);
   if (!MODES.includes(cfg.mode)) throw new Error(`mode must be one of ${MODES.join(', ')}`);
   for (const k of ['dataDir', 'llmBaseUrl', 'taskpilotUrl']) if (!cfg[k]) throw new Error(`${k} is required`);
@@ -243,6 +245,8 @@ export function createRouter(o) {
   const inflight = new Set(); // K values being sent right now
   let queue = Promise.resolve(); // classification runs one at a time
   let peerAuthFailed = false;
+  let llmDownUntil = 0; // ms; while in the future, retries of other batches wait instead of calling the model
+  let llmDownOwner = null; // the batch whose failure set the gate (its own retry may go through)
   let lastRouteAt = null;
   let closed = false;
 
@@ -337,10 +341,13 @@ export function createRouter(o) {
       .filter(Boolean)
       .sort((a, z) => (a.data.timestamp ?? 0) - (z.data.timestamp ?? 0));
 
+  /** Returns 'retry' (failed, will be retried), 'wait' (gate closed, no call made) or undefined (finished). */
   async function classifyBatch(batchId, attempt) {
     const b = batches.get(batchId);
     const evs = batchEvents(b);
     if (!evs.length) return logRow(batchId, { state: 'classify_failed', attempt, final: true, reason: 'events_missing' });
+    // The model is known to be down because another batch just failed: do not hammer it.
+    if (attempt > 1 && llmDownUntil > now() && llmDownOwner !== batchId) return 'wait';
     let result;
     let reason = 'unknown';
     try {
@@ -349,11 +356,23 @@ export function createRouter(o) {
       reason = String(e?.message ?? 'unknown');
     }
     if (!result) {
-      const final = attempt >= 2;
-      logRow(batchId, { state: 'classify_failed', attempt, final, reason });
-      if (!final) scheduleClassifyRetry(batchId);
-      return;
+      const classifyFirstAt = b.classifyFirstAt ?? now();
+      const unavailable = isUnavailable(reason);
+      let final;
+      if (unavailable) {
+        final = now() - classifyFirstAt >= cfg.classifyGiveUpMs;
+        llmDownUntil = now() + cfg.classifyRetryMs;
+        llmDownOwner = batchId;
+      } else {
+        final = attempt >= 2;
+      }
+      logRow(batchId, { state: 'classify_failed', attempt, final, reason, classifyFirstAt });
+      if (final) return undefined;
+      if (attempt === 1) scheduleClassifyRetry(batchId); // later attempts are driven by that loop
+      return 'retry';
     }
+    llmDownUntil = 0;
+    llmDownOwner = null;
     const { action_needed, summary } = result;
     if (cfg.mode === 'shadow') return logRow(batchId, { state: 'shadow', action_needed, summary });
     if (!action_needed) return logRow(batchId, { state: 'no_action', action_needed, summary });
@@ -372,12 +391,27 @@ export function createRouter(o) {
     track(sendBatch(batchId));
   }
 
+  /**
+   * Retry a failed classification. Backend-unavailable failures repeat every classifyRetryMs until
+   * classifyGiveUpMs after the first attempt; anything else gets one retry after CLASSIFY_RETRY_MS.
+   * The first wait is measured from the last routes.jsonl row, so a restart does not restart the clock.
+   */
   function scheduleClassifyRetry(batchId) {
     track(
       (async () => {
-        await sleep(CLASSIFY_RETRY_MS);
-        if (closed) return;
-        await enqueue(() => classifyBatch(batchId, 2));
+        let wait = null;
+        for (;;) {
+          const b = batches.get(batchId);
+          if (!b || isTerminal(b)) return;
+          const every = isUnavailable(b.reason) ? cfg.classifyRetryMs : CLASSIFY_RETRY_MS;
+          const since = Date.parse(b.ts);
+          await sleep(wait ?? Math.max(0, (Number.isNaN(since) ? now() : since) + every - now()));
+          if (closed) return;
+          const out = await enqueue(() => classifyBatch(batchId, (batches.get(batchId).attempt ?? 1) + 1));
+          if (out === 'wait') wait = Math.max(llmDownUntil - now(), 1000);
+          else if (out === 'retry') wait = null;
+          else return;
+        }
       })(),
     );
   }
@@ -550,6 +584,7 @@ export function createRouter(o) {
     pending: open.size + [...batches.values()].filter(b => !isTerminal(b)).length,
     lastRouteAt,
     peerAuthFailed,
+    llmUnavailableUntil: llmDownUntil > now() ? new Date(llmDownUntil).toISOString() : null,
   });
 
   const server = http.createServer((req, res) => {
@@ -688,6 +723,8 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
     batchQuietMs: Number(env.ROUTER_BATCH_QUIET_MS ?? 120_000),
     peerTimeoutMs: Number(env.ROUTER_PEER_TIMEOUT_MS ?? 120_000),
     llmTimeoutMs: Number(env.ROUTER_LLM_TIMEOUT_MS ?? 60_000),
+    classifyRetryMs: Number(env.ROUTER_CLASSIFY_RETRY_MS ?? 30 * 60_000),
+    classifyGiveUpMs: Number(env.ROUTER_CLASSIFY_GIVE_UP_MS ?? 24 * 3600_000),
     sessionNames,
   });
   router.recover();

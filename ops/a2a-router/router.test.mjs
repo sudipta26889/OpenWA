@@ -64,6 +64,7 @@ async function setup(over = {}) {
     now: () => clock.t,
     sleep: async ms => {
       sleeps.push(ms);
+      if (over.advance) clock.t += ms; // the fake clock moves with every sleep
     },
     logger: (msg, extra) => logs.push(JSON.stringify({ msg, ...extra })),
     ...over.cfg,
@@ -223,6 +224,106 @@ test('a model error then a good answer on the retry is routed', async () => {
   await hook(s, evt());
   await s.router.drain();
   assert.equal(s.last().state, 'routed');
+});
+
+const HALF_HOUR = 30 * 60_000;
+
+test('backend unavailable (503, network error, 429, 404) retries every 30 min, then routes', async () => {
+  const answers = [() => json(503, {}), () => { throw new Error('connection refused'); }, () => json(429, {}), () => json(404, {}), () => llmReply(GOOD)];
+  const s = await setup({ advance: true, llm: (_b, n) => answers[n - 1]() });
+  await hook(s, evt());
+  await s.router.drain();
+  assert.equal(s.calls.llm.length, 5);
+  assert.deepEqual(s.sleeps, [HALF_HOUR, HALF_HOUR, HALF_HOUR, HALF_HOUR]);
+  const failed = s.routes().filter(r => r.state === 'classify_failed');
+  assert.deepEqual(failed.map(r => r.reason), ['http_503', 'network_error', 'http_429', 'http_404']);
+  assert.ok(failed.every(r => r.final === false));
+  assert.equal(s.last().state, 'routed');
+});
+
+test('backend unavailable for 24 h after the first attempt: final, no peer call', async () => {
+  const s = await setup({ advance: true, llm: () => json(503, {}) });
+  await hook(s, evt());
+  await s.router.drain();
+  assert.equal(s.calls.llm.length, 49); // t = 0, then every 30 min up to 24 h
+  const failed = s.routes().filter(r => r.state === 'classify_failed');
+  assert.equal(failed.at(-1).final, true);
+  assert.ok(failed.slice(0, -1).every(r => r.final === false));
+  assert.equal(s.calls.send.length, 0);
+  assert.equal(s.router.health().pending, 0);
+});
+
+test('give-up window and retry interval are configurable', async () => {
+  const s = await setup({ advance: true, llm: () => json(503, {}), cfg: { classifyRetryMs: 1000, classifyGiveUpMs: 3000 } });
+  await hook(s, evt());
+  await s.router.drain();
+  assert.equal(s.calls.llm.length, 4); // t = 0, 1, 2, 3 s
+  assert.deepEqual(s.sleeps, [1000, 1000, 1000]);
+});
+
+test('while the model is down, waiting batches do not each fire a call', async () => {
+  const times = [];
+  let ref;
+  const s = await setup({
+    advance: true,
+    llm: () => {
+      times.push(ref.clock.t);
+      return json(503, {});
+    },
+    cfg: { classifyGiveUpMs: 2 * 3600_000 },
+  });
+  ref = s;
+  for (const chatId of ['910000000003@c.us', '910000000004@c.us', '910000000005@c.us']) await hook(s, evt({ chatId }));
+  await s.router.drain();
+  // 3 first attempts are allowed; every later call must be at a distinct time (one per tick), not three at once
+  const retries = times.slice(3);
+  assert.ok(retries.length > 0);
+  assert.equal(new Set(retries).size, retries.length);
+  for (const b of s.routes().filter(r => r.state === 'classify_failed' && r.final)) assert.equal(b.reason, 'http_503');
+  assert.equal(s.routes().filter(r => r.state === 'classify_failed' && r.final).length, 3);
+});
+
+test('health reports llmUnavailableUntil while the model is down and null once it answers', async () => {
+  let during;
+  let ref;
+  const s = await setup({
+    llm: (_b, n) => {
+      if (n === 2) during = ref.router.health().llmUnavailableUntil;
+      return n === 1 ? json(503, {}) : llmReply(GOOD);
+    },
+  });
+  ref = s;
+  assert.equal(s.router.health().llmUnavailableUntil, null);
+  await hook(s, evt());
+  await s.router.drain();
+  assert.equal(during, new Date(T0 + HALF_HOUR).toISOString());
+  assert.equal(s.router.health().llmUnavailableUntil, null);
+});
+
+test('restart: an unavailable-retry resumes from routes.jsonl and keeps the remaining wait and the 24 h clock', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a2a-router-retry-'));
+  const e = evt({ id: 'R1' });
+  fs.writeFileSync(
+    path.join(dir, 'inbound.jsonl'),
+    `${JSON.stringify({ receivedAt: new Date(T0 - 3600_000).toISOString(), idempotencyKey: e.key, sessionId: SESSION, data: e.body.data })}\n`,
+  );
+  const first = T0 - 23.5 * 3600_000; // 30 min left of the 24 h window
+  const rows = [
+    { ts: new Date(first).toISOString(), batchId: 'rb', state: 'batched', sessionId: SESSION, chatId: CHAT, keys: [e.key], messageIds: ['R1'] },
+    { ts: new Date(T0 - 10 * 60_000).toISOString(), batchId: 'rb', state: 'classify_failed', attempt: 9, final: false, reason: 'http_503', classifyFirstAt: first },
+  ];
+  fs.writeFileSync(path.join(dir, 'routes.jsonl'), rows.map(r => `${JSON.stringify(r)}\n`).join(''));
+  // 1) the event of a retrying batch survives pruning even though it is older than 7 days
+  const old = JSON.parse(fs.readFileSync(path.join(dir, 'inbound.jsonl'), 'utf8'));
+  old.receivedAt = new Date(T0 - 9 * 86400_000).toISOString();
+  fs.writeFileSync(path.join(dir, 'inbound.jsonl'), `${JSON.stringify(old)}\n`);
+  // 2) the retry fires after the REMAINING 20 min and, the model still being down, it is final (24 h reached)
+  const s = await setup({ dir, advance: true, llm: () => json(503, {}) });
+  await s.router.drain();
+  assert.equal(s.inbound().length, 1, 'inbound event of a retrying batch is not pruned');
+  assert.deepEqual(s.sleeps.slice(0, 1), [20 * 60_000]);
+  assert.equal(s.calls.llm.length, 2); // 20 min later: still inside 24 h -> retried; 30 min after that: final
+  assert.equal(s.routes().filter(r => r.state === 'classify_failed').at(-1).final, true);
 });
 
 test('the model call uses the configured model, key and timeout signal', async () => {
@@ -459,7 +560,7 @@ test('no log line or stdout line contains a message body', async () => {
 test('GET /health reports mode, pending, lastRouteAt and peerAuthFailed', async () => {
   const s = await setup();
   let h = await (await fetch(`${s.base}/health`)).json();
-  assert.deepEqual(h, { mode: 'live', pending: 0, lastRouteAt: null, peerAuthFailed: false });
+  assert.deepEqual(h, { mode: 'live', pending: 0, lastRouteAt: null, peerAuthFailed: false, llmUnavailableUntil: null });
   await hook(s, evt());
   h = await (await fetch(`${s.base}/health`)).json();
   assert.equal(h.pending, 1); // an open batch

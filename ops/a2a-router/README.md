@@ -39,6 +39,8 @@ approval-worker dependencies healthy. Without DharaHIL, TaskPilot runs peer writ
 | `ROUTER_BATCH_QUIET_MS`       | `120000`                                       |
 | `ROUTER_PEER_TIMEOUT_MS`      | `120000`                                       |
 | `ROUTER_LLM_TIMEOUT_MS`       | `60000`                                        |
+| `ROUTER_CLASSIFY_RETRY_MS`    | `1800000` (30 min)                             |
+| `ROUTER_CLASSIFY_GIVE_UP_MS`  | `86400000` (24 h)                              |
 | `ROUTER_SESSION_NAMES`        | optional JSON `{"<sessionId>":"personal-wa"}`  |
 | `ROUTER_DATA_DIR`, `PORT`     | `/data`, `8790`                                |
 
@@ -46,6 +48,15 @@ approval-worker dependencies healthy. Without DharaHIL, TaskPilot runs peer writ
 `recursivesi/flint`; any other value makes the router refuse to start (and `classify-fixture` refuse to
 run). LiteLLM must also have no fallback route from `recursivesi/flint` to a cloud model, otherwise a Flint
 outage would send message text to that cloud model without the router knowing.
+
+**Flint runs on the owner's MacBook Pro.** When the laptop is off or asleep, Flint is down, possibly for a
+whole night. A classification that fails because the backend is unavailable (timeout, network error, HTTP
+5xx, 429 or 404) is retried every `ROUTER_CLASSIFY_RETRY_MS` until `ROUTER_CLASSIFY_GIVE_UP_MS` after the
+batch's first attempt, so messages wait up to 24 h for Flint. Only then is the batch final. Retries go one
+at a time; once one fails as unavailable, the other waiting batches wait for the next tick instead of each
+calling the model (`/health` shows `llmUnavailableUntil`). The retry state is read back from `routes.jsonl`
+after a restart. Unusable model output (`invalid_json`, `invalid_shape`) still gets one retry after 10 min,
+then is final. Inbound events of a batch that is still retrying are never pruned.
 
 Secrets are only ever file paths. The files must be readable by the container user (uid 1000, `node`),
 mode 600. The token file is re-read on every peer call, so a rotated token needs no restart.
@@ -61,7 +72,8 @@ mode 600. The token file is re-read on every peer call, so a rotated token needs
   whose batch is not yet terminal is never pruned. `routes.jsonl` lines are pruned after 90 days. Pruning
   runs at startup and daily.
 
-`GET /health` returns `{mode, pending, lastRouteAt, peerAuthFailed}`.
+`GET /health` returns `{mode, pending, lastRouteAt, peerAuthFailed, llmUnavailableUntil}` (`llmUnavailableUntil`
+is an ISO time while the model is known to be down, otherwise `null`).
 
 ## Webhooks (created by the owner after the router is up in `shadow`)
 

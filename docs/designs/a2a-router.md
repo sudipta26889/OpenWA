@@ -130,6 +130,9 @@ Webhook secret 16-255 chars. OpenWA times out at 10 s and treats any 2xx as deli
   (`typesafe/jev-latest`), which receives the free text and work-item text and is not covered by the
   switch; (c) LiteLLM has no fallback route from `recursivesi/flint` to a cloud model (applies to the
   router's own calls too).
+  Update (TaskPilot round 4): Jev is TypeSafe cloud, and saved WhatsApp-derived tasks can reach it
+  through other clients' dedupe/routing, so a per-peer exemption is not enough. (d) Live also waits
+  for Jev to be off, or replaced by a local decision model, across all of TaskPilot.
 
 ## Prerequisites (via GuardianAI / owner; no secret in any message)
 
