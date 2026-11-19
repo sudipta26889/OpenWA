@@ -103,3 +103,10 @@ Expected: `action_needed: true`, and a summary naming the documents.
 ## Tests
 
 `node --test ops/a2a-router/` (no network; fetch, clock, sleep and data dir are injected).
+
+## Webhook provenance (2026-11-19)
+The two `message.received` webhooks (business-wa, personal-wa → `http://a2a-router:8790/hook`) were created by
+GuardianAI on the NUC with `~/fleet-tasks/openwa-a2a-router-create-webhooks.py`, using a one-shot copy of the
+watchdog's operator key (owner's decision; file on a memory disk, deleted in the same command). OpenWA's audit
+trail therefore shows the watchdog key as their creator; that is expected, not a compromise of the watchdog key.
+The webhook secret lives only in `/opt/openwa/a2a-router-secrets/webhook-secret` on the NUC.
