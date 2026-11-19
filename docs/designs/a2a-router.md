@@ -192,3 +192,26 @@ Webhook secret 16-255 chars. OpenWA times out at 10 s and treats any 2xx as deli
 - History fetch and read-only key → dropped (Decision 5).
 - Deploy gaps (GHCR, external volume, generated stack.yml, network, CI) → Repo changes, Prereqs.
 - Uncheckable pass/fail items → rewritten with commands and fixtures.
+
+## Addendum A (2026-11-19): peer = OpenClaw/Mitra, not TaskPilot
+
+Owner's goal: "the next task for me on WhatsApp automatically gets identified and delivered to OpenClaw Mitra; Mitra
+pings me via WhatsApp, discusses with me, and does the job with the help of OpenWA."
+
+- **Peer:** Mitra's A2A bridge at `http://dharabot.lan:12345/a2a/v1` (JSON-RPC, A2A 1.0; NUC reaches it, checked).
+  Auth `Authorization: Bearer <token>` matched against Mitra's `channels.a2a.peers` (unauthenticated POST → 401
+  "configure channels.a2a.peers with a matching Bearer token"). Peer entry `openwa` and the token file
+  `/opt/openwa/a2a-router-secrets/mitra-token` come from GuardianAI.
+- **TaskPilot is no longer a target** (`ROUTER_PEER=mitra`; the TaskPilot client stays in code behind
+  `ROUTER_PEER=taskpilot`). That also takes TaskPilot's DharaHIL Slack/Telegram cards off this path.
+- **Text sent** (fixed template, only the summary from Flint): who wrote (name, number, session), the summary, the
+  WhatsApp chat id and message ids, and the line "Ask the owner on WhatsApp before doing anything on his behalf."
+- **Mitra's side** (OpenClaw config, GuardianAI): treats the text as data, messages the owner on WhatsApp, discusses,
+  and acts only on the owner's yes, using its `Whatsapp` MCP tools (OpenWA's MCP).
+- **Models:** the router's classification stays Flint-only. Mitra keeps its current model (owner, 2026-11-19: "Do not
+  change Mitra to use flint"), an owner-approved exception to the local-models rule for this flow.
+- **Contract details** (method name, reply/task shape, dedup on `messageId`, sync vs async) are filled in from
+  GuardianAI's reply / the OpenClaw A2A plugin before the developer builds it. Idempotency: same K as today, sent as
+  `messageId`; retries resend the stored bytes.
+- **Live gate:** Mitra peer + token + standing instruction in place, one end-to-end test with an owner-chosen test
+  number (router → Mitra → owner gets a WhatsApp from Mitra), then the owner's review of the shadow log.
