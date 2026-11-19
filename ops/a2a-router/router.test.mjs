@@ -473,12 +473,13 @@ test('tasks/list with only older tasks does not stop the resend', async () => {
   assert.equal(s.last().taskId, 't2');
 });
 
-test('a network error is retried at 30 s, 2 min and 10 min, then peer_failed', async () => {
-  const s = await setup({ peer: () => new Error('ECONNRESET') });
+test('a network error is retried at 30 s, 2 min and 10 min, then every 30 min until 24 h, then peer_failed', async () => {
+  const s = await setup({ advance: true, peer: () => new Error('ECONNRESET') });
   await hook(s, evt());
   await s.router.drain();
-  assert.deepEqual(s.sleeps, [30_000, 120_000, 600_000]);
-  assert.equal(s.calls.send.length, 4);
+  assert.deepEqual(s.sleeps.slice(0, 4), [30_000, 120_000, 600_000, HALF_HOUR]);
+  assert.ok(s.sleeps.slice(3).every(w => w === HALF_HOUR));
+  assert.ok(s.calls.send.length > 4);
   assert.ok(s.calls.send.every(c => c.raw === s.calls.send[0].raw));
   assert.equal(s.last().state, 'peer_failed');
 });
@@ -730,13 +731,68 @@ test('mitra: 503 retries at 30 s with the same bytes, then routed; no tasks/list
   assert.equal(s.last().state, 'routed');
 });
 
-test('mitra: network errors follow 30 s / 2 min / 10 min, then peer_failed', async () => {
-  const s = await mitra({ mitra: () => new Error('connection refused') });
+test('mitra: network errors follow 30 s / 2 min / 10 min, then every 30 min, and only peer_failed after 24 h', async () => {
+  const s = await mitra({ advance: true, mitra: () => new Error('connection refused') });
   await hook(s, evt());
   await s.router.drain();
-  assert.equal(s.calls.mitra.length, 4);
-  assert.deepEqual(s.sleeps, [30_000, 120_000, 600_000]);
+  assert.deepEqual(s.sleeps.slice(0, 4), [30_000, 120_000, 600_000, HALF_HOUR]);
+  assert.ok(s.sleeps.slice(3).every(w => w === HALF_HOUR));
   assert.equal(s.last().state, 'peer_failed');
+  assert.ok(s.calls.mitra.every(c => c.raw === s.calls.mitra[0].raw));
+});
+
+test('mitra: 503 for 20 min then 200 is routed, same bytes, never peer_failed', async () => {
+  const s = await mitra({ advance: true, mitra: () => (s.clock.t - T0 < 20 * 60_000 ? json(503, {}) : json(200, { jsonrpc: '2.0', id: 'x', result: { task: { id: 't' } } })) });
+  await hook(s, evt());
+  await s.router.drain();
+  assert.equal(s.last().state, 'routed');
+  assert.ok(!s.routes().some(r => r.state === 'peer_failed'));
+  assert.ok(s.calls.mitra.length > 3, 'kept retrying past the 30 s / 2 min / 10 min schedule');
+  assert.ok(s.calls.mitra.every(c => c.raw === s.calls.mitra[0].raw));
+});
+
+test('mitra: a send that failed for 25 h ends peer_failed; before 24 h it does not', async () => {
+  const s = await mitra({ advance: true, mitra: () => json(503, {}) });
+  await hook(s, evt());
+  await s.router.drain();
+  const last = s.routes().at(-1);
+  assert.equal(last.state, 'peer_failed');
+  assert.equal(last.reason, 'http_503');
+  const rows = s.routes().filter(r => r.state === 'retry_wait');
+  assert.ok(rows.length > 40 && rows.every(r => r.reason === 'http_503'));
+  assert.ok(Date.parse(last.ts) - T0 >= 24 * 3600_000);
+  assert.ok(Date.parse(rows.at(-1).ts) - T0 < 25 * 3600_000);
+});
+
+test('mitra: restart in the long retry phase resumes with the stored bytes and the original 24 h clock', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a2a-router-mitra-'));
+  const e = evt({ id: 'R9' });
+  fs.writeFileSync(path.join(dir, 'inbound.jsonl'), `${JSON.stringify({ receivedAt: new Date(T0).toISOString(), idempotencyKey: e.key, sessionId: SESSION, data: e.body.data })}\n`);
+  const K = routeKey(SESSION, CHAT, 'R9');
+  const stored = buildMitraRequest({ K, sessionId: SESSION, chatId: CHAT, text: 'stored text' });
+  const ts = new Date(T0).toISOString();
+  const firstAttemptAt = T0 - 23.9 * 3600_000; // 6 min left of the 24 h
+  const rows = [
+    { ts, batchId: 'lb', state: 'batched', sessionId: SESSION, chatId: CHAT, keys: [e.key], messageIds: ['R9'] },
+    { ts, batchId: 'lb', state: 'pending', K, request: stored, firstAttemptAt, attempt: 0 },
+    { ts, batchId: 'lb', state: 'retry_wait', attempt: 7, reason: 'http_503', waitMs: HALF_HOUR },
+  ];
+  fs.writeFileSync(path.join(dir, 'routes.jsonl'), rows.map(r => `${JSON.stringify(r)}\n`).join(''));
+  const s = await mitra({ dir, advance: true, mitra: (_b, n) => (n === 1 ? json(503, {}) : json(200, { jsonrpc: '2.0', id: 'x', result: { task: { id: 't' } } })) });
+  await s.router.drain();
+  // first resend (503), then the 24 h window is not yet over (23.9 h + 0 < 24 h): waits, resends, routed
+  assert.equal(s.calls.mitra[0].raw, stored);
+  assert.equal(s.calls.mitra.length, 2);
+  assert.equal(s.last().state, 'routed');
+  // and a restart past 24 h ends it
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'a2a-router-mitra-'));
+  fs.writeFileSync(path.join(dir2, 'inbound.jsonl'), fs.readFileSync(path.join(dir, 'inbound.jsonl')));
+  const old = rows.map(r => (r.state === 'pending' ? { ...r, firstAttemptAt: T0 - 25 * 3600_000 } : r));
+  fs.writeFileSync(path.join(dir2, 'routes.jsonl'), old.map(r => `${JSON.stringify(r)}\n`).join(''));
+  const s2 = await mitra({ dir: dir2, advance: true, mitra: () => json(503, {}) });
+  await s2.router.drain();
+  assert.equal(s2.calls.mitra.length, 1);
+  assert.equal(s2.last().state, 'peer_failed');
 });
 
 test('mitra: 429 honours Retry-After', async () => {
@@ -867,23 +923,101 @@ test('flint parse: only message.content counts; reasoning_content is ignored eve
   const ev = ICICI_FIXTURE;
   const ok = await classifyMessages({ events: ev, baseUrl: LLM, key: 'k', model: 'recursivesi/flint', fetch: async () => withReasoning(JSON.stringify(GOOD), 'thinking: {"action_needed": false, "summary": "x"}') });
   assert.equal(ok.action_needed, true);
-  for (const content of ['', null, undefined]) {
+  for (const content of ['', '  \n ', null, undefined]) {
     await assert.rejects(
       classifyMessages({ events: ev, baseUrl: LLM, key: 'k', model: 'recursivesi/flint', fetch: async () => withReasoning(content, JSON.stringify(GOOD)) }),
-      /invalid_json/,
+      /empty_answer/,
     );
   }
 });
 
-test('router passes ROUTER_LLM_TEMPERATURE through; the default stays 0', async () => {
+test('flint: finish_reason length is empty_answer even when content looks complete', async () => {
+  await assert.rejects(
+    classifyMessages({ events: ICICI_FIXTURE, baseUrl: LLM, key: 'k', model: 'recursivesi/flint', fetch: async () => json(200, { choices: [{ finish_reason: 'length', message: { content: JSON.stringify(GOOD) } }] }) }),
+    /empty_answer/,
+  );
+});
+
+test('the request body defaults to temperature 1.0 and top_p 0.95, with no max_tokens and no response_format; both are overridable', async () => {
   const s0 = await setup();
   await hook(s0, evt());
   await s0.router.drain();
-  assert.equal(s0.calls.llm[0].body.temperature, 0);
-  const s1 = await setup({ cfg: { temperature: 1 } });
+  const b = s0.calls.llm[0].body;
+  assert.equal(b.temperature, 1);
+  assert.equal(b.top_p, 0.95);
+  assert.equal('max_tokens' in b, false);
+  assert.equal('response_format' in b, false);
+  const s1 = await setup({ cfg: { temperature: 0.6, topP: 0.8 } });
   await hook(s1, evt());
   await s1.router.drain();
-  assert.equal(s1.calls.llm[0].body.temperature, 1);
+  assert.equal(s1.calls.llm[0].body.temperature, 0.6);
+  assert.equal(s1.calls.llm[0].body.top_p, 0.8);
+  let sent;
+  await classifyMessages({ events: ICICI_FIXTURE, baseUrl: LLM, key: 'k', model: 'recursivesi/flint', fetch: async (_u, init) => ((sent = JSON.parse(init.body)), llmReply(GOOD)) });
+  assert.equal(sent.temperature, 1);
+  assert.equal(sent.top_p, 0.95);
+});
+
+test('empty content and finish_reason length are retried like an outage: never no_action, never final, then classified', async () => {
+  const answers = [
+    () => llmReply(''),
+    () => json(200, { choices: [{ finish_reason: 'length', message: { content: '' } }] }),
+    () => json(500, {}),
+    () => llmReply(GOOD),
+  ];
+  const s = await setup({ advance: true, llm: (_b, n) => answers[n - 1]() });
+  await hook(s, evt());
+  await s.router.drain();
+  assert.equal(s.calls.llm.length, 4);
+  assert.deepEqual(s.sleeps, [HALF_HOUR, HALF_HOUR, HALF_HOUR]);
+  const failed = s.routes().filter(r => r.state === 'classify_failed');
+  assert.deepEqual(failed.map(r => r.reason), ['empty_answer', 'empty_answer', 'http_500']);
+  assert.ok(failed.every(r => r.final === false));
+  assert.ok(!s.routes().some(r => r.state === 'no_action'));
+  assert.equal(s.last().state, 'routed');
+});
+
+test('permanently empty answers end final only after the 24 h give-up', async () => {
+  const s = await setup({ advance: true, llm: () => llmReply('') });
+  await hook(s, evt());
+  await s.router.drain();
+  const failed = s.routes().filter(r => r.state === 'classify_failed');
+  assert.equal(failed.at(-1).final, true);
+  assert.ok(failed.slice(0, -1).every(r => r.final === false));
+  assert.equal(s.calls.send.length, 0);
+});
+
+test('HTTP 500, 502, 503 and 504 from the model are all retried', async () => {
+  for (const code of [500, 502, 503, 504]) {
+    const s = await setup({ advance: true, llm: (_b, n) => (n === 1 ? json(code, {}) : llmReply(GOOD)) });
+    await hook(s, evt());
+    await s.router.drain();
+    assert.equal(s.routes().find(r => r.state === 'classify_failed').final, false);
+    assert.equal(s.last().state, 'routed');
+  }
+});
+
+test('the Flint timeout defaults to 300 s', async () => {
+  const seen = [];
+  const orig = AbortSignal.timeout;
+  AbortSignal.timeout = ms => (seen.push(ms), orig.call(AbortSignal, ms));
+  try {
+    await classifyMessages({ events: ICICI_FIXTURE, baseUrl: LLM, key: 'k', model: 'recursivesi/flint', fetch: async () => llmReply(GOOD) });
+    const s = await setup();
+    await hook(s, evt());
+    await s.router.drain();
+  } finally {
+    AbortSignal.timeout = orig;
+  }
+  assert.equal(seen[0], 300_000);
+  assert.ok(seen.includes(300_000) && seen.filter(ms => ms === 300_000).length >= 2);
+});
+
+test('stack.yml carries no ROUTER_TASKPILOT_* and docker-compose.override.yml neither', () => {
+  const root = path.join(path.dirname(new URL(import.meta.url).pathname), '..', '..');
+  for (const f of ['ops/portainer/stack.yml', 'ops/portainer/stack.override.yml', 'docker-compose.override.yml']) {
+    assert.ok(!fs.readFileSync(path.join(root, f), 'utf8').includes('ROUTER_TASKPILOT'), f);
+  }
 });
 
 test('eval decision: POSTs /systemone with local/decision and reads answers.action_needed.noul', async () => {

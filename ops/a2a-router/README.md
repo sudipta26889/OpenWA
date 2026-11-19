@@ -50,14 +50,18 @@ restart. The router starts without the token file in `shadow` mode. The text sen
 | `ROUTER_PEER`                 | `mitra` (or `taskpilot`)                       |
 | `ROUTER_MITRA_URL`            | `http://dharabot.lan:12345/a2a/v1`             |
 | `ROUTER_MITRA_TOKEN_FILE`     | path of the Mitra peer token (may be absent in shadow) |
-| `ROUTER_MITRA_TIMEOUT_MS`     | `25000`                                        |
+| `ROUTER_MITRA_TIMEOUT_MS`     | `90000`                                        |
 | `ROUTER_TASKPILOT_URL`        | `https://taskpilot-mcp.sudiptadhara.in/a2a` (taskpilot peer only) |
 | `ROUTER_WEBHOOK_SECRET_FILE`  | required: path, ≥16 characters inside          |
 | `ROUTER_LLM_KEY_FILE`         | required: path of the router's LiteLLM key     |
 | `ROUTER_TASKPILOT_TOKEN_FILE` | required only with `ROUTER_PEER=taskpilot`     |
 | `ROUTER_BATCH_QUIET_MS`       | `120000`                                       |
 | `ROUTER_PEER_TIMEOUT_MS`      | `120000`                                       |
-| `ROUTER_LLM_TIMEOUT_MS`       | `60000`                                        |
+| `ROUTER_LLM_TIMEOUT_MS`       | `300000` (5 min)                               |
+| `ROUTER_LLM_TEMPERATURE`      | `1.0` (Flint model card)                       |
+| `ROUTER_LLM_TOP_P`            | `0.95`                                         |
+| `ROUTER_PEER_RETRY_MS`        | `1800000` (30 min, after the 30 s / 2 min / 10 min resends) |
+| `ROUTER_PEER_GIVE_UP_MS`      | `86400000` (24 h after the first send)         |
 | `ROUTER_CLASSIFY_RETRY_MS`    | `1800000` (30 min)                             |
 | `ROUTER_CLASSIFY_GIVE_UP_MS`  | `86400000` (24 h)                              |
 | `ROUTER_SESSION_NAMES`        | optional JSON `{"<sessionId>":"personal-wa"}`  |
@@ -70,9 +74,25 @@ restart. The router starts without the token file in `shadow` mode. The text sen
 only, never message bodies) and a summary: accuracy, false positives, false negatives, invalid outputs, p50/p95
 latency. `decision` mode calls `POST <base>/systemone` with `local/decision` and prints accuracy / FP / FN at
 confidence thresholds 0.5, 0.6, 0.7, 0.8 and 0.9; it stops with a clear error if LiteLLM refuses the key
-(401/403). Needs `ROUTER_LLM_BASE_URL` and `ROUTER_LLM_KEY_FILE`. `ROUTER_LLM_TEMPERATURE` (default `0`) sets the
-router's classification temperature. Flint is a reasoning model: the router sends no `max_tokens`, parses only
-`message.content`, and counts an empty content as invalid even if `reasoning_content` holds an answer.
+(401/403). Needs `ROUTER_LLM_BASE_URL` and `ROUTER_LLM_KEY_FILE`. `ROUTER_LLM_TEMPERATURE` (default `1.0`) and
+`ROUTER_LLM_TOP_P` (default `0.95`) set the router's sampling; the eval CLI uses the same defaults
+(`--temperature`, `--top-p` override). Flint is a reasoning model: the router sends no `max_tokens`, parses only
+`message.content`, and never sends `response_format` (LM Studio answers 400 to it). An empty content, or a
+`finish_reason` of `length`, is `empty_answer` even if `reasoning_content` holds an answer.
+
+**Why temperature 1.0 / top_p 0.95:** at temperature 0 Flint can loop in its reasoning, spend every token there and
+return empty content (`finish_reason: length`) or make LiteLLM answer 500. The model card's sampling answers.
+`empty_answer` is handled like an outage: retried every `ROUTER_CLASSIFY_RETRY_MS` up to `ROUTER_CLASSIFY_GIVE_UP_MS`,
+never `no_action`, never final before that. HTTP 500/502/503/504 are retried the same way. The Flint timeout is 300 s.
+
+**Mitra outages:** a send that fails on a retryable reason (timeout, network error, HTTP 5xx, 429, JSON-RPC -32603)
+is resent after 30 s, 2 min and 10 min, then every `ROUTER_PEER_RETRY_MS` (30 min) until
+`ROUTER_PEER_GIVE_UP_MS` (24 h) after the first attempt; only then it is `peer_failed`. Every resend uses the stored
+bytes. The first-attempt time and attempt count are in `routes.jsonl`, so a restart continues the same 24 h clock.
+4xx and auth failures are unchanged (`peer_rejected`, `peer_auth_failed`, no retry).
+
+**TaskPilot peer:** `ROUTER_PEER=taskpilot` still works when `ROUTER_TASKPILOT_URL` and
+`ROUTER_TASKPILOT_TOKEN_FILE` are supplied; the shipped stack no longer sets them.
 
 **Owner rule: WhatsApp text reaches `recursivesi/flint` and no other model.** `ROUTER_MODEL` may only be
 `recursivesi/flint`; any other value makes the router refuse to start (and `classify-fixture` refuse to

@@ -19,10 +19,8 @@ services:
       - ROUTER_PEER=mitra
       - ROUTER_MITRA_URL=http://dharabot.lan:12345/a2a/v1
       - ROUTER_MITRA_TOKEN_FILE=/secrets/mitra-token
-      - ROUTER_TASKPILOT_URL=https://taskpilot-mcp.sudiptadhara.in/a2a
       - ROUTER_WEBHOOK_SECRET_FILE=/secrets/webhook-secret
       - ROUTER_LLM_KEY_FILE=/secrets/llm-key
-      - ROUTER_TASKPILOT_TOKEN_FILE=/secrets/taskpilot-token
     extra_hosts:
       - db.lan:192.168.10.120
     image: ghcr.io/sudipta26889/openwa-a2a-router:latest
