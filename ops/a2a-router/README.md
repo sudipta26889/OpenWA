@@ -101,7 +101,7 @@ outage would send message text to that cloud model without the router knowing.
 
 **Flint runs on the owner's MacBook Pro.** When the laptop is off or asleep, Flint is down, possibly for a
 whole night. A classification that fails because the backend is unavailable (timeout, network error, HTTP
-5xx, 429 or 404) is retried every `ROUTER_CLASSIFY_RETRY_MS` until `ROUTER_CLASSIFY_GIVE_UP_MS` after the
+5xx, 429, 404 or 400) is retried every `ROUTER_CLASSIFY_RETRY_MS` until `ROUTER_CLASSIFY_GIVE_UP_MS` after the
 batch's first attempt, so messages wait up to 24 h for Flint. Only then is the batch final. Retries go one
 at a time; once one fails as unavailable, the other waiting batches wait for the next tick instead of each
 calling the model (`/health` shows `llmUnavailableUntil`). The retry state is read back from `routes.jsonl`

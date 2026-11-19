@@ -997,6 +997,16 @@ test('HTTP 500, 502, 503 and 504 from the model are all retried', async () => {
   }
 });
 
+test('HTTP 400 from the model (transient under load) is retried, then classified', async () => {
+  const s = await setup({ advance: true, llm: (_b, n) => (n === 1 ? json(400, {}) : llmReply(GOOD)) });
+  await hook(s, evt());
+  await s.router.drain();
+  const failed = s.routes().filter(r => r.state === 'classify_failed');
+  assert.deepEqual(failed.map(r => [r.reason, r.final]), [['http_400', false]]);
+  assert.deepEqual(s.sleeps, [HALF_HOUR]);
+  assert.equal(s.last().state, 'routed');
+});
+
 test('the Flint timeout defaults to 300 s', async () => {
   const seen = [];
   const orig = AbortSignal.timeout;

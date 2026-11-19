@@ -21,7 +21,7 @@ const MAX_RETRY_AFTER_MS = 600_000;
 const CLASSIFY_RETRY_MS = 600_000; // the one retry after invalid_json / invalid_shape
 /** Backend unavailable (Flint's laptop off or asleep): timeout, network error, HTTP 5xx, 429, 404. */
 /** `empty_answer`: Flint spent its tokens reasoning and returned no content (or stopped at the length limit). */
-const isUnavailable = reason => /^(timeout|network_error|empty_answer|http_(5\d\d|429|404))$/.test(reason ?? '');
+const isUnavailable = reason => /^(timeout|network_error|empty_answer|http_(5\d\d|429|404|400))$/.test(reason ?? '');
 export const DEFAULT_TEMPERATURE = 1.0; // Flint model card; temperature 0 makes it loop in its reasoning
 export const DEFAULT_TOP_P = 0.95;
 export const DEFAULT_LLM_TIMEOUT_MS = 300_000;
