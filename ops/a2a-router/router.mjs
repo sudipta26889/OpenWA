@@ -409,7 +409,7 @@ export function buildMitraRequest({ K, sessionId, chatId, text, method = 'SendMe
 // ---- the router ----
 
 export function createRouter(o) {
-  const cfg = { temperature: 0, peer: 'mitra', mitraUrl: 'http://dharabot.lan:12345/a2a/v1', mitraTimeoutMs: 25_000, mode: 'off', batchQuietMs: 120_000, peerTimeoutMs: 120_000, llmTimeoutMs: 60_000, classifyRetryMs: 30 * 60_000, classifyGiveUpMs: DAY_MS, model: REQUIRED_MODEL, sessionNames: {}, ...o };
+  const cfg = { temperature: 0, peer: 'mitra', mitraUrl: 'http://dharabot.lan:12345/a2a/v1', mitraTimeoutMs: 25_000, mode: 'off', batchQuietMs: 120_000, peerTimeoutMs: 120_000, llmTimeoutMs: 180_000, classifyRetryMs: 30 * 60_000, classifyGiveUpMs: DAY_MS, model: REQUIRED_MODEL, sessionNames: {}, ...o };
   if (cfg.model !== REQUIRED_MODEL) throw new Error(`ROUTER_MODEL must be ${REQUIRED_MODEL}; WhatsApp text may not reach any other model (got ${cfg.model})`);
   if (!MODES.includes(cfg.mode)) throw new Error(`mode must be one of ${MODES.join(', ')}`);
   if (!['mitra', 'taskpilot'].includes(cfg.peer)) throw new Error('peer must be mitra or taskpilot');
@@ -964,7 +964,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   if (process.argv[2] === 'classify-fixture') {
     const key = readSecretFile('ROUTER_LLM_KEY_FILE')();
     try {
-      const r = await runFixture({ baseUrl: env.ROUTER_LLM_BASE_URL, key, model, timeoutMs: Number(env.ROUTER_LLM_TIMEOUT_MS ?? 60_000) });
+      const r = await runFixture({ baseUrl: env.ROUTER_LLM_BASE_URL, key, model, timeoutMs: Number(env.ROUTER_LLM_TIMEOUT_MS ?? 180_000) });
       console.log(JSON.stringify(r, null, 2));
     } catch (e) {
       console.error(`classify-fixture failed: ${e.message}`);
@@ -1069,7 +1069,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
     taskpilotUrl: env.ROUTER_TASKPILOT_URL ?? 'https://taskpilot-mcp.sudiptadhara.in/a2a',
     batchQuietMs: Number(env.ROUTER_BATCH_QUIET_MS ?? 120_000),
     peerTimeoutMs: Number(env.ROUTER_PEER_TIMEOUT_MS ?? 120_000),
-    llmTimeoutMs: Number(env.ROUTER_LLM_TIMEOUT_MS ?? 60_000),
+    llmTimeoutMs: Number(env.ROUTER_LLM_TIMEOUT_MS ?? 180_000),
     temperature: Number(env.ROUTER_LLM_TEMPERATURE ?? 0),
     classifyRetryMs: Number(env.ROUTER_CLASSIFY_RETRY_MS ?? 30 * 60_000),
     classifyGiveUpMs: Number(env.ROUTER_CLASSIFY_GIVE_UP_MS ?? 24 * 3600_000),
