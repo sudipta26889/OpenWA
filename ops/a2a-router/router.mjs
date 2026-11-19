@@ -90,7 +90,7 @@ export function parseClassification(content) {
 }
 
 /** One chat/completions call. Returns {action_needed, summary}; throws Error(reason) on any failure. */
-export async function classifyMessages({ events, fetch: fetchFn = globalThis.fetch, baseUrl, key, model, timeoutMs = 60_000, temperature = 0 }) {
+export async function classifyMessages({ events, fetch: fetchFn = globalThis.fetch, baseUrl, key, model, timeoutMs = 180_000, temperature = 0 }) {
   let res;
   try {
     res = await fetchFn(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
