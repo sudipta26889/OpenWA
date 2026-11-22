@@ -41,6 +41,8 @@ services:
       - ROUTER_MITRA_TOKEN_FILE=/secrets/mitra-token
       # Mitra's own WhatsApp lid: its pings to the owner must never loop back into the router.
       - ROUTER_IGNORE_SENDERS=281389312278744@lid
+      # Pings name the WhatsApp number instead of the session UUID.
+      - 'ROUTER_SESSION_NAMES={"0face0b6-25d2-4621-833d-6a6ed1598b0a":"personal-wa","4a6a3c02-5adb-4e07-9355-afc874ed45cd":"business-wa"}'
       # Same LAN LiteLLM TaskPilot uses; Flint only (the router refuses any other model).
       - ROUTER_LLM_BASE_URL=http://db.lan:4000/v1
     # Pinned like openwa-api: a DNS failure must not cut the router off from LiteLLM.
