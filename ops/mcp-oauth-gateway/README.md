@@ -52,7 +52,7 @@ client ──► :2785 mcp-oauth-gateway ──► openwa-api:2785 (not publishe
 ## Result cap
 
 For callers using an OAuth access token (e.g. claude.ai), `POST /mcp` answers are buffered (up to 8 MB; bigger
-ones stream through untouched). When the *payload* of a JSON-RPC `result.content` (the decoded blob of an embedded
+ones stream through untouched). When the _payload_ of a JSON-RPC `result.content` (the decoded blob of an embedded
 base64 resource, else the joined text items) is longer than `MAX_RESULT_CHARS` (100,000), the content becomes one
 text item with the first 100,000 characters and a `[truncated by gateway: N characters in all; …]` marker, in
 `application/json` and `text/event-stream` answers; `isError` and the other fields are kept. A payload that fits is
@@ -97,8 +97,8 @@ the key is never echoed back.
 
 ## Config (root `.env`, forwarded by `docker-compose.override.yml`)
 
-| Key            | Meaning                                                        |
-| -------------- | -------------------------------------------------------------- |
+| Key            | Meaning                                                          |
+| -------------- | ---------------------------------------------------------------- |
 | `OAUTH_ISSUER` | Public https origin clients reach, e.g. `https://wa.example.com` |
 
 These keys are kept out of the root `.env.example` on purpose: that file belongs to upstream.

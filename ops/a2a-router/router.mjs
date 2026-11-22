@@ -375,6 +375,18 @@ function taskText({ summary, sessionName, who, chatId, messageIds }) {
   ].join('\n');
 }
 
+/** contextId for the peers: Mitra only accepts letters, digits and . _ : - so every other char becomes '_'. Stable per chat. */
+export const peerContextId = (sessionId, chatId) => `openwa:${sessionId}:${chatId}`.replace(/[^A-Za-z0-9._:-]/g, '_');
+
+/** A peer's JSON-RPC error message for the route row: control chars removed, trimmed, max 200 chars. Never request text. */
+const rpcDetail = e => {
+  const m = e?.message;
+  if (typeof m !== 'string') return undefined;
+  // eslint-disable-next-line no-control-regex
+  const d = m.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').trim().slice(0, 200);
+  return d || undefined;
+};
+
 export function buildRequest({ K, sessionId, chatId, text }) {
   return JSON.stringify({
     jsonrpc: '2.0',
@@ -382,7 +394,7 @@ export function buildRequest({ K, sessionId, chatId, text }) {
     method: 'message/send',
     params: {
       idempotencyKey: K,
-      message: { messageId: K, contextId: `openwa:${sessionId}:${chatId}`, parts: [{ kind: 'text', text }] },
+      message: { messageId: K, contextId: peerContextId(sessionId, chatId), parts: [{ kind: 'text', text }] },
     },
   });
 }
@@ -407,7 +419,7 @@ export function buildMitraRequest({ K, sessionId, chatId, text, method = 'SendMe
     id: uuidFrom(`id:${K}`),
     method,
     params: {
-      message: { messageId: K, role: 'ROLE_USER', contextId: `openwa:${sessionId}:${chatId}`, parts: [{ text }] },
+      message: { messageId: K, role: 'ROLE_USER', contextId: peerContextId(sessionId, chatId), parts: [{ text }] },
       configuration: { returnImmediately: true },
     },
   });
@@ -416,7 +428,8 @@ export function buildMitraRequest({ K, sessionId, chatId, text, method = 'SendMe
 // ---- the router ----
 
 export function createRouter(o) {
-  const cfg = { temperature: DEFAULT_TEMPERATURE, topP: DEFAULT_TOP_P, peer: 'mitra', mitraUrl: 'http://dharabot.lan:12345/a2a/v1', mitraTimeoutMs: 90_000, mode: 'off', batchQuietMs: 120_000, peerTimeoutMs: 120_000, llmTimeoutMs: DEFAULT_LLM_TIMEOUT_MS, classifyRetryMs: 30 * 60_000, classifyGiveUpMs: DAY_MS, peerRetryMs: 30 * 60_000, peerGiveUpMs: DAY_MS, model: REQUIRED_MODEL, sessionNames: {}, ...o };
+  const cfg = { temperature: DEFAULT_TEMPERATURE, topP: DEFAULT_TOP_P, peer: 'mitra', mitraUrl: 'http://dharabot.lan:12345/a2a/v1', mitraTimeoutMs: 90_000, mode: 'off', batchQuietMs: 120_000, peerTimeoutMs: 120_000, llmTimeoutMs: DEFAULT_LLM_TIMEOUT_MS, classifyRetryMs: 30 * 60_000, classifyGiveUpMs: DAY_MS, peerRetryMs: 30 * 60_000, peerGiveUpMs: DAY_MS, model: REQUIRED_MODEL, sessionNames: {}, ignoreSenders: [], ...o };
+  const ignoreSenders = new Set((cfg.ignoreSenders ?? []).map(s => String(s).trim()).filter(Boolean));
   if (cfg.model !== REQUIRED_MODEL) throw new Error(`ROUTER_MODEL must be ${REQUIRED_MODEL}; WhatsApp text may not reach any other model (got ${cfg.model})`);
   if (!MODES.includes(cfg.mode)) throw new Error(`mode must be one of ${MODES.join(', ')}`);
   if (!['mitra', 'taskpilot'].includes(cfg.peer)) throw new Error('peer must be mitra or taskpilot');
@@ -496,7 +509,7 @@ export function createRouter(o) {
     appendLine(routesFile, row);
     batches.set(batchId, { ...prev, ...row });
     if (row.state === 'routed') lastRouteAt = row.ts;
-    logger('route', { batchId, state: row.state, reason: row.reason, taskId: row.taskId });
+    logger('route', { batchId, state: row.state, reason: row.reason, detail: row.detail, taskId: row.taskId });
   };
   const isTerminal = b => TERMINAL.has(b.state) || (b.state === 'classify_failed' && b.final === true);
 
@@ -663,9 +676,9 @@ export function createRouter(o) {
     if (j?.error) {
       const code = j.error.code;
       if (code === -32002) return authFailed();
-      if (code === -32602 || code === -32010) return { kind: 'rejected', reason: `rpc_${code}` };
+      if (code === -32602 || code === -32010) return { kind: 'rejected', reason: `rpc_${code}`, detail: rpcDetail(j.error) };
       if (code === -32603) return { kind: 'retry', reason: 'rpc_-32603' };
-      return { kind: 'failed', reason: `rpc_${code}` };
+      return { kind: 'failed', reason: `rpc_${code}`, detail: rpcDetail(j.error) };
     }
     if (!res.ok) return { kind: 'rejected', reason: `http_${res.status}` };
     return { kind: 'result', result: j?.result ?? {} };
@@ -730,9 +743,9 @@ export function createRouter(o) {
     if (j?.error) {
       const code = j.error.code;
       if (code === -32601) return { kind: 'fallback' };
-      if (code === -32602) return { kind: 'rejected', reason: `rpc_${code}` };
+      if (code === -32602) return { kind: 'rejected', reason: `rpc_${code}`, detail: rpcDetail(j.error) };
       if (code === -32603) return { kind: 'retry', reason: 'rpc_-32603' };
-      return { kind: 'failed', reason: `rpc_${code}` };
+      return { kind: 'failed', reason: `rpc_${code}`, detail: rpcDetail(j.error) };
     }
     return { kind: 'result', taskId: j?.result?.task?.id ?? j?.result?.id ?? null };
   }
@@ -767,8 +780,8 @@ export function createRouter(o) {
           if (out.kind === 'fallback') out = { kind: 'failed', reason: 'rpc_-32601' };
         }
         if (out.kind === 'auth') return logRow(batchId, { state: 'peer_auth_failed', reason: out.reason });
-        if (out.kind === 'rejected') return logRow(batchId, { state: 'peer_rejected', reason: out.reason });
-        if (out.kind === 'failed') return logRow(batchId, { state: 'peer_failed', reason: out.reason });
+        if (out.kind === 'rejected') return logRow(batchId, { state: 'peer_rejected', reason: out.reason, detail: out.detail });
+        if (out.kind === 'failed') return logRow(batchId, { state: 'peer_failed', reason: out.reason, detail: out.detail });
         if (out.kind === 'result') return logRow(batchId, { state: 'routed', taskId: out.taskId });
         const waitMs = peerWait(attempt, out, b.firstAttemptAt);
         if (waitMs === null) return logRow(batchId, { state: 'peer_failed', reason: out.reason });
@@ -787,14 +800,14 @@ export function createRouter(o) {
     if (!b?.request || inflight.has(b.K)) return; // never two sends in flight for one K
     inflight.add(b.K);
     try {
-      const contextId = `openwa:${b.sessionId}:${b.chatId}`;
+      const contextId = peerContextId(b.sessionId, b.chatId);
       for (let attempt = b.attempt ?? 0; ; attempt++) {
         if (closed) return;
         if (peerAuthFailed) return logRow(batchId, { state: 'peer_auth_failed', reason: 'peer auth failed earlier' });
         const out = await peerCall(b.request);
         if (out.kind === 'auth') return logRow(batchId, { state: 'peer_auth_failed', reason: out.reason });
-        if (out.kind === 'rejected') return logRow(batchId, { state: 'peer_rejected', reason: out.reason });
-        if (out.kind === 'failed') return logRow(batchId, { state: 'peer_failed', reason: out.reason });
+        if (out.kind === 'rejected') return logRow(batchId, { state: 'peer_rejected', reason: out.reason, detail: out.detail });
+        if (out.kind === 'failed') return logRow(batchId, { state: 'peer_failed', reason: out.reason, detail: out.detail });
         if (out.kind === 'result') {
           const state = out.result.state ?? out.result.status?.state;
           if (state === 'auth_required' || state === 'completed') {
@@ -857,6 +870,10 @@ export function createRouter(o) {
       return send(res, 400, { error: 'bad_payload' });
     }
     if (data.fromMe || data.kind !== 'individual' || data.isStatusBroadcast) return send(res, 200, { ok: true, status: 'dropped' });
+    // backstop: never store or classify events from ignored senders (e.g. Mitra's own WhatsApp id)
+    if (ignoreSenders.size && [data.from, data.author, data.chatId, data.senderPhone].some(v => typeof v === 'string' && ignoreSenders.has(v))) {
+      return send(res, 200, { ok: true, status: 'ignored' });
+    }
     const key = String(req.headers['x-openwa-idempotency-key'] ?? body.idempotencyKey ?? crypto.createHash('sha256').update(raw).digest('hex'));
     if (seen.has(key)) return send(res, 200, { ok: true, status: 'duplicate' });
     const rec = {
@@ -1095,6 +1112,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
     classifyRetryMs: Number(env.ROUTER_CLASSIFY_RETRY_MS ?? 30 * 60_000),
     classifyGiveUpMs: Number(env.ROUTER_CLASSIFY_GIVE_UP_MS ?? 24 * 3600_000),
     sessionNames,
+    ignoreSenders: (env.ROUTER_IGNORE_SENDERS ?? '').split(',').map(s => s.trim()).filter(Boolean),
   });
   router.recover();
   const port = Number(env.PORT ?? 8790);

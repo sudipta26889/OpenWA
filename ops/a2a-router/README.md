@@ -18,10 +18,10 @@ a2a-router ── JSONL ──▶ /data
 
 ## Modes (`ROUTER_MODE`)
 
-| mode     | does                                                                 |
-| -------- | -------------------------------------------------------------------- |
-| `off`    | stores events and logs each batch; no model call, no peer call        |
-| `shadow` | classifies and logs; **no peer call**. Start here and review 7 days   |
+| mode     | does                                                                    |
+| -------- | ----------------------------------------------------------------------- |
+| `off`    | stores events and logs each batch; no model call, no peer call          |
+| `shadow` | classifies and logs; **no peer call**. Start here and review 7 days     |
 | `live`   | also hands the message to the peer (Mitra) when `action_needed` is true |
 
 Before `live` with Mitra: the `openwa` peer and its token file exist (GuardianAI), and one end-to-end test with
@@ -42,30 +42,31 @@ restart. The router starts without the token file in `shadow` mode. The text sen
 
 ## Configuration
 
-| variable                      | default                                        |
-| ----------------------------- | ---------------------------------------------- |
-| `ROUTER_MODE`                 | `off`                                          |
-| `ROUTER_LLM_BASE_URL`         | required (LiteLLM base, e.g. `https://…/v1`)   |
-| `ROUTER_MODEL`                | `recursivesi/flint`                            |
-| `ROUTER_PEER`                 | `mitra` (or `taskpilot`)                       |
-| `ROUTER_MITRA_URL`            | `http://dharabot.lan:12345/a2a/v1`             |
-| `ROUTER_MITRA_TOKEN_FILE`     | path of the Mitra peer token (may be absent in shadow) |
-| `ROUTER_MITRA_TIMEOUT_MS`     | `90000`                                        |
-| `ROUTER_TASKPILOT_URL`        | `https://taskpilot-mcp.sudiptadhara.in/a2a` (taskpilot peer only) |
-| `ROUTER_WEBHOOK_SECRET_FILE`  | required: path, ≥16 characters inside          |
-| `ROUTER_LLM_KEY_FILE`         | required: path of the router's LiteLLM key     |
-| `ROUTER_TASKPILOT_TOKEN_FILE` | required only with `ROUTER_PEER=taskpilot`     |
-| `ROUTER_BATCH_QUIET_MS`       | `120000`                                       |
-| `ROUTER_PEER_TIMEOUT_MS`      | `120000`                                       |
-| `ROUTER_LLM_TIMEOUT_MS`       | `300000` (5 min)                               |
-| `ROUTER_LLM_TEMPERATURE`      | `1.0` (Flint model card)                       |
-| `ROUTER_LLM_TOP_P`            | `0.95`                                         |
-| `ROUTER_PEER_RETRY_MS`        | `1800000` (30 min, after the 30 s / 2 min / 10 min resends) |
-| `ROUTER_PEER_GIVE_UP_MS`      | `86400000` (24 h after the first send)         |
-| `ROUTER_CLASSIFY_RETRY_MS`    | `1800000` (30 min)                             |
-| `ROUTER_CLASSIFY_GIVE_UP_MS`  | `86400000` (24 h)                              |
-| `ROUTER_SESSION_NAMES`        | optional JSON `{"<sessionId>":"personal-wa"}`  |
-| `ROUTER_DATA_DIR`, `PORT`     | `/data`, `8790`                                |
+| variable                      | default                                                                                                                                                       |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ROUTER_MODE`                 | `off`                                                                                                                                                         |
+| `ROUTER_LLM_BASE_URL`         | required (LiteLLM base, e.g. `https://…/v1`)                                                                                                                  |
+| `ROUTER_MODEL`                | `recursivesi/flint`                                                                                                                                           |
+| `ROUTER_PEER`                 | `mitra` (or `taskpilot`)                                                                                                                                      |
+| `ROUTER_MITRA_URL`            | `http://dharabot.lan:12345/a2a/v1`                                                                                                                            |
+| `ROUTER_MITRA_TOKEN_FILE`     | path of the Mitra peer token (may be absent in shadow)                                                                                                        |
+| `ROUTER_MITRA_TIMEOUT_MS`     | `90000`                                                                                                                                                       |
+| `ROUTER_TASKPILOT_URL`        | `https://taskpilot-mcp.sudiptadhara.in/a2a` (taskpilot peer only)                                                                                             |
+| `ROUTER_WEBHOOK_SECRET_FILE`  | required: path, ≥16 characters inside                                                                                                                         |
+| `ROUTER_LLM_KEY_FILE`         | required: path of the router's LiteLLM key                                                                                                                    |
+| `ROUTER_TASKPILOT_TOKEN_FILE` | required only with `ROUTER_PEER=taskpilot`                                                                                                                    |
+| `ROUTER_BATCH_QUIET_MS`       | `120000`                                                                                                                                                      |
+| `ROUTER_PEER_TIMEOUT_MS`      | `120000`                                                                                                                                                      |
+| `ROUTER_LLM_TIMEOUT_MS`       | `300000` (5 min)                                                                                                                                              |
+| `ROUTER_LLM_TEMPERATURE`      | `1.0` (Flint model card)                                                                                                                                      |
+| `ROUTER_LLM_TOP_P`            | `0.95`                                                                                                                                                        |
+| `ROUTER_PEER_RETRY_MS`        | `1800000` (30 min, after the 30 s / 2 min / 10 min resends)                                                                                                   |
+| `ROUTER_PEER_GIVE_UP_MS`      | `86400000` (24 h after the first send)                                                                                                                        |
+| `ROUTER_CLASSIFY_RETRY_MS`    | `1800000` (30 min)                                                                                                                                            |
+| `ROUTER_CLASSIFY_GIVE_UP_MS`  | `86400000` (24 h)                                                                                                                                             |
+| `ROUTER_IGNORE_SENDERS`       | comma-separated ids (`…@lid`, `…@c.us`, numbers); default empty. An event whose `from`, `author`, `chatId` or `senderPhone` matches is dropped before storing |
+| `ROUTER_SESSION_NAMES`        | optional JSON `{"<sessionId>":"personal-wa"}`                                                                                                                 |
+| `ROUTER_DATA_DIR`, `PORT`     | `/data`, `8790`                                                                                                                                               |
 
 ### Evals (synthetic, no personal data)
 
@@ -138,7 +139,12 @@ of `ROUTER_WEBHOOK_SECRET_FILE`), and `filters` (all must match): `fromMe is fal
 up after 30 s, 2 min, 10 min), `peer_rejected` (403, -32602, -32010), `peer_auth_failed` (401 or -32002:
 all peer calls stop until restart, an `ALERT` line is logged). Before every resend the router asks
 `tasks/list {contextId}` and, if a task newer than the first attempt exists, records it as `routed`
-instead. Every resend uses the stored bytes; the text is never rebuilt.
+instead. Every resend uses the stored bytes; the text is never rebuilt. When a peer answers with a JSON-RPC
+error, its `message` (control characters removed, max 200 characters) is stored as `detail` on the route row
+and in the log line; the request text is never logged.
+
+The peer `contextId` is `openwa:<sessionId>:<chatId>` with every character outside `A-Za-z0-9._:-` replaced
+by `_` (`9198…@c.us` becomes `9198…_c.us`), because Mitra rejects anything else with -32602.
 
 ## Classify the fixture by hand
 
@@ -155,6 +161,7 @@ Expected: `action_needed: true`, and a summary naming the documents.
 `node --test ops/a2a-router/` (no network; fetch, clock, sleep and data dir are injected).
 
 ## Webhook provenance (2026-11-19)
+
 The two `message.received` webhooks (business-wa, personal-wa → `http://a2a-router:8790/hook`) were created by
 GuardianAI on the NUC with `~/fleet-tasks/openwa-a2a-router-create-webhooks.py`, using a one-shot copy of the
 watchdog's operator key (owner's decision; file on a memory disk, deleted in the same command). OpenWA's audit
