@@ -2346,6 +2346,7 @@ describe('every workflow holds the token at contents: read for the jobs that nam
   const HELD: Record<string, string> = { contents: 'read' };
   const NAMED = [
     'ci.yml',
+    'homelab-deploy.yml',
     'java-sdk-release.yml',
     'js-sdk-release.yml',
     'php-sdk-release.yml',
