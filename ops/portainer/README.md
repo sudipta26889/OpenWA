@@ -8,10 +8,10 @@
 
 ## State that must survive
 
-| Volume | Mounted at | Holds |
-|---|---|---|
-| `openwa_openwa-data` | `/app/data` in openwa-api | WhatsApp LocalAuth sessions, generated keys |
-| `openwa_mcp-oauth-gateway-data` | `/data` in the gateway | Sealed OAuth state |
+| Volume                          | Mounted at                | Holds                                       |
+| ------------------------------- | ------------------------- | ------------------------------------------- |
+| `openwa_openwa-data`            | `/app/data` in openwa-api | WhatsApp LocalAuth sessions, generated keys |
+| `openwa_mcp-oauth-gateway-data` | `/data` in the gateway    | Sealed OAuth state                          |
 
 Both are `external: true`, so a missing or misnamed volume fails the deploy instead of creating an empty one. Never run two API containers on these volumes. WhatsApp allows one live client per login.
 

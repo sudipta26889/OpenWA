@@ -72,7 +72,7 @@ Webhook secret 16-255 chars. OpenWA times out at 10 s and treats any 2xx as deli
 ## Pipeline
 
 1. **Receive** `/hook`: read raw bytes; verify HMAC with `crypto.timingSafeEqual` before `JSON.parse`
-   (bad → 401). Append the event to `/data/inbound.jsonl` and fsync, *then* answer 200. Duplicate
+   (bad → 401). Append the event to `/data/inbound.jsonl` and fsync, _then_ answer 200. Duplicate
    `X-OpenWA-Idempotency-Key` (dedup set rebuilt from the file at startup) → 200, not appended.
    Write failure → 500 so OpenWA retries.
 2. **Batch** per `sessionId:chatId`: close after 120 s quiet (`ROUTER_BATCH_QUIET_MS`). On startup,
@@ -88,9 +88,19 @@ Webhook secret 16-255 chars. OpenWA times out at 10 s and treats any 2xx as deli
    WhatsApp message ids, "Proposed by the OpenWA router; owner approval required." Append the full
    request body to `routes.jsonl` (state `pending`) **before** sending.
    ```json
-   {"jsonrpc":"2.0","id":"<uuid>","method":"message/send",
-    "params":{"idempotencyKey":"K","message":{"messageId":"K",
-      "contextId":"openwa:<sessionId>:<chatId>","parts":[{"kind":"text","text":"T"}]}}}
+   {
+     "jsonrpc": "2.0",
+     "id": "<uuid>",
+     "method": "message/send",
+     "params": {
+       "idempotencyKey": "K",
+       "message": {
+         "messageId": "K",
+         "contextId": "openwa:<sessionId>:<chatId>",
+         "parts": [{ "kind": "text", "text": "T" }]
+       }
+     }
+   }
    ```
    `Authorization: Bearer <token from ROUTER_TASKPILOT_TOKEN_FILE>`. `contextId` is required for
    TaskPilot's agent path and keeps that chat's history.
@@ -137,7 +147,7 @@ Webhook secret 16-255 chars. OpenWA times out at 10 s and treats any 2xx as deli
 ## Prerequisites (via GuardianAI / owner; no secret in any message)
 
 1. TaskPilot peer token: `npx tsx scripts/mint-peer-token.ts openwa_router <owner-email> <workspace>
-   365` in TaskPilot `apps/mcp` → client `peer_openwa_router`; only the JWT goes in the mode-600 file.
+365` in TaskPilot `apps/mcp` → client `peer_openwa_router`; only the JWT goes in the mode-600 file.
    No refresh; expiry recorded; rotate by minting a new token and revoking the old.
 2. LiteLLM virtual key for the router, limited to `recursivesi/flint`, in a mode-600 file.
 3. Volume `openwa_a2a-router-data` created before the first deploy (stack volumes are `external`).
